@@ -1,7 +1,5 @@
 //! MIDI — Standard MIDI File (SMF) parser + transport metadata + soft-synth scaffold.
 //!
-//! Round-1 ships:
-//!
 //! * **[`smf`]** — pure-Rust parser for the Standard MIDI File format
 //!   (Type 0 / 1 / 2). Header (`MThd`) + tracks (`MTrk`) + every common
 //!   channel-voice message, sysex (`F0` / `F7`), and meta event
@@ -13,19 +11,27 @@
 //! * **[`paths`]** — per-OS SoundFont/SFZ/DLS search paths plus the
 //!   `OXIDEAV_SOUNDFONT_PATH` environment override. `find_soundfonts`
 //!   walks them and returns every instrument-bank file present.
-//! * **[`instruments`]** — [`instruments::Instrument`] trait, magic-byte
-//!   detector stubs for SoundFont 2 / SFZ / DLS, and a working
-//!   pure-tone fallback ([`instruments::tone::ToneInstrument`]) so the
-//!   synth produces *something* even with no on-disk bank.
+//! * **[`instruments`]** — [`instruments::Instrument`] trait. Three
+//!   adapters:
+//!     * **[`instruments::sf2`]** — full SoundFont 2 RIFF reader +
+//!       voice generator (round-2 work). Walks the `sfbk` form,
+//!       cross-resolves the preset → instrument → zone → sample
+//!       chain, and renders 16-bit PCM at the requested pitch via
+//!       linear interpolation, with optional sample-loop support.
+//!     * **[`instruments::sfz`]** / **[`instruments::dls`]** —
+//!       magic-byte detector stubs; `make_voice` returns
+//!       [`Error::Unsupported`]. Loaders are round-3.
+//!     * **[`instruments::tone`]** — sine/triangle/saw/square
+//!       fallback so the synth produces *something* even when no
+//!       on-disk bank is present.
 //! * **[`downloader`]** — stub that names a planned default bank
-//!   (TimGM6mb) but currently returns `Error::Unsupported`.
+//!   (TimGM6mb) but currently returns [`Error::Unsupported`].
 //!
 //! The decoder factory ([`make_decoder`]) is registered under codec id
-//! [`CODEC_ID_STR`] = `"midi"`. Round-1 returns
-//! `Error::Unsupported("MIDI synthesis not yet implemented; round 2")`
-//! when invoked — the crate is a parser + path finder + scaffold for now.
-//! Synthesis (mixing voices into PCM frames, mapping SMF events to
-//! voice on/off, tempo + division → real-time scheduling) is round-2.
+//! [`CODEC_ID_STR`] = `"midi"`. `send_packet` currently returns
+//! [`Error::Unsupported`] — round-3 wires SMF events through the SF2
+//! voice generator (note-on/off dispatch, tempo + division scheduling,
+//! voice mixing into PCM frames).
 
 pub mod downloader;
 pub mod instruments;
@@ -64,9 +70,11 @@ fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     }))
 }
 
-/// Round-1 stub decoder. Validates incoming packets as SMF (so a caller
-/// gets a clear "wrong bytes" rather than a silent miss), then surfaces
-/// `Error::Unsupported` from `send_packet`. Synthesis lands in round-2.
+/// Stub decoder. Validates incoming packets as SMF (so a caller gets a
+/// clear "wrong bytes" rather than a silent miss), then surfaces
+/// `Error::Unsupported` from `send_packet`. The SF2 voice generator
+/// lands in round-2 (see [`crate::instruments::sf2`]); wiring SMF
+/// events through it is round-3.
 struct MidiStubDecoder {
     codec_id: CodecId,
 }
@@ -89,9 +97,10 @@ impl Decoder for MidiStubDecoder {
         // `invalid`, not `unsupported`.
         crate::smf::parse(&packet.data)?;
         Err(Error::unsupported(
-            "MIDI synthesis not yet implemented; round 2 will wire the SMF \
-             event stream through a soft-synth driven by SoundFont 2 / SFZ / \
-             DLS or the pure-tone fallback (see oxideav_midi::instruments)",
+            "MIDI synthesis not yet implemented; round 3 will wire the SMF \
+             event stream through the SF2 voice generator (see \
+             oxideav_midi::instruments::sf2) — the loader and per-note \
+             render path is in place, the event scheduler is not",
         ))
     }
 

@@ -1,15 +1,20 @@
-//! External-instrument trait + per-format adapter stubs + a pure-tone
-//! fallback that needs no on-disk file.
-//!
-//! Round-1: only header/magic detection and a working sine/saw/triangle
-//! oscillator. Actual sample fetching from SoundFont 2 / SFZ / DLS
-//! lands in round-2.
+//! External-instrument trait + per-format adapters + pure-tone
+//! fallback.
 //!
 //! The [`Instrument`] trait describes a small surface — "give me one
 //! voice (a sound source) for this MIDI program at this pitch" — so
-//! the synth core can stay format-agnostic. The pure-tone fallback
-//! ([`tone::ToneInstrument`]) is the canary: if no SoundFont is
-//! available, the synth still produces *something*.
+//! the synth core can stay format-agnostic.
+//!
+//! - [`sf2`] is a working SoundFont 2 reader + voice generator: it
+//!   loads a `.sf2` bank into memory, cross-resolves the preset →
+//!   instrument → zone → sample chain, and renders 16-bit PCM at the
+//!   requested pitch via linear interpolation. (Modulators, sm24,
+//!   stereo linking, and full envelopes/filters are pending.)
+//! - [`sfz`] and [`dls`] are still magic-byte detector stubs;
+//!   `make_voice` returns `Error::Unsupported` for both. Loaders are
+//!   round-3.
+//! - [`tone::ToneInstrument`] is the canary: if no SoundFont is
+//!   available, the synth still produces *something*.
 
 use oxideav_core::Result;
 
