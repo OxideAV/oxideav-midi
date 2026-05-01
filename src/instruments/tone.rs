@@ -53,16 +53,22 @@ impl Instrument for ToneInstrument {
         // square-law curve so soft notes feel softer than linear.
         let v = velocity as f32 / 127.0;
         let amplitude = v * v * 0.4; // headroom: 16 voices at peak ~ 1.0
+        let base_phase_inc = frequency / sample_rate.max(1) as f32;
         Ok(Box::new(ToneVoice {
             waveform,
             phase: 0.0,
-            phase_inc: frequency / sample_rate.max(1) as f32,
+            base_phase_inc,
+            phase_inc: base_phase_inc,
             amplitude,
-            // 250 ms attack-to-sustain, then sustained, then 100 ms release.
-            attack_samples: (sample_rate as f32 * 0.05) as u32,
-            release_samples: (sample_rate as f32 * 0.10) as u32,
+            pressure_gain: 1.0,
+            // DAHDSR: 5 ms attack, 50 ms decay to 70 % sustain, 100 ms release.
+            attack_samples: (sample_rate as f32 * 0.005).max(1.0) as u32,
+            decay_samples: (sample_rate as f32 * 0.05).max(1.0) as u32,
+            release_samples: (sample_rate as f32 * 0.10).max(1.0) as u32,
+            sustain_level: 0.7,
             elapsed: 0,
             release_pos: None,
+            release_start_level: 1.0,
             done: false,
         }))
     }
@@ -98,14 +104,52 @@ struct ToneVoice {
     waveform: Waveform,
     /// Phase in `0.0..1.0` (one full cycle).
     phase: f32,
+    /// Base phase increment before pitch-bend modulation.
+    base_phase_inc: f32,
+    /// Live phase increment = `base_phase_inc * 2^(bend_cents / 1200)`.
     phase_inc: f32,
     amplitude: f32,
+    /// Aftertouch gain in `1.0..=1.5` (rest .. full pressure).
+    pressure_gain: f32,
     attack_samples: u32,
+    decay_samples: u32,
     release_samples: u32,
+    sustain_level: f32,
     elapsed: u32,
     /// `Some(elapsed_at_release)` once `release()` was called.
     release_pos: Option<u32>,
+    /// Envelope value sampled at the moment of release.
+    release_start_level: f32,
     done: bool,
+}
+
+impl ToneVoice {
+    fn envelope_at(&self, t: u32) -> f32 {
+        if let Some(rel_at) = self.release_pos {
+            let since = t.saturating_sub(rel_at);
+            if since >= self.release_samples {
+                return 0.0;
+            }
+            // Quadratic release: starts at the release-time level,
+            // decays to silence over `release_samples`.
+            let x = since as f32 / self.release_samples.max(1) as f32;
+            return self.release_start_level * (1.0 - x) * (1.0 - x);
+        }
+        // Attack.
+        if t < self.attack_samples {
+            return t as f32 / self.attack_samples.max(1) as f32;
+        }
+        let t = t - self.attack_samples;
+        // Decay (exponential-ish via 1 - (1-x)^2).
+        if t < self.decay_samples {
+            let x = t as f32 / self.decay_samples.max(1) as f32;
+            let drop = 1.0 - self.sustain_level;
+            let curve = 1.0 - (1.0 - x) * (1.0 - x);
+            return 1.0 - drop * curve;
+        }
+        // Sustain.
+        self.sustain_level
+    }
 }
 
 impl Voice for ToneVoice {
@@ -114,21 +158,11 @@ impl Voice for ToneVoice {
             return 0;
         }
         for (i, slot) in out.iter_mut().enumerate() {
-            // Envelope: linear attack, sustain at 1.0, linear release.
-            let env = if let Some(rel_at) = self.release_pos {
-                let since_release = self.elapsed.saturating_sub(rel_at);
-                if since_release >= self.release_samples {
-                    self.done = true;
-                    // Write nothing further this render — surface the
-                    // partial fill to the caller so it can drop us.
-                    return i;
-                }
-                1.0 - (since_release as f32 / self.release_samples.max(1) as f32)
-            } else if self.elapsed < self.attack_samples {
-                self.elapsed as f32 / self.attack_samples.max(1) as f32
-            } else {
-                1.0
-            };
+            let env = self.envelope_at(self.elapsed);
+            if self.release_pos.is_some() && env <= 0.0 {
+                self.done = true;
+                return i;
+            }
 
             let osc = match self.waveform {
                 Waveform::Sine => (self.phase * std::f32::consts::TAU).sin(),
@@ -145,7 +179,7 @@ impl Voice for ToneVoice {
                     }
                 }
             };
-            *slot = osc * env * self.amplitude;
+            *slot = osc * env * self.amplitude * self.pressure_gain;
             self.phase += self.phase_inc;
             if self.phase >= 1.0 {
                 self.phase -= 1.0;
@@ -157,12 +191,23 @@ impl Voice for ToneVoice {
 
     fn release(&mut self) {
         if self.release_pos.is_none() {
+            self.release_start_level = self.envelope_at(self.elapsed).max(0.0);
             self.release_pos = Some(self.elapsed);
         }
     }
 
     fn done(&self) -> bool {
         self.done
+    }
+
+    fn set_pitch_bend_cents(&mut self, cents: i32) {
+        let bend_ratio = (2.0f32).powf(cents as f32 / 1200.0);
+        self.phase_inc = self.base_phase_inc * bend_ratio;
+    }
+
+    fn set_pressure(&mut self, pressure: f32) {
+        let p = pressure.clamp(0.0, 1.0);
+        self.pressure_gain = 1.0 + 0.5 * p;
     }
 }
 
@@ -199,6 +244,85 @@ mod tests {
         assert_eq!(n, 1024);
         let nonzero = buf.iter().filter(|s| s.abs() > 0.001).count();
         assert!(nonzero > 100, "expected non-silent output, got {nonzero}");
+    }
+
+    #[test]
+    fn adsr_envelope_has_distinct_decay_phase() {
+        let inst = ToneInstrument::new();
+        // 48 kHz → 5 ms attack ≈ 240 samples, 50 ms decay ≈ 2400 samples,
+        // sustain at 0.7. The attack-peak sample (~240) should be ≥ the
+        // post-decay sample (~3000), and the post-decay sample should be
+        // close to sustain_level * peak (= 0.7 * peak), noticeably lower
+        // than the attack peak.
+        let mut voice = inst.make_voice(73, 60, 127, 48_000).unwrap(); // sine for clean envelope
+        let mut buf = vec![0.0f32; 4096];
+        voice.render(&mut buf);
+        // Find the peak around sample 240 (end of attack).
+        let attack_peak = buf[230..260].iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        // Sample at ~3500 (well past decay) should be at sustain.
+        let sustain_peak = buf[3400..3500]
+            .iter()
+            .map(|s| s.abs())
+            .fold(0.0f32, f32::max);
+        assert!(attack_peak > 0.05, "attack peak too quiet: {attack_peak}",);
+        assert!(
+            sustain_peak < attack_peak,
+            "sustain ({sustain_peak}) should be quieter than attack peak ({attack_peak})",
+        );
+        // Sustain should be roughly 70 % of attack peak.
+        let ratio = sustain_peak / attack_peak;
+        assert!(
+            (0.5..=0.85).contains(&ratio),
+            "sustain/attack ratio {ratio} outside expected ADSR shape",
+        );
+    }
+
+    #[test]
+    fn pitch_bend_changes_voice_frequency() {
+        // Sample the phase increment indirectly: render two equal-length
+        // buffers, one at centre bend, one with +200 cents. The bent
+        // voice completes its first cycle in ≈ 89 % of the centre's
+        // sample count (2^(-200/1200) ≈ 0.89).
+        let inst = ToneInstrument::new();
+        let mut a = inst.make_voice(73, 69, 127, 48_000).unwrap(); // A4 sine
+        let mut b = inst.make_voice(73, 69, 127, 48_000).unwrap();
+        b.set_pitch_bend_cents(200); // +2 semitones
+        let mut buf_a = vec![0.0f32; 1024];
+        let mut buf_b = vec![0.0f32; 1024];
+        a.render(&mut buf_a);
+        b.render(&mut buf_b);
+        // Count zero crossings — `b` should have more.
+        let cross_a = buf_a.windows(2).filter(|w| w[0] * w[1] < 0.0).count();
+        let cross_b = buf_b.windows(2).filter(|w| w[0] * w[1] < 0.0).count();
+        assert!(
+            cross_b > cross_a,
+            "+2 semitones should give more zero crossings: a={cross_a}, b={cross_b}",
+        );
+    }
+
+    #[test]
+    fn pressure_increases_amplitude() {
+        let inst = ToneInstrument::new();
+        let mut a = inst.make_voice(73, 69, 100, 48_000).unwrap();
+        let mut b = inst.make_voice(73, 69, 100, 48_000).unwrap();
+        b.set_pressure(1.0);
+        // Render past attack (5 ms = 240 samples).
+        let mut buf_a = vec![0.0f32; 4096];
+        let mut buf_b = vec![0.0f32; 4096];
+        a.render(&mut buf_a);
+        b.render(&mut buf_b);
+        let peak_a = buf_a[1000..2000]
+            .iter()
+            .map(|s| s.abs())
+            .fold(0.0f32, f32::max);
+        let peak_b = buf_b[1000..2000]
+            .iter()
+            .map(|s| s.abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            peak_b > peak_a * 1.2,
+            "pressure should boost amplitude: a={peak_a}, b={peak_b}",
+        );
     }
 
     #[test]

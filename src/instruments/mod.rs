@@ -41,6 +41,17 @@ pub trait Voice: Send {
 
     /// `true` when the voice has nothing more to produce.
     fn done(&self) -> bool;
+
+    /// Set the per-voice pitch-bend offset, in cents (1/100 semitone).
+    /// `0` is centre. Default is a no-op for voices that don't model
+    /// pitch (the round-3 / round-4 generators all support it).
+    fn set_pitch_bend_cents(&mut self, _cents: i32) {}
+
+    /// Set per-voice pressure (aftertouch), `0.0..=1.0`. Default route
+    /// is a multiplicative gain on the rendered samples. Voices may
+    /// override to route pressure into filter cutoff, vibrato depth,
+    /// etc.; the round-4 default modulator chain just modulates volume.
+    fn set_pressure(&mut self, _pressure: f32) {}
 }
 
 /// Source of voices for one MIDI program (a "bank").

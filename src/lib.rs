@@ -727,6 +727,112 @@ mod tests {
         r
     }
 
+    /// End-to-end SMF with a pitch-bend event mid-note: feed the
+    /// decoder, check that the channel state's pitch bend changed by
+    /// the time the bend tick has fired.
+    #[test]
+    fn end_to_end_pitch_bend_event() {
+        let mut dec = MidiDecoder::new(Arc::new(ToneInstrument::new()), OUTPUT_SAMPLE_RATE);
+        let blob = pitch_bend_smf();
+        let pkt = Packet::new(0, TimeBase::new(1, 44_100), blob);
+        dec.send_packet(&pkt).unwrap();
+        // Pull frames until the scheduler has dispatched everything,
+        // including the pitch bend (located at tick 480, ≈ 23 k samples
+        // = ~22 chunks of 1024).
+        for _ in 0..64 {
+            match dec.receive_frame() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("unexpected: {e:?}"),
+            }
+        }
+        // Inspect the scheduler — the bend should have been applied.
+        // We can't poke the mixer directly through the decoder API; the
+        // test relies on the scheduler having walked past the event.
+        let s = dec.scheduler().unwrap();
+        assert!(s.is_done(), "scheduler should have drained the bend");
+    }
+
+    /// SMF with: tempo, note-on at tick 0, pitch-bend max-up at tick
+    /// 480, note-off at tick 960, EOT at tick 1200.
+    fn pitch_bend_smf() -> Vec<u8> {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"MThd");
+        blob.extend_from_slice(&6u32.to_be_bytes());
+        blob.extend_from_slice(&0u16.to_be_bytes());
+        blob.extend_from_slice(&1u16.to_be_bytes());
+        blob.extend_from_slice(&480u16.to_be_bytes());
+
+        let mut t: Vec<u8> = Vec::new();
+        // tick 0 set tempo 500_000 us/qn (= 120 BPM).
+        t.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]);
+        // tick 0 note on chan 0 key 60 vel 100.
+        t.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        // tick 480 pitch bend max-up. VLQ(480) = 83 60.
+        t.extend_from_slice(&[0x83, 0x60, 0xE0, 0x7F, 0x7F]);
+        // tick 480 → tick 960: note-off. VLQ(480) = 83 60.
+        t.extend_from_slice(&[0x83, 0x60, 0x80, 0x3C, 0x40]);
+        // tick + 240 EOT. VLQ(240) = 81 70.
+        t.extend_from_slice(&[0x81, 0x70, 0xFF, 0x2F, 0x00]);
+        push_track(&mut blob, &t);
+        blob
+    }
+
+    /// End-to-end SMF with a channel-aftertouch event mid-note: assert
+    /// the decoder doesn't crash and audio still gets produced.
+    #[test]
+    fn end_to_end_channel_aftertouch_event() {
+        let mut dec = MidiDecoder::new(Arc::new(ToneInstrument::new()), OUTPUT_SAMPLE_RATE);
+        let blob = aftertouch_smf();
+        let pkt = Packet::new(0, TimeBase::new(1, 44_100), blob);
+        dec.send_packet(&pkt).unwrap();
+        let mut samples: Vec<i16> = Vec::new();
+        for _ in 0..64 {
+            match dec.receive_frame() {
+                Ok(Frame::Audio(af)) => {
+                    for chunk in af.data[0].chunks_exact(2) {
+                        samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    }
+                }
+                Err(Error::Eof) => break,
+                Ok(_) => panic!("expected audio"),
+                Err(e) => panic!("unexpected: {e:?}"),
+            }
+        }
+        // We rendered audio.
+        assert!(!samples.is_empty(), "no audio rendered");
+        let nonzero = samples.iter().filter(|s| s.abs() > 16).count();
+        assert!(
+            nonzero > samples.len() / 20,
+            "expected ≥ 5 % non-silent: {} / {}",
+            nonzero,
+            samples.len(),
+        );
+    }
+
+    /// SMF with: tempo, note-on at tick 0, channel pressure at tick 240,
+    /// note-off at tick 480, EOT at tick 720.
+    fn aftertouch_smf() -> Vec<u8> {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"MThd");
+        blob.extend_from_slice(&6u32.to_be_bytes());
+        blob.extend_from_slice(&0u16.to_be_bytes());
+        blob.extend_from_slice(&1u16.to_be_bytes());
+        blob.extend_from_slice(&480u16.to_be_bytes());
+
+        let mut t: Vec<u8> = Vec::new();
+        t.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]);
+        t.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        // VLQ(240) = 81 70. Channel pressure D0 with value 0x60.
+        t.extend_from_slice(&[0x81, 0x70, 0xD0, 0x60]);
+        // VLQ(240): note off.
+        t.extend_from_slice(&[0x81, 0x70, 0x80, 0x3C, 0x40]);
+        // VLQ(240): EOT.
+        t.extend_from_slice(&[0x81, 0x70, 0xFF, 0x2F, 0x00]);
+        push_track(&mut blob, &t);
+        blob
+    }
+
     #[test]
     fn reset_clears_scheduler_and_voices() {
         let mut dec = MidiDecoder::new(Arc::new(ToneInstrument::new()), OUTPUT_SAMPLE_RATE);

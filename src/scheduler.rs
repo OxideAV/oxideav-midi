@@ -263,20 +263,28 @@ impl Scheduler {
                 mixer.channel_state_mut(channel).program = program;
             }
             ChannelBody::ControlChange { controller, value } => match controller {
+                6 => mixer.set_data_entry(channel, value, true), // RPN data MSB
                 7 => mixer.channel_state_mut(channel).volume = value,
                 10 => mixer.channel_state_mut(channel).pan = value,
+                38 => mixer.set_data_entry(channel, value, false), // RPN data LSB
                 64 => mixer.set_sustain(channel, value),
+                100 => mixer.set_rpn_byte(channel, value, false), // RPN LSB
+                101 => mixer.set_rpn_byte(channel, value, true),  // RPN MSB
                 120 | 123 => {
                     // CC 120 = All Sound Off, CC 123 = All Notes Off.
                     mixer.all_notes_off();
                 }
-                _ => { /* CC not handled in round 3 */ }
+                _ => { /* other CCs not modelled in round 4 */ }
             },
-            // Per-key aftertouch / channel aftertouch / pitch bend
-            // deferred to round 4.
-            ChannelBody::PolyAftertouch { .. }
-            | ChannelBody::ChannelAftertouch { .. }
-            | ChannelBody::PitchBend { .. } => {}
+            ChannelBody::PolyAftertouch { key, pressure } => {
+                mixer.set_poly_pressure(channel, key, pressure);
+            }
+            ChannelBody::ChannelAftertouch { pressure } => {
+                mixer.set_channel_pressure(channel, pressure);
+            }
+            ChannelBody::PitchBend { value } => {
+                mixer.set_pitch_bend(channel, value);
+            }
         }
     }
 
@@ -488,6 +496,70 @@ mod tests {
         s.step(4096, &mut mixer, &inst);
         assert_eq!(mixer.channel_state(0).volume, 50);
         assert_eq!(mixer.channel_state(0).pan, 0);
+    }
+
+    #[test]
+    fn pitch_bend_event_propagates_to_mixer() {
+        let mut ev = Vec::new();
+        // Note on, then pitch bend, then EOT.
+        ev.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // note on
+                                                         // Pitch bend max-up: status E0, lsb 0x7F, msb 0x7F.
+        ev.extend_from_slice(&[0x10, 0xE0, 0x7F, 0x7F]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.channel_state(0).pitch_bend, 0x3FFF);
+    }
+
+    #[test]
+    fn channel_pressure_event_propagates() {
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // note on
+        ev.extend_from_slice(&[0x10, 0xD0, 0x40]); // channel pressure
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.channel_state(0).channel_pressure, 0x40);
+    }
+
+    #[test]
+    fn rpn_zero_data_entry_changes_pitch_bend_range() {
+        let mut ev = Vec::new();
+        // CC 101 = 0 (RPN MSB), CC 100 = 0 (RPN LSB) → select RPN 0.
+        ev.extend_from_slice(&[0x00, 0xB0, 101, 0]);
+        ev.extend_from_slice(&[0x00, 0xB0, 100, 0]);
+        // CC 6 = 12 → ±12 semitones.
+        ev.extend_from_slice(&[0x00, 0xB0, 6, 12]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(4096, &mut mixer, &inst);
+        assert_eq!(mixer.channel_state(0).pitch_bend_range_cents, 1200);
+    }
+
+    #[test]
+    fn poly_aftertouch_event_propagates() {
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        // Poly aftertouch: status An, key, pressure.
+        ev.extend_from_slice(&[0x10, 0xA0, 0x3C, 0x50]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        // Just run the dispatcher — assertion is "doesn't crash and
+        // voice still alive". Detailed routing is covered in mixer tests.
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.live_voice_count(), 1);
     }
 
     #[test]

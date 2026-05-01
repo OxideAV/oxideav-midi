@@ -14,4 +14,4 @@ keywords = ["multimedia", "midi", "audio", "synth", "smf"]
 categories = ["multimedia::audio", "multimedia::encoding"]
 
 [dependencies]
-oxideav-core = "0.2"
+oxideav-core = "0.1"

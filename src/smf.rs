@@ -629,7 +629,7 @@ mod tests {
         let mut buf = vec![v & 0x7F];
         v >>= 7;
         while v != 0 {
-            buf.push(((v & 0x7F) | 0x80) as u32);
+            buf.push((v & 0x7F) | 0x80);
             v >>= 7;
         }
         // we built it LSB-first; reverse to get MSB-first wire order.

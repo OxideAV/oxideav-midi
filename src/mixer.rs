@@ -41,6 +41,15 @@ use crate::instruments::Voice;
 /// (32 voice fetches × 1024 samples = ~32 k mults per chunk).
 pub const MAX_VOICES: usize = 32;
 
+/// Convert a raw 14-bit pitch-bend scalar (`0..=16383`, centre `0x2000`)
+/// to a signed cents offset using the per-channel bend range. Default
+/// range is 200 cents (= ±2 semitones, GM RP-018 recommended practice).
+pub fn pitch_bend_to_cents(value: u16, range_cents: u16) -> i32 {
+    let centred = value.min(0x3FFF) as i32 - 0x2000;
+    // ±8192 maps to ±range_cents.
+    centred * range_cents as i32 / 0x2000
+}
+
 /// Number of MIDI channels — fixed by the spec, not configurable.
 pub const NUM_CHANNELS: usize = 16;
 
@@ -92,6 +101,22 @@ pub struct ChannelState {
     /// CC 64 (Sustain Pedal). `true` while the pedal is depressed
     /// (value >= 64); the mixer holds note-offs until it lifts.
     pub sustain: bool,
+    /// Live pitch-bend value as the raw 14-bit MIDI scalar
+    /// (`0..=16383`). Centre is `0x2000`. Map to cents via
+    /// `(value - 0x2000) * pitch_bend_range_cents / 8192`.
+    pub pitch_bend: u16,
+    /// Pitch-bend range in cents (default 200 = ±2 semitones per GM
+    /// recommended practice). Updated via RPN 0 (CC 100/101 = 0/0,
+    /// CC 6 = MSB semitones, CC 38 = LSB cents).
+    pub pitch_bend_range_cents: u16,
+    /// Channel pressure (mono aftertouch) as the raw `0..=127` scalar.
+    /// Default 0 = no pressure modulation.
+    pub channel_pressure: u8,
+    /// Currently-selected RPN as a 14-bit value (CC 100 LSB / CC 101
+    /// MSB). `0x3FFF` is the "RPN null" marker that disables further
+    /// CC-6 / CC-38 writes. We default to null so a CC 6 with no prior
+    /// RPN selection doesn't accidentally clobber the bend range.
+    pub rpn: u16,
 }
 
 impl Default for ChannelState {
@@ -101,6 +126,10 @@ impl Default for ChannelState {
             volume: 100,
             pan: 64,
             sustain: false,
+            pitch_bend: 0x2000,
+            pitch_bend_range_cents: 200,
+            channel_pressure: 0,
+            rpn: 0x3FFF,
         }
     }
 }
@@ -151,6 +180,94 @@ impl Mixer {
         &mut self.channels[channel as usize % NUM_CHANNELS]
     }
 
+    /// Apply a pitch-bend event. `value` is the raw 14-bit MIDI scalar
+    /// in `0..=16383` (centre = `0x2000`); the conversion to cents
+    /// uses the channel's current `pitch_bend_range_cents` (default
+    /// 200 = ±2 semitones, the GM recommended range — overridden via
+    /// RPN 0). Every still-held voice on `channel` is updated at once.
+    pub fn set_pitch_bend(&mut self, channel: u8, value: u16) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let v = value & 0x3FFF;
+        self.channels[ch].pitch_bend = v;
+        let cents = pitch_bend_to_cents(v, self.channels[ch].pitch_bend_range_cents);
+        for slot in self.slots.iter_mut() {
+            if slot.channel == channel {
+                if let Some(voice) = slot.voice.as_mut() {
+                    voice.set_pitch_bend_cents(cents);
+                }
+            }
+        }
+    }
+
+    /// Apply channel pressure (mono aftertouch, MIDI status `Dn`). The
+    /// `0..=127` value modulates volume on every still-held voice on
+    /// `channel`.
+    pub fn set_channel_pressure(&mut self, channel: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].channel_pressure = value;
+        let p = (value as f32 / 127.0).clamp(0.0, 1.0);
+        for slot in self.slots.iter_mut() {
+            if slot.channel == channel {
+                if let Some(voice) = slot.voice.as_mut() {
+                    voice.set_pressure(p);
+                }
+            }
+        }
+    }
+
+    /// Apply polyphonic key pressure (per-key aftertouch, MIDI status
+    /// `An`). Only voices matching `(channel, key)` are touched.
+    pub fn set_poly_pressure(&mut self, channel: u8, key: u8, value: u8) {
+        let p = (value as f32 / 127.0).clamp(0.0, 1.0);
+        for slot in self.slots.iter_mut() {
+            if slot.channel == channel && slot.key == key {
+                if let Some(voice) = slot.voice.as_mut() {
+                    voice.set_pressure(p);
+                }
+            }
+        }
+    }
+
+    /// Update the currently-selected RPN. Called from the scheduler in
+    /// response to CC 100 (LSB) / 101 (MSB). `is_msb` distinguishes the
+    /// two; the new 14-bit value lives in `channels[ch].rpn`.
+    pub fn set_rpn_byte(&mut self, channel: u8, value: u8, is_msb: bool) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let cur = self.channels[ch].rpn;
+        let new = if is_msb {
+            (cur & 0x007F) | ((value as u16 & 0x7F) << 7)
+        } else {
+            (cur & 0x3F80) | (value as u16 & 0x7F)
+        };
+        self.channels[ch].rpn = new;
+    }
+
+    /// Apply a data-entry CC (CC 6 = MSB, CC 38 = LSB) to whatever the
+    /// currently-selected RPN is. Round-4 only honours RPN 0
+    /// (pitch-bend range): CC 6 = semitone count, CC 38 = additional
+    /// cents. Other RPNs are silently ignored.
+    pub fn set_data_entry(&mut self, channel: u8, value: u8, is_msb: bool) {
+        let ch = channel as usize % NUM_CHANNELS;
+        if self.channels[ch].rpn != 0 {
+            // Only RPN 0 (pitch-bend range) matters in round 4.
+            return;
+        }
+        let cur = self.channels[ch].pitch_bend_range_cents;
+        let new = if is_msb {
+            // CC 6: semitone portion. Replace the "hundreds" digit
+            // (semitones * 100) and keep the LSB cents.
+            value as u16 * 100 + (cur % 100)
+        } else {
+            // CC 38: cents portion (0..=99).
+            (cur / 100) * 100 + (value as u16 % 100)
+        };
+        self.channels[ch].pitch_bend_range_cents = new.max(1); // never zero
+                                                               // Re-apply the live bend with the new range so still-held voices
+                                                               // pick up the change immediately.
+        let bend = self.channels[ch].pitch_bend;
+        self.set_pitch_bend(channel, bend);
+    }
+
     /// Apply CC 64 (sustain pedal). When the value crosses below the
     /// 64 threshold while the pedal is currently held, every voice on
     /// `channel` whose `sustained` flag is set has its release fired.
@@ -199,8 +316,19 @@ impl Mixer {
 
     /// Insert a freshly-built voice for `channel` / `key`. Velocity is
     /// recorded for diagnostics; the actual amplitude lives inside the
-    /// voice (the SF2 / tone constructors fold it in).
-    pub fn note_on(&mut self, channel: u8, key: u8, velocity: u8, voice: Box<dyn Voice>) {
+    /// voice (the SF2 / tone constructors fold it in). Channel-level
+    /// pitch bend and aftertouch are applied to the freshly-allocated
+    /// voice so a note triggered while the bend wheel is held picks up
+    /// the offset on its first sample.
+    pub fn note_on(&mut self, channel: u8, key: u8, velocity: u8, mut voice: Box<dyn Voice>) {
+        let st = self.channels[channel as usize % NUM_CHANNELS];
+        let cents = pitch_bend_to_cents(st.pitch_bend, st.pitch_bend_range_cents);
+        if cents != 0 {
+            voice.set_pitch_bend_cents(cents);
+        }
+        if st.channel_pressure != 0 {
+            voice.set_pressure(st.channel_pressure as f32 / 127.0);
+        }
         let idx = self.pick_slot();
         let age = self.next_age;
         self.next_age = self.next_age.wrapping_add(1);
@@ -328,11 +456,15 @@ mod tests {
 
     /// A test voice that produces a constant DC value for `total`
     /// samples then reports `done`. Lets us assert mix arithmetic
-    /// without standing up a full SF2 fixture.
+    /// without standing up a full SF2 fixture. Also records the last
+    /// pitch-bend / pressure value pushed in via the optional Voice
+    /// methods so tests can assert routing.
     struct ConstVoice {
         value: f32,
         remaining: usize,
         done: bool,
+        last_bend_cents: std::sync::Arc<std::sync::Mutex<i32>>,
+        last_pressure: std::sync::Arc<std::sync::Mutex<f32>>,
     }
     impl Voice for ConstVoice {
         fn render(&mut self, out: &mut [f32]) -> usize {
@@ -356,6 +488,12 @@ mod tests {
         fn done(&self) -> bool {
             self.done
         }
+        fn set_pitch_bend_cents(&mut self, cents: i32) {
+            *self.last_bend_cents.lock().unwrap() = cents;
+        }
+        fn set_pressure(&mut self, p: f32) {
+            *self.last_pressure.lock().unwrap() = p;
+        }
     }
 
     fn voice(value: f32, samples: usize) -> Box<dyn Voice> {
@@ -363,7 +501,28 @@ mod tests {
             value,
             remaining: samples,
             done: false,
+            last_bend_cents: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            last_pressure: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
         })
+    }
+
+    type BendCell = std::sync::Arc<std::sync::Mutex<i32>>;
+    type PressureCell = std::sync::Arc<std::sync::Mutex<f32>>;
+
+    /// Build a [`ConstVoice`] plus shared handles to its `last_bend_cents`
+    /// / `last_pressure` cells so the test can read the values back after
+    /// the mixer has handed the voice to its slot.
+    fn instrumented_voice(value: f32, samples: usize) -> (Box<dyn Voice>, BendCell, PressureCell) {
+        let bend = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let press = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+        let v = Box::new(ConstVoice {
+            value,
+            remaining: samples,
+            done: false,
+            last_bend_cents: bend.clone(),
+            last_pressure: press.clone(),
+        });
+        (v, bend, press)
     }
 
     #[test]
@@ -504,5 +663,103 @@ mod tests {
         assert_eq!(m.live_voice_count(), 2);
         m.all_notes_off();
         assert_eq!(m.live_voice_count(), 0);
+    }
+
+    #[test]
+    fn pitch_bend_to_cents_centre_is_zero() {
+        // 0x2000 = centre = no bend.
+        assert_eq!(pitch_bend_to_cents(0x2000, 200), 0);
+    }
+
+    #[test]
+    fn pitch_bend_to_cents_full_up_is_plus_range() {
+        // 0x3FFF = +max = +range cents (≈ 200 = +2 semitones at default).
+        let cents = pitch_bend_to_cents(0x3FFF, 200);
+        assert!((199..=200).contains(&cents), "got {cents}");
+    }
+
+    #[test]
+    fn pitch_bend_to_cents_full_down_is_minus_range() {
+        // 0 = -max.
+        let cents = pitch_bend_to_cents(0, 200);
+        assert_eq!(cents, -200);
+    }
+
+    #[test]
+    fn pitch_bend_routes_to_held_voices() {
+        let mut m = Mixer::new();
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        m.set_pitch_bend(0, 0x3FFF); // hard up
+        let cents = *bend_cell.lock().unwrap();
+        assert!((199..=200).contains(&cents), "got {cents}");
+        // ChannelState should also reflect the new value.
+        assert_eq!(m.channel_state(0).pitch_bend, 0x3FFF);
+    }
+
+    #[test]
+    fn pitch_bend_applied_at_note_on_when_already_held() {
+        let mut m = Mixer::new();
+        // Bend up first, then start a note — the new voice should see
+        // the bend on its very first sample.
+        m.set_pitch_bend(0, 0x3FFF);
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        let cents = *bend_cell.lock().unwrap();
+        assert!(
+            cents >= 199,
+            "note-on did not pick up live pitch bend: got {cents}"
+        );
+    }
+
+    #[test]
+    fn channel_pressure_routes_to_all_channel_voices_only() {
+        let mut m = Mixer::new();
+        let (v0, _, p0) = instrumented_voice(0.5, 1024);
+        let (v1, _, p1) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v0);
+        m.note_on(1, 64, 100, v1);
+        m.set_channel_pressure(0, 100); // only ch 0
+        let pa = *p0.lock().unwrap();
+        let pb = *p1.lock().unwrap();
+        assert!(pa > 0.5, "ch 0 pressure not routed: {pa}");
+        assert_eq!(pb, 0.0, "ch 1 pressure should be untouched");
+    }
+
+    #[test]
+    fn poly_pressure_only_routes_to_matching_key() {
+        let mut m = Mixer::new();
+        let (v_match, _, p_match) = instrumented_voice(0.5, 1024);
+        let (v_other, _, p_other) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v_match);
+        m.note_on(0, 64, 100, v_other);
+        m.set_poly_pressure(0, 60, 80);
+        let pa = *p_match.lock().unwrap();
+        let pb = *p_other.lock().unwrap();
+        assert!(pa > 0.0, "matching-key voice didn't see pressure: {pa}");
+        assert_eq!(pb, 0.0, "non-matching-key voice should be untouched");
+    }
+
+    #[test]
+    fn rpn_zero_then_data_entry_changes_bend_range() {
+        let mut m = Mixer::new();
+        // Select RPN 0 (CC 101 MSB = 0, CC 100 LSB = 0).
+        m.set_rpn_byte(0, 0, true);
+        m.set_rpn_byte(0, 0, false);
+        // CC 6 = 12 → ±12 semitones (= 1200 cents).
+        m.set_data_entry(0, 12, true);
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 1200);
+        // CC 38 = 50 → +50 cents on top.
+        m.set_data_entry(0, 50, false);
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 1250);
+    }
+
+    #[test]
+    fn rpn_null_blocks_data_entry() {
+        let mut m = Mixer::new();
+        // No RPN selected (default = 0x3FFF, the null marker).
+        m.set_data_entry(0, 12, true);
+        // Default range (200) must be untouched.
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 200);
     }
 }

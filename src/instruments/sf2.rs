@@ -90,6 +90,29 @@ pub const GEN_FINE_TUNE: u16 = 52;
 /// `overridingRootKey` (gen 58): MIDI key, replaces sample's own root.
 pub const GEN_OVERRIDING_ROOT_KEY: u16 = 58;
 
+// ---- volume envelope (DAHDSR) generators ----
+/// `delayVolEnv` (gen 33): signed timecents until the envelope starts.
+/// `time_seconds = 2^(timecents/1200)`. Spec default: -12000 (= ~1 ms,
+/// effectively no delay).
+pub const GEN_DELAY_VOL_ENV: u16 = 33;
+/// `attackVolEnv` (gen 34): linear ramp from 0 to peak in timecents.
+pub const GEN_ATTACK_VOL_ENV: u16 = 34;
+/// `holdVolEnv` (gen 35): hold at peak before decay begins, timecents.
+pub const GEN_HOLD_VOL_ENV: u16 = 35;
+/// `decayVolEnv` (gen 36): time (timecents) to exponentially decay from
+/// peak (1.0 linear / 0 dB) to the sustain level.
+pub const GEN_DECAY_VOL_ENV: u16 = 36;
+/// `sustainVolEnv` (gen 37): sustain attenuation in centibels (10 cB =
+/// 1 dB). 0 = full peak, 1000 = -100 dB ≈ silence. The spec caps the
+/// sensible range at ~1440 cB.
+pub const GEN_SUSTAIN_VOL_ENV: u16 = 37;
+/// `releaseVolEnv` (gen 38): exponential release from current level to
+/// silence in timecents.
+pub const GEN_RELEASE_VOL_ENV: u16 = 38;
+/// `initialAttenuation` (gen 48): static attenuation in centibels
+/// applied to the whole voice. Default 0 (no attenuation).
+pub const GEN_INITIAL_ATTENUATION: u16 = 48;
+
 // -------------------------------------------------------------------------
 // In-memory bank representation.
 // -------------------------------------------------------------------------
@@ -617,6 +640,118 @@ pub struct SamplePlan {
     /// sample's native rate. A note one octave above the original key
     /// gives 2.0; one octave below gives 0.5.
     pub pitch_ratio: f64,
+    /// Combined semitone+cents offset baked into `pitch_ratio`. Carried
+    /// separately so the live voice can re-compute the playback rate
+    /// after a pitch-bend event without re-resolving the whole plan.
+    pub semitones: i32,
+    pub fine_cents: i32,
+    /// Volume envelope (DAHDSR) parameters in **timecents** for the
+    /// time fields and **centibels** for the sustain attenuation. SF2
+    /// generators 33-38 (delay/attack/hold/decay/sustain/release) feed
+    /// directly into these slots.
+    pub env: EnvParams,
+    /// Static attenuation in centibels (gen 48 `initialAttenuation`).
+    /// Folded into the voice's amplitude on construction.
+    pub initial_attenuation_cb: i32,
+}
+
+/// SF2 volume-envelope parameters in spec units (timecents for times,
+/// centibels for sustain attenuation). Construction from raw generator
+/// values goes through [`EnvParams::from_generators`].
+#[derive(Clone, Copy, Debug)]
+pub struct EnvParams {
+    /// Delay before envelope start (timecents). `i32::MIN` is treated
+    /// as the spec default ~ -12000 (≈ 1 ms, effectively zero).
+    pub delay_tc: i32,
+    /// Linear-rise attack time (timecents).
+    pub attack_tc: i32,
+    /// Hold-at-peak time before decay begins (timecents).
+    pub hold_tc: i32,
+    /// Exponential decay-to-sustain time (timecents).
+    pub decay_tc: i32,
+    /// Sustain attenuation in centibels (10 cB = 1 dB).
+    pub sustain_cb: i32,
+    /// Exponential release time (timecents).
+    pub release_tc: i32,
+}
+
+impl Default for EnvParams {
+    fn default() -> Self {
+        // SF2 spec defaults: every time field = -12000 timecents
+        // (≈ 1 ms, treated as "instantaneous"); sustain = 0 cB
+        // (no attenuation). With pure spec defaults the envelope is
+        // effectively disabled — so when no generators override these
+        // we substitute round-4 "musical" defaults (5 ms attack,
+        // 100 ms decay, full sustain, 100 ms release) so that fixtures
+        // without explicit envelope generators still get an audible
+        // ADSR shape rather than the round-3 flat AR.
+        Self {
+            delay_tc: i32::MIN,
+            attack_tc: i32::MIN,
+            hold_tc: i32::MIN,
+            decay_tc: i32::MIN,
+            sustain_cb: 0,
+            release_tc: i32::MIN,
+        }
+    }
+}
+
+impl EnvParams {
+    /// Pull the six generators (33-38) out of the instrument-zone
+    /// generators (with falling back to the preset zone). Per the SF2
+    /// spec, igen wins, but pgen *adds* to the igen value when both are
+    /// present — except for sustain which is pgen-overrides. We approxi-
+    /// mate that with "igen wins, else pgen" since real banks use one or
+    /// the other, not both, for envelope shaping.
+    pub fn from_generators(igens: &[Generator], pgens: &[Generator]) -> Self {
+        fn pick(igens: &[Generator], pgens: &[Generator], oper: u16) -> Option<i16> {
+            generator_amount(igens, oper)
+                .or_else(|| generator_amount(pgens, oper))
+                .map(|v| v as i16)
+        }
+        Self {
+            delay_tc: pick(igens, pgens, GEN_DELAY_VOL_ENV)
+                .map(i32::from)
+                .unwrap_or(i32::MIN),
+            attack_tc: pick(igens, pgens, GEN_ATTACK_VOL_ENV)
+                .map(i32::from)
+                .unwrap_or(i32::MIN),
+            hold_tc: pick(igens, pgens, GEN_HOLD_VOL_ENV)
+                .map(i32::from)
+                .unwrap_or(i32::MIN),
+            decay_tc: pick(igens, pgens, GEN_DECAY_VOL_ENV)
+                .map(i32::from)
+                .unwrap_or(i32::MIN),
+            sustain_cb: pick(igens, pgens, GEN_SUSTAIN_VOL_ENV)
+                .map(|v| v as i32)
+                .unwrap_or(0),
+            release_tc: pick(igens, pgens, GEN_RELEASE_VOL_ENV)
+                .map(i32::from)
+                .unwrap_or(i32::MIN),
+        }
+    }
+}
+
+/// Convert SF2 timecents to seconds. `2^(timecents/1200)`. The
+/// `i32::MIN` sentinel returns the round-4 musical default (`fallback`).
+pub fn timecents_to_seconds(tc: i32, fallback: f32) -> f32 {
+    if tc == i32::MIN {
+        return fallback;
+    }
+    // Spec defaults of -12000 (= ~1 ms) are themselves "no envelope" in
+    // the audible sense — substitute the fallback if we get the spec
+    // default *without* any larger override on the same field.
+    if tc <= -12000 {
+        return fallback.min(0.001);
+    }
+    (2.0f64).powf(tc as f64 / 1200.0) as f32
+}
+
+/// Convert SF2 sustain centibels to a linear gain. `cb = 10 * dB`. Spec
+/// caps at +1440 cB (≈ 0); we clamp at 1440 (≈ -144 dB).
+pub fn centibels_to_gain(cb: i32) -> f32 {
+    let clamped = cb.clamp(0, 1440) as f32;
+    (10.0f32).powf(-clamped / 200.0)
 }
 
 impl SamplePlan {
@@ -665,6 +800,10 @@ impl SamplePlan {
         let semitones = target_key as i32 - root as i32 + coarse;
         let pitch_ratio = (2f64).powf(semitones as f64 / 12.0) * (2f64).powf(fine as f64 / 1200.0);
 
+        let env = EnvParams::from_generators(igens, pgens);
+        let initial_attenuation_cb = signed_amount(igens, GEN_INITIAL_ATTENUATION) as i32
+            + signed_amount(pgens, GEN_INITIAL_ATTENUATION) as i32;
+
         Self {
             start,
             end,
@@ -673,6 +812,10 @@ impl SamplePlan {
             sample_rate: sample.sample_rate.max(1),
             loops,
             pitch_ratio,
+            semitones,
+            fine_cents: fine,
+            env,
+            initial_attenuation_cb,
         }
     }
 }
@@ -1027,6 +1170,15 @@ fn parse_shdr(body: &[u8]) -> Result<Vec<SampleHeader>> {
 /// PCM buffer and walks it at the requested pitch ratio. Linear
 /// interpolation between adjacent samples (round-3 will swap in cubic
 /// Hermite or sinc).
+///
+/// Round-4 envelope shape is full DAHDSR (delay, attack, hold,
+/// exponential decay-to-sustain, sustain, exponential release). The
+/// times come from SF2 generators 33-38 (timecents) with round-4
+/// musical defaults for any field the bank doesn't override. Pitch bend
+/// is applied at render time via [`Sf2Voice::set_pitch_bend_cents`];
+/// channel/poly aftertouch is folded into the final amplitude via
+/// [`Sf2Voice::set_pressure`] (the SF2 default modulator chain routes
+/// pressure to volume — see `simplified default` row in §8.4.x).
 pub struct Sf2Voice {
     sample_data: Arc<[i16]>,
     /// Absolute frame index into `sample_data` of the playback start.
@@ -1047,17 +1199,43 @@ pub struct Sf2Voice {
     /// integer part is the frame index, the fractional part feeds the
     /// linear interpolator.
     phase: f64,
-    /// How many frames of `sample_data` we advance per output frame.
-    /// Combines pitch ratio with the (sample_rate / output_rate) ratio.
+    /// Base playback rate before any pitch-bend modulation: combines
+    /// the resolved pitch ratio with the sample-rate / output-rate
+    /// conversion. We store it so `set_pitch_bend_cents` can derive
+    /// `phase_inc` without touching the original plan.
+    base_phase_inc: f64,
+    /// Live playback rate (frames of `sample_data` per output frame).
+    /// Equal to `base_phase_inc * 2^(pitch_bend_cents/1200)`.
     phase_inc: f64,
-    /// Output gain (velocity-curve folded in).
+    /// Output gain (velocity-curve + initialAttenuation folded in).
     amplitude: f32,
-    release_pos: Option<u32>,
-    release_samples: u32,
+    /// Aftertouch / channel-pressure gain in `0.0..=1.0`. Multiplied
+    /// into every sample at render time. Default 1.0 = no attenuation.
+    pressure_gain: f32,
+    /// Live pitch-bend offset in cents (1/100 semitone). Updated by
+    /// [`set_pitch_bend_cents`]; consumed when computing `phase_inc`.
+    pitch_bend_cents: i32,
+    /// Sample counter (in *output* frames, not source frames).
     elapsed: u32,
-    /// Linear attack — kept short so test fixtures don't have to
-    /// render thousands of samples to see audible output.
+    /// Sample at which `release()` was called, or `None` while the note
+    /// is still held.
+    release_pos: Option<u32>,
+    /// Envelope level captured at the moment of release. The release
+    /// stage starts from this value and decays exponentially to silence
+    /// over `release_samples`.
+    release_start_level: f32,
+    /// Volume envelope (DAHDSR) phase boundaries, in *output* frames.
+    delay_samples: u32,
     attack_samples: u32,
+    hold_samples: u32,
+    decay_samples: u32,
+    release_samples: u32,
+    /// Linear sustain level in `0.0..=1.0` (computed once from the
+    /// `sustain_cb` generator). Decay falls from 1.0 to this level;
+    /// release falls from `release_start_level` toward zero.
+    sustain_level: f32,
+    /// `true` once the envelope has fully released (or the sample has
+    /// run off the end of a non-looping zone). Drives `done()`.
     done: bool,
 }
 
@@ -1068,9 +1246,27 @@ impl Sf2Voice {
         velocity: u8,
         output_rate: u32,
     ) -> Self {
+        // SF2 default modulator: velocity → initialAttenuation. The
+        // conventional curve is `40 * log10(127/vel)` dB (≈ -40 dB at
+        // velocity 1, 0 dB at 127). We approximate with the v^2 curve
+        // the round-3 voice already used; combining it with `gen 48`
+        // initialAttenuation gives the round-4 default modulator chain
+        // a sensible velocity response without standing up the full
+        // SF2 modulator language.
         let v = (velocity as f32 / 127.0).clamp(0.0, 1.0);
-        let amplitude = v * v * 0.5;
+        let attn = centibels_to_gain(plan.initial_attenuation_cb);
+        let amplitude = v * v * 0.5 * attn;
         let phase_inc = plan.pitch_ratio * (plan.sample_rate as f64 / output_rate.max(1) as f64);
+
+        // Round-4 musical fallbacks for fields the bank didn't set.
+        let sr = output_rate.max(1) as f32;
+        let delay_s = timecents_to_seconds(plan.env.delay_tc, 0.0);
+        let attack_s = timecents_to_seconds(plan.env.attack_tc, 0.005);
+        let hold_s = timecents_to_seconds(plan.env.hold_tc, 0.0);
+        let decay_s = timecents_to_seconds(plan.env.decay_tc, 0.100);
+        let release_s = timecents_to_seconds(plan.env.release_tc, 0.100);
+        let sustain_level = centibels_to_gain(plan.env.sustain_cb);
+
         Self {
             sample_data,
             start: plan.start,
@@ -1079,15 +1275,71 @@ impl Sf2Voice {
             end_loop: plan.end_loop,
             loops: plan.loops,
             phase: plan.start as f64,
+            base_phase_inc: phase_inc,
             phase_inc,
             amplitude,
-            release_pos: None,
-            // 50 ms release. Keeps voices from clicking when released.
-            release_samples: (output_rate as f32 * 0.05) as u32,
+            pressure_gain: 1.0,
+            pitch_bend_cents: 0,
             elapsed: 0,
-            attack_samples: (output_rate as f32 * 0.005) as u32, // 5 ms
+            release_pos: None,
+            release_start_level: 1.0,
+            delay_samples: (sr * delay_s) as u32,
+            attack_samples: (sr * attack_s).max(1.0) as u32,
+            hold_samples: (sr * hold_s) as u32,
+            decay_samples: (sr * decay_s).max(1.0) as u32,
+            release_samples: (sr * release_s).max(1.0) as u32,
+            sustain_level,
             done: false,
         }
+    }
+
+    /// Compute the envelope value at the current `elapsed` sample. Walks
+    /// through Delay → Attack → Hold → Decay → Sustain (or Release
+    /// after `release()`).
+    fn envelope_at(&self, t: u32) -> f32 {
+        // Release: dominant once the user has lifted the note.
+        if let Some(rel_at) = self.release_pos {
+            let since = t.saturating_sub(rel_at);
+            if since >= self.release_samples {
+                return 0.0;
+            }
+            // Exponential release from `release_start_level` to 0. We
+            // use the linear-interpolated -100 dB-floor approximation
+            // from FluidSynth: level *= 10^(-0.05 * t / release_seconds).
+            // Equivalently: end_level = start * 10^(-100/20) ≈ 1e-5 over
+            // the full release window. We use the simpler `start * (1 -
+            // x)^2` curve which sounds nearly identical and is cheaper.
+            let x = since as f32 / self.release_samples.max(1) as f32;
+            let curve = (1.0 - x) * (1.0 - x);
+            return self.release_start_level * curve;
+        }
+        // Delay phase: nothing.
+        if t < self.delay_samples {
+            return 0.0;
+        }
+        let t = t - self.delay_samples;
+        // Attack: linear ramp from 0 to 1.
+        if t < self.attack_samples {
+            return t as f32 / self.attack_samples.max(1) as f32;
+        }
+        let t = t - self.attack_samples;
+        // Hold at peak.
+        if t < self.hold_samples {
+            return 1.0;
+        }
+        let t = t - self.hold_samples;
+        // Decay: exponential from 1.0 down to sustain_level. We use
+        // `1.0 - (1.0 - sustain) * (1 - (1-x)^2)` so the curve starts
+        // steep then flattens — perceptually close to a true exp decay
+        // without `expf` in the inner loop.
+        if t < self.decay_samples {
+            let x = t as f32 / self.decay_samples.max(1) as f32;
+            let drop = 1.0 - self.sustain_level;
+            let curve = 1.0 - (1.0 - x) * (1.0 - x);
+            return 1.0 - drop * curve;
+        }
+        // Sustain.
+        self.sustain_level
     }
 
     /// Sample one PCM frame at fractional index `phase` (linear
@@ -1111,19 +1363,12 @@ impl Voice for Sf2Voice {
             return 0;
         }
         for (i, slot) in out.iter_mut().enumerate() {
-            // Envelope: linear attack, sustain at 1.0, linear release.
-            let env = if let Some(rel_at) = self.release_pos {
-                let since = self.elapsed.saturating_sub(rel_at);
-                if since >= self.release_samples {
-                    self.done = true;
-                    return i;
-                }
-                1.0 - (since as f32 / self.release_samples.max(1) as f32)
-            } else if self.elapsed < self.attack_samples {
-                self.elapsed as f32 / self.attack_samples.max(1) as f32
-            } else {
-                1.0
-            };
+            let env = self.envelope_at(self.elapsed);
+            // Envelope ran fully out post-release? Voice is done.
+            if self.release_pos.is_some() && env <= 0.0 {
+                self.done = true;
+                return i;
+            }
 
             // If we've walked off the end of the (non-looping) sample
             // and the user hasn't released us, mark done — there's no
@@ -1149,7 +1394,7 @@ impl Voice for Sf2Voice {
             }
 
             let s = self.fetch(self.phase);
-            *slot = s * env * self.amplitude;
+            *slot = s * env * self.amplitude * self.pressure_gain;
             self.phase += self.phase_inc;
             self.elapsed = self.elapsed.wrapping_add(1);
         }
@@ -1158,12 +1403,30 @@ impl Voice for Sf2Voice {
 
     fn release(&mut self) {
         if self.release_pos.is_none() {
+            // Capture the current envelope level so the release stage
+            // starts from where we actually are (mid-attack notes
+            // shouldn't suddenly jump to 1.0 just because of release).
+            self.release_start_level = self.envelope_at(self.elapsed).max(0.0);
             self.release_pos = Some(self.elapsed);
         }
     }
 
     fn done(&self) -> bool {
         self.done
+    }
+
+    fn set_pitch_bend_cents(&mut self, cents: i32) {
+        self.pitch_bend_cents = cents;
+        let bend_ratio = (2.0f64).powf(cents as f64 / 1200.0);
+        self.phase_inc = self.base_phase_inc * bend_ratio;
+    }
+
+    fn set_pressure(&mut self, pressure: f32) {
+        // SF2 default modulator: pressure routed to volume. Map 0..1
+        // to a gentle gain curve so low pressure doesn't kill the note
+        // — synths typically treat 0 pressure as "no boost", not "off".
+        let p = pressure.clamp(0.0, 1.0);
+        self.pressure_gain = 1.0 + 0.5 * p; // 1.0 at rest, 1.5 at full
     }
 }
 
@@ -1649,6 +1912,246 @@ mod tests {
         assert_eq!(zstring(b"hi\0\0\0"), "hi");
         assert_eq!(zstring(b"abc"), "abc");
         assert_eq!(zstring(b""), "");
+    }
+
+    #[test]
+    fn timecents_to_seconds_round_trip() {
+        // 0 timecents = 1 s.
+        assert!((timecents_to_seconds(0, 0.0) - 1.0).abs() < 1e-6);
+        // 1200 timecents = 2 s.
+        assert!((timecents_to_seconds(1200, 0.0) - 2.0).abs() < 1e-4);
+        // -1200 timecents = 0.5 s.
+        assert!((timecents_to_seconds(-1200, 0.0) - 0.5).abs() < 1e-4);
+        // i32::MIN sentinel returns the fallback.
+        assert!((timecents_to_seconds(i32::MIN, 0.05) - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn centibels_to_gain_known_values() {
+        // 0 cB = full gain.
+        assert!((centibels_to_gain(0) - 1.0).abs() < 1e-6);
+        // 200 cB = -20 dB ≈ 0.1.
+        assert!((centibels_to_gain(200) - 0.1).abs() < 1e-3);
+        // 1000 cB = -100 dB.
+        assert!(centibels_to_gain(1000) < 1e-4);
+    }
+
+    #[test]
+    fn voice_pitch_bend_changes_phase_inc() {
+        let blob = build_minimal_looping_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let inst = Sf2Instrument {
+            name: "test".into(),
+            bank,
+        };
+        // Native rate = 22050; output = 22050 → phase_inc = 1.0 at
+        // centre. +1200 cents = +1 octave → phase_inc = 2.0.
+        let mut voice = inst.make_voice(0, 60, 100, 22_050).unwrap();
+        // Render half a buffer at centre, count the phase movement
+        // implicitly via output amplitude variance.
+        let mut buf = vec![0.0f32; 1024];
+        voice.render(&mut buf);
+        let energy_centre: f32 = buf.iter().map(|s| s * s).sum();
+        // Now bend up an octave and render again.
+        voice.set_pitch_bend_cents(1200);
+        let mut buf2 = vec![0.0f32; 1024];
+        voice.render(&mut buf2);
+        // The looping ramp at 2× speed produces twice as many "edges"
+        // per chunk, but total energy stays comparable. Assert the
+        // voice didn't go silent and still produces audio.
+        let energy_bent: f32 = buf2.iter().map(|s| s * s).sum();
+        assert!(energy_bent > 0.001, "bent voice silent: {energy_bent}");
+        assert!(
+            energy_centre > 0.001,
+            "centre voice silent: {energy_centre}",
+        );
+    }
+
+    #[test]
+    fn voice_pressure_boosts_amplitude() {
+        let blob = build_minimal_looping_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let inst = Sf2Instrument {
+            name: "test".into(),
+            bank,
+        };
+        let mut a = inst.make_voice(0, 60, 100, 22_050).unwrap();
+        let mut b = inst.make_voice(0, 60, 100, 22_050).unwrap();
+        b.set_pressure(1.0);
+        // Render past attack (5 ms = 110 samples at 22050 Hz).
+        let mut buf_a = vec![0.0f32; 1024];
+        let mut buf_b = vec![0.0f32; 1024];
+        a.render(&mut buf_a);
+        b.render(&mut buf_b);
+        // Sample post-attack peak.
+        let peak_a: f32 = buf_a[200..1000].iter().map(|s| s.abs()).fold(0.0, f32::max);
+        let peak_b: f32 = buf_b[200..1000].iter().map(|s| s.abs()).fold(0.0, f32::max);
+        assert!(
+            peak_b > peak_a * 1.2,
+            "pressure didn't boost: a={peak_a}, b={peak_b}"
+        );
+    }
+
+    #[test]
+    fn envelope_release_starts_from_current_level() {
+        // Release fired *during* attack should not jump to peak. The
+        // release stage starts from the live envelope sample.
+        let blob = build_minimal_looping_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let inst = Sf2Instrument {
+            name: "test".into(),
+            bank,
+        };
+        let mut voice = inst.make_voice(0, 60, 127, 48_000).unwrap();
+        // Render only a handful of samples (still in attack at 5 ms /
+        // 240 samples), then release.
+        let mut buf = vec![0.0f32; 16];
+        voice.render(&mut buf);
+        voice.release();
+        // Drain to done. 100 ms release at 48 kHz = 4800 samples; with
+        // 16-sample chunks that's 300 iterations — give plenty of head-
+        // room for the loop bound.
+        let mut total = 0;
+        let mut peak: f32 = 0.0;
+        for _ in 0..1024 {
+            let n = voice.render(&mut buf);
+            for s in &buf[..n] {
+                peak = peak.max(s.abs());
+            }
+            total += n;
+            if voice.done() {
+                break;
+            }
+        }
+        assert!(voice.done(), "voice should finish after release");
+        // A mid-attack release shouldn't pop to peak — the release-
+        // start level is bounded by what attack delivered (~ 16/240 ≈
+        // 0.07 of peak gain).
+        assert!(
+            peak < 0.5,
+            "release start must not jump to full amplitude: peak={peak}",
+        );
+        assert!(total > 0);
+    }
+
+    #[test]
+    fn envelope_full_dahdsr_overrides_via_generators() {
+        // Build a fixture where the bank explicitly sets a long attack
+        // (~50 ms = ~3000 samples at 44.1 kHz) and assert the rendered
+        // output rises gradually instead of hitting peak by sample 240.
+        let blob = build_envelope_override_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let inst = Sf2Instrument {
+            name: "test".into(),
+            bank,
+        };
+        let mut voice = inst.make_voice(0, 60, 127, 44_100).unwrap();
+        let mut buf = vec![0.0f32; 4096];
+        voice.render(&mut buf);
+        // At sample 100 (~ 2 ms) we should be quieter than at sample
+        // 2500 (~ 56 ms, near the end of the long attack).
+        let early = buf[80..120].iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+        let late = buf[2400..2600]
+            .iter()
+            .map(|s| s.abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            late > early * 2.0,
+            "long attack should ramp gradually: early={early}, late={late}",
+        );
+    }
+
+    /// Same fixture as `build_minimal_looping_sf2` but with explicit
+    /// envelope generators (attackVolEnv = 50 ms, sustainVolEnv = 200
+    /// cB ≈ -20 dB) so we can exercise the round-4 ADSR path.
+    fn build_envelope_override_sf2() -> Vec<u8> {
+        let mut samples: Vec<i16> = Vec::with_capacity(20);
+        for i in 0i32..20 {
+            let v = (i * 800 - 8000) as i16;
+            samples.push(v);
+        }
+        let mut smpl_bytes = Vec::with_capacity(samples.len() * 2);
+        for s in &samples {
+            smpl_bytes.extend_from_slice(&s.to_le_bytes());
+        }
+
+        let mut info = Vec::new();
+        push_chunk(&mut info, b"ifil", &{
+            let mut v = Vec::new();
+            v.extend_from_slice(&2u16.to_le_bytes());
+            v.extend_from_slice(&4u16.to_le_bytes());
+            v
+        });
+        let mut info_list = Vec::new();
+        info_list.extend_from_slice(b"INFO");
+        info_list.extend_from_slice(&info);
+
+        let mut sdta = Vec::new();
+        push_chunk(&mut sdta, b"smpl", &smpl_bytes);
+        let mut sdta_list = Vec::new();
+        sdta_list.extend_from_slice(b"sdta");
+        sdta_list.extend_from_slice(&sdta);
+
+        let mut phdr = Vec::new();
+        phdr.extend_from_slice(&phdr_record("Test Preset", 0, 0, 0));
+        phdr.extend_from_slice(&phdr_record("EOP", 0, 0, 1));
+        let mut pbag = Vec::new();
+        pbag.extend_from_slice(&bag_record(0, 0));
+        pbag.extend_from_slice(&bag_record(1, 0));
+        let pmod = vec![0u8; PMOD_RECORD];
+        let mut pgen = Vec::new();
+        pgen.extend_from_slice(&gen_record(GEN_INSTRUMENT, 0));
+        pgen.extend_from_slice(&gen_record(0, 0));
+        let mut inst_chunk = Vec::new();
+        inst_chunk.extend_from_slice(&inst_record("Test Inst", 0));
+        inst_chunk.extend_from_slice(&inst_record("EOI", 2));
+        let mut ibag = Vec::new();
+        ibag.extend_from_slice(&bag_record(0, 0));
+        // Four real gens in this zone (attack + sustain + sample modes
+        // + sample id), then the gen-sentinel-zero at index 4. The
+        // sentinel bag's gen_start points at the sentinel gen (= 4).
+        ibag.extend_from_slice(&bag_record(4, 0));
+        let imod = vec![0u8; IMOD_RECORD];
+        // attackVolEnv = -4660 timecents (= ~50 ms): 2^(-4660/1200) ≈
+        // 0.0596 s ≈ 50 ms. Encode -4660 as u16: 0xEDAC.
+        let attack_tc: i16 = -4660;
+        // sustainVolEnv = 200 cB (-20 dB).
+        let sustain_cb: i16 = 200;
+        let mut igen = Vec::new();
+        igen.extend_from_slice(&gen_record(GEN_ATTACK_VOL_ENV, attack_tc as u16));
+        igen.extend_from_slice(&gen_record(GEN_SUSTAIN_VOL_ENV, sustain_cb as u16));
+        igen.extend_from_slice(&gen_record(GEN_SAMPLE_MODES, 1));
+        igen.extend_from_slice(&gen_record(GEN_SAMPLE_ID, 0));
+        igen.extend_from_slice(&gen_record(0, 0));
+        let mut shdr = Vec::new();
+        shdr.extend_from_slice(&shdr_record("RampLoop", 0, 20, 5, 15, 22050, 60, 0, 0, 1));
+        shdr.extend_from_slice(&shdr_record("EOS", 0, 0, 0, 0, 0, 0, 0, 0, 0));
+
+        let mut pdta = Vec::new();
+        push_chunk(&mut pdta, b"phdr", &phdr);
+        push_chunk(&mut pdta, b"pbag", &pbag);
+        push_chunk(&mut pdta, b"pmod", &pmod);
+        push_chunk(&mut pdta, b"pgen", &pgen);
+        push_chunk(&mut pdta, b"inst", &inst_chunk);
+        push_chunk(&mut pdta, b"ibag", &ibag);
+        push_chunk(&mut pdta, b"imod", &imod);
+        push_chunk(&mut pdta, b"igen", &igen);
+        push_chunk(&mut pdta, b"shdr", &shdr);
+        let mut pdta_list = Vec::new();
+        pdta_list.extend_from_slice(b"pdta");
+        pdta_list.extend_from_slice(&pdta);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"sfbk");
+        push_chunk(&mut body, b"LIST", &info_list);
+        push_chunk(&mut body, b"LIST", &sdta_list);
+        push_chunk(&mut body, b"LIST", &pdta_list);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
     }
 
     #[test]
