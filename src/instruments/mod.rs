@@ -52,6 +52,36 @@ pub trait Voice: Send {
     /// override to route pressure into filter cutoff, vibrato depth,
     /// etc.; the round-4 default modulator chain just modulates volume.
     fn set_pressure(&mut self, _pressure: f32) {}
+
+    /// `true` when this voice produces native stereo output via
+    /// [`render_stereo`](Voice::render_stereo) and should bypass the
+    /// mixer's mono-pan law. Default `false` — the mixer renders the
+    /// mono `render` output and pans it.
+    fn is_stereo(&self) -> bool {
+        false
+    }
+
+    /// Render up to `out_l.len()` stereo samples into the L/R planes.
+    /// Both planes must be the same length. Default impl renders the
+    /// mono [`render`](Voice::render) output into `out_l` and copies it
+    /// to `out_r`; voices that override [`is_stereo`](Voice::is_stereo)
+    /// to `true` override this to write distinct L/R samples (e.g. a
+    /// SoundFont stereo zone that pulls from a paired sample).
+    fn render_stereo(&mut self, out_l: &mut [f32], out_r: &mut [f32]) -> usize {
+        debug_assert_eq!(out_l.len(), out_r.len());
+        let n = self.render(out_l);
+        out_r[..n].copy_from_slice(&out_l[..n]);
+        n
+    }
+
+    /// Non-zero exclusive-class id (SF2 generator 57). When a new
+    /// voice with the same `exclusive_class` is started on the same
+    /// channel, the mixer hard-stops every prior voice in that class —
+    /// drum kits use this for hi-hat open/closed pairs. Default `0` =
+    /// no exclusivity.
+    fn exclusive_class(&self) -> u16 {
+        0
+    }
 }
 
 /// Source of voices for one MIDI program (a "bank").

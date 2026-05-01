@@ -15,9 +15,12 @@
 //!   adapters:
 //!     * **[`instruments::sf2`]** — full SoundFont 2 RIFF reader +
 //!       voice generator. Walks the `sfbk` form, cross-resolves the
-//!       preset → instrument → zone → sample chain, and renders 16-bit
-//!       PCM at the requested pitch via linear interpolation, with
-//!       optional sample-loop support.
+//!       preset → instrument → zone → sample chain, and renders
+//!       sm24-aware 24-bit PCM at the requested pitch via linear
+//!       interpolation. Honours the volume + modulation DAHDSR
+//!       envelopes, the initial low-pass biquad filter, mod-env →
+//!       pitch / filter routing, exclusive-class drum cuts, and
+//!       native stereo zones.
 //!     * **[`instruments::sfz`]** / **[`instruments::dls`]** —
 //!       magic-byte detector stubs; `make_voice` returns
 //!       [`Error::Unsupported`]. Loaders are round-4.

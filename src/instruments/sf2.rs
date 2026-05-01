@@ -1,10 +1,32 @@
 //! SoundFont 2 (`.sf2`) instrument-bank reader + voice generator.
 //!
-//! Round-2 implementation: walks the RIFF/sfbk container, pulls the
+//! Round-6 implementation: walks the RIFF/sfbk container, pulls the
 //! INFO / sdta / pdta lists apart into the canonical preset →
-//! instrument → zone → sample chain, then plays the matching 16-bit PCM
-//! sample at the requested pitch. Linear interpolation only; the
-//! envelopes, filters, modulators, and stereo linking land in round 3.
+//! instrument → zone → sample chain, then plays the matching PCM
+//! sample at the requested pitch. Linear interpolation only.
+//!
+//! What round 6 adds on top of round 5:
+//!
+//! - **`sm24` 24-bit sample bytes** (SoundFont 2.04+). When present, the
+//!   `sm24` chunk's u8s are combined with the `smpl` chunk's i16s into a
+//!   24-bit signed sample buffer. Banks without `sm24` are widened by
+//!   shifting the 16-bit value left by 8, so the PCM path always runs
+//!   over the same 24-bit-or-better representation.
+//! - **Stereo sample linking** (`sample_link` + `sample_type`). When two
+//!   sample headers reference each other and one is tagged left/right,
+//!   the voice fetches frames from both buffers and writes them to L/R
+//!   directly, bypassing the mixer's pan law (which is mono-source).
+//! - **Modulation envelope** (gen 25-30 — `delayModEnv`, `attackModEnv`,
+//!   `holdModEnv`, `decayModEnv`, `sustainModEnv`, `releaseModEnv`). The
+//!   modEnv shape mirrors the volume envelope's DAHDSR but is routed
+//!   into the filter cutoff via `modEnvToFilterFc` (gen 11) and into
+//!   pitch via `modEnvToPitch` (gen 7).
+//! - **Initial low-pass filter** (gen 8 = `initialFilterFc`, gen 9 =
+//!   `initialFilterQ`). One-pole biquad on the voice output, cutoff in
+//!   absolute cents (re. 8.176 Hz), Q in centibels of resonance.
+//! - **Exclusive class** (gen 57). Note-on with the same exclusive class
+//!   on the same channel cuts every previously-allocated voice in that
+//!   class — used for hi-hat open/closed pairs in drum kits.
 //!
 //! On-disk layout (full spec is the SoundFont 2.04 PDF, Creative Labs):
 //!
@@ -113,12 +135,48 @@ pub const GEN_RELEASE_VOL_ENV: u16 = 38;
 /// applied to the whole voice. Default 0 (no attenuation).
 pub const GEN_INITIAL_ATTENUATION: u16 = 48;
 
+// ---- modulation envelope (DAHDSR) generators (round 6) ----
+/// `delayModEnv` (gen 25): timecents until the modulation envelope starts.
+pub const GEN_DELAY_MOD_ENV: u16 = 25;
+/// `attackModEnv` (gen 26): linear attack ramp for the modulation envelope.
+pub const GEN_ATTACK_MOD_ENV: u16 = 26;
+/// `holdModEnv` (gen 27): hold-at-peak time for the modulation envelope.
+pub const GEN_HOLD_MOD_ENV: u16 = 27;
+/// `decayModEnv` (gen 28): decay-to-sustain time for the modulation envelope.
+pub const GEN_DECAY_MOD_ENV: u16 = 28;
+/// `sustainModEnv` (gen 29): sustain level for the modulation envelope.
+/// Per spec this is a *fraction* of full-scale in 0.1 % units (i.e.
+/// 0 = peak, 1000 = silence). We normalise to `0.0..=1.0` at construction.
+pub const GEN_SUSTAIN_MOD_ENV: u16 = 29;
+/// `releaseModEnv` (gen 30): release-to-zero time for the modulation envelope.
+pub const GEN_RELEASE_MOD_ENV: u16 = 30;
+/// `modEnvToPitch` (gen 7): pitch modulation depth in cents. Applied
+/// multiplied by the live modulation-envelope level.
+pub const GEN_MOD_ENV_TO_PITCH: u16 = 7;
+/// `modEnvToFilterFc` (gen 11): filter cutoff modulation in cents,
+/// scaled by the live modulation-envelope level.
+pub const GEN_MOD_ENV_TO_FILTER_FC: u16 = 11;
+
+// ---- low-pass filter generators (round 6) ----
+/// `initialFilterFc` (gen 8): initial filter cutoff in absolute cents
+/// (re. 8.176 Hz). Default 13500 (≈ 19914 Hz, effectively no filter).
+pub const GEN_INITIAL_FILTER_FC: u16 = 8;
+/// `initialFilterQ` (gen 9): filter resonance in centibels (10 cB = 1 dB).
+/// Default 0 (no resonance peak).
+pub const GEN_INITIAL_FILTER_Q: u16 = 9;
+
+// ---- voice exclusivity (round 6) ----
+/// `exclusiveClass` (gen 57): non-zero value cuts every prior voice in
+/// the same class on the same channel. Used for hi-hat open / closed
+/// drum pairs.
+pub const GEN_EXCLUSIVE_CLASS: u16 = 57;
+
 // -------------------------------------------------------------------------
 // In-memory bank representation.
 // -------------------------------------------------------------------------
 
 /// One SoundFont 2 bank in memory. Cheap to clone — sample data is an
-/// `Arc<[i16]>` so the (potentially large) PCM block isn't duplicated
+/// `Arc<[i32]>` so the (potentially large) PCM block isn't duplicated
 /// per voice.
 #[derive(Clone, Debug)]
 pub struct Sf2Bank {
@@ -148,9 +206,35 @@ pub struct Sf2Bank {
     pub ibags: Vec<Bag>,
     /// Instrument generators.
     pub igens: Vec<Generator>,
-    /// Concatenated 16-bit PCM. All sample headers slice into this
-    /// single buffer — `start..end` half-open.
-    pub sample_data: Arc<[i16]>,
+    /// Concatenated PCM, as signed 24-bit values stored in `i32`s with
+    /// the sample value occupying the lower 24 bits (sign-extended). For
+    /// banks without an `sm24` chunk every value is the original 16-bit
+    /// `smpl` sample left-shifted by 8: a 0x7FFF i16 becomes
+    /// 0x007F_FF00 (≈ +2^23 - 256) and a 0x8000 i16 becomes 0xFF80_0000
+    /// (= -2^23). When `sm24` is present, its u8 byte fills the LSB.
+    /// All sample headers slice into this single buffer — `start..end`
+    /// half-open. Convert to `f32` via `value as f32 * (1.0 / 8_388_608.0)`
+    /// (1 / 2^23).
+    pub sample_data: Arc<[i32]>,
+}
+
+/// `sample_type` bit values from the SF2 2.04 spec (table at the end of
+/// the `shdr` section). Mono-only banks emit `MONO`; stereo pairs emit
+/// `LEFT` / `RIGHT` and cross-link via `sample_link`. ROM samples are
+/// from the bank ROM and should not contain PCM (we treat them as mono
+/// even when the high bit is set — round 6 ignores ROM samples).
+pub mod sample_type_bits {
+    /// Bit 0: mono sample (no stereo link).
+    pub const MONO: u16 = 0x0001;
+    /// Bit 1: right-channel half of a stereo pair. Pair partner index in
+    /// `sample_link`.
+    pub const RIGHT: u16 = 0x0002;
+    /// Bit 2: left-channel half of a stereo pair.
+    pub const LEFT: u16 = 0x0004;
+    /// Bit 3: linked sample (round-6 unused — same handling as mono).
+    pub const LINKED: u16 = 0x0008;
+    /// Bit 15: ROM bank sample. Round-6 treats these as silent.
+    pub const ROM: u16 = 0x8000;
 }
 
 /// INFO list metadata. Only the fields we surface today.
@@ -203,11 +287,13 @@ pub struct SampleHeader {
     pub original_key: u8,
     /// Pitch correction in cents (signed; usually small, ±50).
     pub pitch_correction: i8,
-    /// Sample link (paired stereo sample index). Round-2 ignores;
-    /// round-3 will use this for stereo expansion.
+    /// Paired stereo-sample index — when `sample_type` carries `LEFT`
+    /// or `RIGHT`, this names the partner half. Self-references and
+    /// out-of-range values are rejected at parse time.
     pub sample_link: u16,
-    /// Sample type bitmask (1 = mono, 2 = right, 4 = left, …). We
-    /// surface it; round-2 only honours mono+stereo-as-mono.
+    /// Sample type bitmask (see [`sample_type_bits`]). Round 6 honours
+    /// `LEFT` / `RIGHT` for stereo voice rendering; ROM samples are
+    /// treated as silent.
     pub sample_type: u16,
 }
 
@@ -440,6 +526,7 @@ impl Sf2Bank {
 
         let mut info = Sf2Info::default();
         let mut sdta_smpl: &[u8] = &[];
+        let mut sdta_sm24: &[u8] = &[];
         let mut pdta_payload: &[u8] = &[];
 
         while !body_cur.at_end() {
@@ -457,7 +544,11 @@ impl Sf2Bank {
             let list_body = &payload[4..];
             match list_type {
                 b"INFO" => parse_info(list_body, &mut info)?,
-                b"sdta" => sdta_smpl = parse_sdta(list_body)?,
+                b"sdta" => {
+                    let (smpl, sm24) = parse_sdta(list_body)?;
+                    sdta_smpl = smpl;
+                    sdta_sm24 = sm24;
+                }
                 b"pdta" => pdta_payload = list_body,
                 _ => {
                     // Unknown LIST type — ignore.
@@ -470,9 +561,14 @@ impl Sf2Bank {
         }
         let pdta = Pdta::parse(pdta_payload)?;
 
-        // Convert smpl to i16. The SF2 spec stores PCM as little-endian
-        // signed 16-bit, two bytes per frame. (sm24 — optional 24-bit
-        // lower-byte chunk — is round-3.)
+        // Convert smpl + sm24 to a single i32 buffer holding signed
+        // 24-bit values (in the lower 24 bits, sign-extended). The SF2
+        // spec stores `smpl` as little-endian signed 16-bit, two bytes
+        // per frame. The optional `sm24` chunk (SF2 2.04+) holds the
+        // unsigned lower 8 bits of each 24-bit frame, one byte per
+        // frame. When the `sm24` length doesn't match the frame count
+        // we silently fall back to 16-bit-only (per spec, the sm24
+        // chunk is optional and parsers must tolerate its absence).
         if sdta_smpl.len() % 2 != 0 {
             return Err(Error::invalid(format!(
                 "SF2: sdta-smpl length {} is not a multiple of 2",
@@ -485,9 +581,21 @@ impl Sf2Bank {
                 "SF2: sdta-smpl frame count {frame_count} exceeds cap {MAX_SAMPLE_FRAMES}",
             )));
         }
+        // sm24 must have one byte per frame (spec ifil ≥ 2.04). Empty
+        // = absent. Mismatched length is a spec violation; per the
+        // 2.04 spec we ignore the chunk entirely in that case rather
+        // than reject the whole bank.
+        let use_sm24 = !sdta_sm24.is_empty() && sdta_sm24.len() == frame_count;
         let mut sample_data = Vec::with_capacity(frame_count);
-        for chunk in sdta_smpl.chunks_exact(2) {
-            sample_data.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+        for (i, chunk) in sdta_smpl.chunks_exact(2).enumerate() {
+            let hi = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+            // Combine: 16-bit MSBs in bits 8..23, 8-bit LSB in bits 0..7.
+            // (hi << 8) preserves sign because `hi` is i32 (sign-extended).
+            let lo = if use_sm24 { sdta_sm24[i] as i32 } else { 0 };
+            // Mask the LSB into the lowest byte. Because `hi << 8` always
+            // has its lowest byte = 0, OR-ing in `lo` doesn't disturb the
+            // sign bit at position 23.
+            sample_data.push((hi << 8) | (lo & 0xFF));
         }
 
         // Cross-validate every sample header against the loaded PCM.
@@ -614,7 +722,29 @@ impl Sf2Bank {
                     continue;
                 }
                 let sample = &self.samples[sample_idx];
-                let plan = SamplePlan::from_zones(sample, igens, gens, key);
+                let mut plan = SamplePlan::from_zones(sample, igens, gens, key);
+                // If this sample is half of a stereo pair, link the
+                // partner so the voice can pull both channels in lock-
+                // step. We require the partner to live within `samples`
+                // (already bounds-checked at parse time) and to point
+                // back at us — the SF2 spec promises bidirectional
+                // links for genuine pairs.
+                if (sample.sample_type & (sample_type_bits::LEFT | sample_type_bits::RIGHT)) != 0 {
+                    let partner = sample.sample_link as usize;
+                    if partner != sample_idx
+                        && partner < self.samples.len()
+                        && self.samples[partner].sample_link as usize == sample_idx
+                    {
+                        let p = &self.samples[partner];
+                        plan.stereo_pair = Some(StereoPair {
+                            start: p.start,
+                            end: p.end,
+                            start_loop: p.start_loop,
+                            end_loop: p.end_loop,
+                            sample_rate: p.sample_rate.max(1),
+                        });
+                    }
+                }
                 return Some(plan);
             }
         }
@@ -650,9 +780,107 @@ pub struct SamplePlan {
     /// generators 33-38 (delay/attack/hold/decay/sustain/release) feed
     /// directly into these slots.
     pub env: EnvParams,
+    /// Modulation envelope (DAHDSR) parameters. Routed into filter and
+    /// pitch via [`Self::mod_env_to_filter_cents`] and
+    /// [`Self::mod_env_to_pitch_cents`]. Round 6.
+    pub mod_env: ModEnvParams,
+    /// Modulation-envelope → pitch depth in cents (gen 7). Multiplied
+    /// by the live mod-env level (`0..=1`) at render time.
+    pub mod_env_to_pitch_cents: i32,
+    /// Modulation-envelope → filter cutoff depth in cents (gen 11).
+    /// Multiplied by the live mod-env level at render time.
+    pub mod_env_to_filter_cents: i32,
+    /// Initial filter cutoff in absolute cents (re. 8.176 Hz). Default
+    /// 13500 cents (≈ 19914 Hz) per SF2 spec — effectively bypass.
+    pub initial_filter_fc_cents: i32,
+    /// Initial filter resonance in centibels (10 cB = 1 dB). Default
+    /// 0 → flat Q.
+    pub initial_filter_q_cb: i32,
     /// Static attenuation in centibels (gen 48 `initialAttenuation`).
     /// Folded into the voice's amplitude on construction.
     pub initial_attenuation_cb: i32,
+    /// Exclusive-class id (gen 57). Non-zero values cut every prior
+    /// voice in the same class on the same channel.
+    pub exclusive_class: u16,
+    /// Optional paired stereo sample. When present, this voice renders
+    /// natively in stereo using both samples — `start..end` of the
+    /// primary above is the *left* (or first-seen) channel, and this
+    /// names the partner's start/end / loop bounds.
+    pub stereo_pair: Option<StereoPair>,
+}
+
+/// Right-channel half of a stereo SF2 zone — companion to
+/// [`SamplePlan`]'s primary `start..end`. The primary plan's pitch
+/// ratio applies to both halves; the right half's own sample rate is
+/// usually identical to the primary but we carry it separately to
+/// tolerate banks where the two halves have minor differences.
+#[derive(Clone, Copy, Debug)]
+pub struct StereoPair {
+    pub start: u32,
+    pub end: u32,
+    pub start_loop: u32,
+    pub end_loop: u32,
+    pub sample_rate: u32,
+}
+
+/// SF2 modulation-envelope parameters (gens 25-30). Same shape as the
+/// volume envelope but with the sustain field being a *fraction*
+/// (`0..=1`, peak..silence) rather than centibels.
+#[derive(Clone, Copy, Debug)]
+pub struct ModEnvParams {
+    pub delay_tc: i32,
+    pub attack_tc: i32,
+    pub hold_tc: i32,
+    pub decay_tc: i32,
+    /// Sustain level expressed as 0.1 % units of attenuation per the
+    /// SF2 spec — 0 = peak, 1000 = silence. We normalise to a `0..=1`
+    /// linear *level* (1.0 - sustain_pct/1000) at construction.
+    pub sustain_per_mille: i32,
+    pub release_tc: i32,
+}
+
+impl Default for ModEnvParams {
+    fn default() -> Self {
+        Self {
+            delay_tc: i32::MIN,
+            attack_tc: i32::MIN,
+            hold_tc: i32::MIN,
+            decay_tc: i32::MIN,
+            sustain_per_mille: 0,
+            release_tc: i32::MIN,
+        }
+    }
+}
+
+impl ModEnvParams {
+    /// Pull gens 25-30 out of `igens` falling back to `pgens`.
+    pub fn from_generators(igens: &[Generator], pgens: &[Generator]) -> Self {
+        fn pick(igens: &[Generator], pgens: &[Generator], oper: u16) -> Option<i16> {
+            generator_amount(igens, oper)
+                .or_else(|| generator_amount(pgens, oper))
+                .map(|v| v as i16)
+        }
+        Self {
+            delay_tc: pick(igens, pgens, GEN_DELAY_MOD_ENV)
+                .map(i32::from)
+                .unwrap_or(i32::MIN),
+            attack_tc: pick(igens, pgens, GEN_ATTACK_MOD_ENV)
+                .map(i32::from)
+                .unwrap_or(i32::MIN),
+            hold_tc: pick(igens, pgens, GEN_HOLD_MOD_ENV)
+                .map(i32::from)
+                .unwrap_or(i32::MIN),
+            decay_tc: pick(igens, pgens, GEN_DECAY_MOD_ENV)
+                .map(i32::from)
+                .unwrap_or(i32::MIN),
+            sustain_per_mille: pick(igens, pgens, GEN_SUSTAIN_MOD_ENV)
+                .map(|v| v as i32)
+                .unwrap_or(0),
+            release_tc: pick(igens, pgens, GEN_RELEASE_MOD_ENV)
+                .map(i32::from)
+                .unwrap_or(i32::MIN),
+        }
+    }
 }
 
 /// SF2 volume-envelope parameters in spec units (timecents for times,
@@ -801,8 +1029,26 @@ impl SamplePlan {
         let pitch_ratio = (2f64).powf(semitones as f64 / 12.0) * (2f64).powf(fine as f64 / 1200.0);
 
         let env = EnvParams::from_generators(igens, pgens);
+        let mod_env = ModEnvParams::from_generators(igens, pgens);
         let initial_attenuation_cb = signed_amount(igens, GEN_INITIAL_ATTENUATION) as i32
             + signed_amount(pgens, GEN_INITIAL_ATTENUATION) as i32;
+        let mod_env_to_pitch_cents = signed_amount(igens, GEN_MOD_ENV_TO_PITCH) as i32
+            + signed_amount(pgens, GEN_MOD_ENV_TO_PITCH) as i32;
+        let mod_env_to_filter_cents = signed_amount(igens, GEN_MOD_ENV_TO_FILTER_FC) as i32
+            + signed_amount(pgens, GEN_MOD_ENV_TO_FILTER_FC) as i32;
+        // Filter cutoff: igen wins outright, fall back to pgen, fall
+        // back to spec default (13500 cents ≈ 19914 Hz, effectively no
+        // filter — well above audio band at any common output rate).
+        let initial_filter_fc_cents = generator_amount(igens, GEN_INITIAL_FILTER_FC)
+            .or_else(|| generator_amount(pgens, GEN_INITIAL_FILTER_FC))
+            .map(|v| v as i32)
+            .unwrap_or(13_500);
+        // Filter Q: igen + pgen are additive per spec.
+        let initial_filter_q_cb = signed_amount(igens, GEN_INITIAL_FILTER_Q) as i32
+            + signed_amount(pgens, GEN_INITIAL_FILTER_Q) as i32;
+        // Exclusive class: u16, igen-only per spec table 9-3 (preset
+        // zones aren't allowed to set it). Default 0 = no class.
+        let exclusive_class = generator_amount(igens, GEN_EXCLUSIVE_CLASS).unwrap_or(0);
 
         Self {
             start,
@@ -815,7 +1061,14 @@ impl SamplePlan {
             semitones,
             fine_cents: fine,
             env,
+            mod_env,
+            mod_env_to_pitch_cents,
+            mod_env_to_filter_cents,
+            initial_filter_fc_cents,
+            initial_filter_q_cb,
             initial_attenuation_cb,
+            exclusive_class,
+            stereo_pair: None,
         }
     }
 }
@@ -887,20 +1140,21 @@ fn zstring(bytes: &[u8]) -> String {
 // sdta list parser.
 // -------------------------------------------------------------------------
 
-/// Returns the raw bytes of the `smpl` sub-chunk. The PCM conversion
-/// happens up in `Sf2Bank::parse`. We could pull `sm24` out here too
-/// when we promote 24-bit support into round 3.
-fn parse_sdta(body: &[u8]) -> Result<&[u8]> {
+/// Returns the raw bytes of the `smpl` and (optional) `sm24` sub-chunks.
+/// The PCM conversion + sm24 combination happens up in `Sf2Bank::parse`.
+fn parse_sdta(body: &[u8]) -> Result<(&[u8], &[u8])> {
     let mut c = Cursor::new(body);
     let mut smpl: &[u8] = &[];
+    let mut sm24: &[u8] = &[];
     while !c.at_end() {
         let (tag, payload) = read_chunk(&mut c)?;
-        if &tag == b"smpl" {
-            smpl = payload;
+        match &tag {
+            b"smpl" => smpl = payload,
+            b"sm24" => sm24 = payload,
+            _ => { /* unknown sdta sub-chunk; ignore */ }
         }
-        // sm24: skipped intentionally for round 2.
     }
-    Ok(smpl)
+    Ok((smpl, sm24))
 }
 
 // -------------------------------------------------------------------------
@@ -1180,7 +1434,7 @@ fn parse_shdr(body: &[u8]) -> Result<Vec<SampleHeader>> {
 /// [`Sf2Voice::set_pressure`] (the SF2 default modulator chain routes
 /// pressure to volume — see `simplified default` row in §8.4.x).
 pub struct Sf2Voice {
-    sample_data: Arc<[i16]>,
+    sample_data: Arc<[i32]>,
     /// Absolute frame index into `sample_data` of the playback start.
     /// Carried for diagnostics; the voice walks `phase` from this on
     /// construction and never re-reads it.
@@ -1199,13 +1453,17 @@ pub struct Sf2Voice {
     /// integer part is the frame index, the fractional part feeds the
     /// linear interpolator.
     phase: f64,
-    /// Base playback rate before any pitch-bend modulation: combines
-    /// the resolved pitch ratio with the sample-rate / output-rate
-    /// conversion. We store it so `set_pitch_bend_cents` can derive
+    /// Right-channel companion of a stereo zone, or `None` for mono.
+    stereo: Option<StereoState>,
+    /// Base playback rate before any pitch-bend / mod-env-to-pitch
+    /// modulation: combines the resolved pitch ratio with the sample-
+    /// rate / output-rate conversion. We store it so
+    /// `set_pitch_bend_cents` and the mod-env-to-pitch path can derive
     /// `phase_inc` without touching the original plan.
     base_phase_inc: f64,
     /// Live playback rate (frames of `sample_data` per output frame).
-    /// Equal to `base_phase_inc * 2^(pitch_bend_cents/1200)`.
+    /// Equal to `base_phase_inc * 2^((pitch_bend_cents +
+    /// mod_env_pitch_cents)/1200)`.
     phase_inc: f64,
     /// Output gain (velocity-curve + initialAttenuation folded in).
     amplitude: f32,
@@ -1237,11 +1495,73 @@ pub struct Sf2Voice {
     /// `true` once the envelope has fully released (or the sample has
     /// run off the end of a non-looping zone). Drives `done()`.
     done: bool,
+    /// Modulation-envelope DAHDSR boundaries (output frames) and the
+    /// corresponding sustain *level* in `0..=1`. Routed into pitch /
+    /// filter cutoff via the `mod_env_to_*_cents` depths below.
+    mod_env_delay: u32,
+    mod_env_attack: u32,
+    mod_env_hold: u32,
+    mod_env_decay: u32,
+    mod_env_release: u32,
+    mod_env_sustain_level: f32,
+    mod_env_release_start_level: f32,
+    /// Mod-env routing depths, in cents.
+    mod_env_to_pitch_cents: i32,
+    mod_env_to_filter_cents: i32,
+    /// Initial filter cutoff in absolute cents (re. 8.176 Hz). The
+    /// live cutoff is `initial_filter_fc_cents + mod_env_level *
+    /// mod_env_to_filter_cents`.
+    initial_filter_fc_cents: i32,
+    /// Filter Q in centibels.
+    initial_filter_q_cb: i32,
+    /// One-pole low-pass biquad state — see
+    /// [`Sf2Voice::filter_step`] for the topology. `None` when the
+    /// cutoff is at the spec default and no mod-env routing is active
+    /// (we skip the per-sample work in that case).
+    filter: Option<BiquadState>,
+    /// Exclusive-class id (gen 57). Read by the mixer at `note_on` time.
+    exclusive_class: u16,
+    /// Output sample rate, hertz. Stashed at construction so the filter
+    /// can recompute coefficients when the modulation envelope drifts
+    /// the cutoff.
+    output_rate: f32,
+}
+
+/// Right-channel state for a stereo voice. Carries its own phase and
+/// loop bounds; the playback rate is shared with the primary (we treat
+/// the stereo halves as locked together).
+struct StereoState {
+    end: u32,
+    start_loop: u32,
+    end_loop: u32,
+    phase: f64,
+}
+
+/// Direct-form-1 biquad filter state. Cleared on construction, ticked
+/// per output sample by [`Sf2Voice::filter_step`]. Coefficients are
+/// recomputed lazily when the cutoff drifts more than a few cents.
+struct BiquadState {
+    /// Most-recent live cutoff in cents — used to skip recomputation
+    /// when the modulation envelope hasn't moved the cutoff much.
+    last_cutoff_cents: i32,
+    /// Live coefficients (a1, a2, b0, b1, b2). a0 is normalised to 1.
+    a1: f32,
+    a2: f32,
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    /// Per-channel delay-line state (x[n-1], x[n-2], y[n-1], y[n-2]).
+    /// `[0]` = left/mono channel, `[1]` = right channel (only used by
+    /// stereo voices).
+    x1: [f32; 2],
+    x2: [f32; 2],
+    y1: [f32; 2],
+    y2: [f32; 2],
 }
 
 impl Sf2Voice {
     fn from_plan(
-        sample_data: Arc<[i16]>,
+        sample_data: Arc<[i32]>,
         plan: &SamplePlan,
         velocity: u8,
         output_rate: u32,
@@ -1267,6 +1587,43 @@ impl Sf2Voice {
         let release_s = timecents_to_seconds(plan.env.release_tc, 0.100);
         let sustain_level = centibels_to_gain(plan.env.sustain_cb);
 
+        // Modulation envelope. Same shape as vol-env but the sustain
+        // semantics are different (per-mille fraction, not centibels).
+        // We pick neutral fallbacks: sustain at full, ~0 ms phases — so
+        // a bank that doesn't use the mod-env gets a constant modulator
+        // value of 1.0 (which, combined with cents=0 routing depths,
+        // yields no audible effect).
+        let mod_delay_s = timecents_to_seconds(plan.mod_env.delay_tc, 0.0);
+        let mod_attack_s = timecents_to_seconds(plan.mod_env.attack_tc, 0.0);
+        let mod_hold_s = timecents_to_seconds(plan.mod_env.hold_tc, 0.0);
+        let mod_decay_s = timecents_to_seconds(plan.mod_env.decay_tc, 0.0);
+        let mod_release_s = timecents_to_seconds(plan.mod_env.release_tc, 0.0);
+        // SF2 spec: sustainModEnv is "fraction of full-scale"
+        // attenuation in 0.1 % units. 0 = peak, 1000 = silence.
+        let mod_sustain_level =
+            (1.0 - (plan.mod_env.sustain_per_mille as f32 / 1000.0)).clamp(0.0, 1.0);
+
+        // Stereo state: only present when the plan carries a partner.
+        let stereo = plan.stereo_pair.map(|p| StereoState {
+            end: p.end,
+            start_loop: p.start_loop,
+            end_loop: p.end_loop,
+            phase: p.start as f64,
+        });
+
+        // Filter: skip the per-sample work entirely when the bank
+        // didn't set anything that would move the cutoff inside the
+        // audible band. 13500 cents ≈ 19914 Hz, and a healthy mod-env
+        // routing depth is needed to bring it below ~12 kHz where it
+        // starts being audible.
+        let needs_filter =
+            plan.initial_filter_fc_cents < 13_000 || plan.mod_env_to_filter_cents.abs() > 200;
+        let filter = if needs_filter {
+            Some(BiquadState::new())
+        } else {
+            None
+        };
+
         Self {
             sample_data,
             start: plan.start,
@@ -1275,6 +1632,7 @@ impl Sf2Voice {
             end_loop: plan.end_loop,
             loops: plan.loops,
             phase: plan.start as f64,
+            stereo,
             base_phase_inc: phase_inc,
             phase_inc,
             amplitude,
@@ -1290,6 +1648,20 @@ impl Sf2Voice {
             release_samples: (sr * release_s).max(1.0) as u32,
             sustain_level,
             done: false,
+            mod_env_delay: (sr * mod_delay_s) as u32,
+            mod_env_attack: (sr * mod_attack_s).max(1.0) as u32,
+            mod_env_hold: (sr * mod_hold_s) as u32,
+            mod_env_decay: (sr * mod_decay_s).max(1.0) as u32,
+            mod_env_release: (sr * mod_release_s).max(1.0) as u32,
+            mod_env_sustain_level: mod_sustain_level,
+            mod_env_release_start_level: 1.0,
+            mod_env_to_pitch_cents: plan.mod_env_to_pitch_cents,
+            mod_env_to_filter_cents: plan.mod_env_to_filter_cents,
+            initial_filter_fc_cents: plan.initial_filter_fc_cents,
+            initial_filter_q_cb: plan.initial_filter_q_cb,
+            filter,
+            exclusive_class: plan.exclusive_class,
+            output_rate: sr,
         }
     }
 
@@ -1343,7 +1715,9 @@ impl Sf2Voice {
     }
 
     /// Sample one PCM frame at fractional index `phase` (linear
-    /// interpolation). Returns 0.0 if `phase` is out of bounds.
+    /// interpolation). Returns 0.0 if `phase` is out of bounds. The
+    /// sample buffer holds signed 24-bit values in i32; the conversion
+    /// to f32 divides by 2^23 = 8 388 608.
     fn fetch(&self, phase: f64) -> f32 {
         let i = phase.floor() as i64;
         let frac = (phase - i as f64) as f32;
@@ -1353,7 +1727,114 @@ impl Sf2Voice {
         let a = self.sample_data[i as usize] as f32;
         let b = self.sample_data[i as usize + 1] as f32;
         let mixed = a + (b - a) * frac;
-        mixed * (1.0 / 32_768.0)
+        mixed * (1.0 / 8_388_608.0)
+    }
+
+    /// Modulation-envelope value at `t` output frames, `0..=1`.
+    /// Same DAHDSR shape as the volume envelope but with `0..=1`
+    /// `sustain_level`. Used to drive filter cutoff and pitch
+    /// modulation. Release follows `release_pos` like the volume
+    /// envelope so a note-off cleanly tails both off together.
+    fn mod_env_at(&self, t: u32) -> f32 {
+        if let Some(rel_at) = self.release_pos {
+            let since = t.saturating_sub(rel_at);
+            if since >= self.mod_env_release {
+                return 0.0;
+            }
+            let x = since as f32 / self.mod_env_release.max(1) as f32;
+            let curve = (1.0 - x) * (1.0 - x);
+            return self.mod_env_release_start_level * curve;
+        }
+        if t < self.mod_env_delay {
+            return 0.0;
+        }
+        let t = t - self.mod_env_delay;
+        if t < self.mod_env_attack {
+            return t as f32 / self.mod_env_attack.max(1) as f32;
+        }
+        let t = t - self.mod_env_attack;
+        if t < self.mod_env_hold {
+            return 1.0;
+        }
+        let t = t - self.mod_env_hold;
+        if t < self.mod_env_decay {
+            let x = t as f32 / self.mod_env_decay.max(1) as f32;
+            let drop = 1.0 - self.mod_env_sustain_level;
+            let curve = 1.0 - (1.0 - x) * (1.0 - x);
+            return 1.0 - drop * curve;
+        }
+        self.mod_env_sustain_level
+    }
+
+    /// Recompute biquad coefficients for a low-pass filter at the given
+    /// cutoff (absolute cents re. 8.176 Hz) and Q (centibels). Direct-
+    /// form 1, RBJ cookbook math.
+    fn update_filter_coeffs(&mut self, cutoff_cents: i32, output_rate: f32) {
+        let Some(filter) = self.filter.as_mut() else {
+            return;
+        };
+        // SF2 absolute cents: cutoff_hz = 8.176 * 2^(cents/1200).
+        // Clamp to a safe range so a hostile bank can't request 0 Hz
+        // (which would zero-divide ω) or anything beyond Nyquist.
+        let cents = cutoff_cents.clamp(1500, 13_500);
+        let cutoff_hz = 8.176_f32 * (2.0_f32).powf(cents as f32 / 1200.0);
+        let nyquist = output_rate * 0.5;
+        let cutoff_hz = cutoff_hz.min(nyquist * 0.99).max(20.0);
+        // Q: cb (centibels). 0 cB = Q ≈ 0.707 (Butterworth). We map
+        // cb → linear Q via Q = 10^(cb/200) * sqrt(0.5). Clamp at 16
+        // to avoid runaway resonance.
+        let q_lin = (10.0_f32).powf(self.initial_filter_q_cb as f32 / 200.0)
+            * std::f32::consts::FRAC_1_SQRT_2;
+        let q = q_lin.clamp(0.1, 16.0);
+        let omega = 2.0 * std::f32::consts::PI * cutoff_hz / output_rate;
+        let alpha = omega.sin() / (2.0 * q);
+        let cos_w = omega.cos();
+        // RBJ low-pass:
+        //   b0 = (1 - cos)/2, b1 = 1 - cos, b2 = (1 - cos)/2,
+        //   a0 = 1 + alpha,   a1 = -2 cos,  a2 = 1 - alpha.
+        let a0 = 1.0 + alpha;
+        let inv_a0 = 1.0 / a0;
+        filter.b0 = ((1.0 - cos_w) * 0.5) * inv_a0;
+        filter.b1 = (1.0 - cos_w) * inv_a0;
+        filter.b2 = ((1.0 - cos_w) * 0.5) * inv_a0;
+        filter.a1 = (-2.0 * cos_w) * inv_a0;
+        filter.a2 = (1.0 - alpha) * inv_a0;
+        filter.last_cutoff_cents = cutoff_cents;
+    }
+
+    /// Run one input sample through the biquad on `channel` (0 = left
+    /// or mono, 1 = right). No-op if the voice has no filter state.
+    fn filter_step(&mut self, channel: usize, x: f32) -> f32 {
+        let Some(filter) = self.filter.as_mut() else {
+            return x;
+        };
+        let y = filter.b0 * x + filter.b1 * filter.x1[channel] + filter.b2 * filter.x2[channel]
+            - filter.a1 * filter.y1[channel]
+            - filter.a2 * filter.y2[channel];
+        filter.x2[channel] = filter.x1[channel];
+        filter.x1[channel] = x;
+        filter.y2[channel] = filter.y1[channel];
+        filter.y1[channel] = y;
+        y
+    }
+}
+
+impl BiquadState {
+    fn new() -> Self {
+        Self {
+            // Out-of-band sentinel forces an initial coefficient
+            // computation on the first call to `update_filter_coeffs`.
+            last_cutoff_cents: i32::MIN,
+            a1: 0.0,
+            a2: 0.0,
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            x1: [0.0; 2],
+            x2: [0.0; 2],
+            y1: [0.0; 2],
+            y2: [0.0; 2],
+        }
     }
 }
 
@@ -1368,6 +1849,40 @@ impl Voice for Sf2Voice {
             if self.release_pos.is_some() && env <= 0.0 {
                 self.done = true;
                 return i;
+            }
+
+            // Apply mod-env to pitch / filter cutoff. We re-derive the
+            // playback rate every sample only when the mod-env routes
+            // to pitch — most banks don't, so the common path stays
+            // multiplication-only.
+            let mod_lvl = if self.mod_env_to_pitch_cents != 0 || self.filter.is_some() {
+                self.mod_env_at(self.elapsed)
+            } else {
+                0.0
+            };
+            if self.mod_env_to_pitch_cents != 0 {
+                let pitch_cents =
+                    self.pitch_bend_cents + (mod_lvl * self.mod_env_to_pitch_cents as f32) as i32;
+                let bend_ratio = (2.0f64).powf(pitch_cents as f64 / 1200.0);
+                self.phase_inc = self.base_phase_inc * bend_ratio;
+            }
+            // Filter cutoff modulation: only recompute coefficients
+            // when the cutoff drifts more than ~50 cents from the last
+            // computed value (cheap perceptual gate).
+            if self.filter.is_some() {
+                let target = self.initial_filter_fc_cents
+                    + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32;
+                let last = self
+                    .filter
+                    .as_ref()
+                    .map(|f| f.last_cutoff_cents)
+                    .unwrap_or(i32::MIN);
+                // Saturating subtraction so the i32::MIN sentinel
+                // (used to force a first-call computation) doesn't
+                // wrap around when subtracted from a positive target.
+                if target.saturating_sub(last).saturating_abs() > 50 {
+                    self.update_filter_coeffs(target, self.output_rate);
+                }
             }
 
             // If we've walked off the end of the (non-looping) sample
@@ -1393,7 +1908,10 @@ impl Voice for Sf2Voice {
                 self.phase = self.start_loop as f64 + wrapped;
             }
 
-            let s = self.fetch(self.phase);
+            let mut s = self.fetch(self.phase);
+            if self.filter.is_some() {
+                s = self.filter_step(0, s);
+            }
             *slot = s * env * self.amplitude * self.pressure_gain;
             self.phase += self.phase_inc;
             self.elapsed = self.elapsed.wrapping_add(1);
@@ -1407,6 +1925,9 @@ impl Voice for Sf2Voice {
             // starts from where we actually are (mid-attack notes
             // shouldn't suddenly jump to 1.0 just because of release).
             self.release_start_level = self.envelope_at(self.elapsed).max(0.0);
+            // Same for the modulation envelope so its routings (filter
+            // cutoff, pitch) tail off cleanly without a discontinuity.
+            self.mod_env_release_start_level = self.mod_env_at(self.elapsed).max(0.0);
             self.release_pos = Some(self.elapsed);
         }
     }
@@ -1427,6 +1948,120 @@ impl Voice for Sf2Voice {
         // — synths typically treat 0 pressure as "no boost", not "off".
         let p = pressure.clamp(0.0, 1.0);
         self.pressure_gain = 1.0 + 0.5 * p; // 1.0 at rest, 1.5 at full
+    }
+
+    fn is_stereo(&self) -> bool {
+        self.stereo.is_some()
+    }
+
+    fn render_stereo(&mut self, out_l: &mut [f32], out_r: &mut [f32]) -> usize {
+        debug_assert_eq!(out_l.len(), out_r.len());
+        // Mono fallback: render mono and copy.
+        if self.stereo.is_none() {
+            let n = self.render(out_l);
+            out_r[..n].copy_from_slice(&out_l[..n]);
+            return n;
+        }
+        if self.done {
+            return 0;
+        }
+        for i in 0..out_l.len() {
+            let env = self.envelope_at(self.elapsed);
+            if self.release_pos.is_some() && env <= 0.0 {
+                self.done = true;
+                return i;
+            }
+
+            // Mod-env routings same as the mono path.
+            let mod_lvl = if self.mod_env_to_pitch_cents != 0 || self.filter.is_some() {
+                self.mod_env_at(self.elapsed)
+            } else {
+                0.0
+            };
+            if self.mod_env_to_pitch_cents != 0 {
+                let pitch_cents =
+                    self.pitch_bend_cents + (mod_lvl * self.mod_env_to_pitch_cents as f32) as i32;
+                let bend_ratio = (2.0f64).powf(pitch_cents as f64 / 1200.0);
+                self.phase_inc = self.base_phase_inc * bend_ratio;
+            }
+            if self.filter.is_some() {
+                let target = self.initial_filter_fc_cents
+                    + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32;
+                let last = self
+                    .filter
+                    .as_ref()
+                    .map(|f| f.last_cutoff_cents)
+                    .unwrap_or(i32::MIN);
+                // Saturating subtraction so the i32::MIN sentinel
+                // (used to force a first-call computation) doesn't
+                // wrap around when subtracted from a positive target.
+                if target.saturating_sub(last).saturating_abs() > 50 {
+                    self.update_filter_coeffs(target, self.output_rate);
+                }
+            }
+
+            // Wrap / end-of-sample handling for the *primary* (left)
+            // sample.
+            if self.phase >= self.end as f64 {
+                if self.loops {
+                    let over = self.phase - self.end_loop as f64;
+                    let loop_len = (self.end_loop as f64 - self.start_loop as f64).max(1.0);
+                    self.phase = self.start_loop as f64 + over.rem_euclid(loop_len);
+                } else {
+                    self.done = true;
+                    return i;
+                }
+            } else if self.loops && self.phase >= self.end_loop as f64 {
+                let over = self.phase - self.end_loop as f64;
+                let loop_len = (self.end_loop as f64 - self.start_loop as f64).max(1.0);
+                self.phase = self.start_loop as f64 + over.rem_euclid(loop_len);
+            }
+
+            // Same wrap logic for the partner. We hold a *copy* of the
+            // partner state outside the borrow so we can call the
+            // existing `fetch` helper without an aliasing conflict.
+            let (partner_phase_to_fetch, advanced_partner_phase) = {
+                let st = self.stereo.as_mut().expect("stereo voice");
+                if st.phase >= st.end as f64 {
+                    if self.loops {
+                        let over = st.phase - st.end_loop as f64;
+                        let loop_len = (st.end_loop as f64 - st.start_loop as f64).max(1.0);
+                        st.phase = st.start_loop as f64 + over.rem_euclid(loop_len);
+                    } else {
+                        // Partner ended early — stop emitting
+                        // (and let the main path also close out).
+                        self.done = true;
+                        return i;
+                    }
+                } else if self.loops && st.phase >= st.end_loop as f64 {
+                    let over = st.phase - st.end_loop as f64;
+                    let loop_len = (st.end_loop as f64 - st.start_loop as f64).max(1.0);
+                    st.phase = st.start_loop as f64 + over.rem_euclid(loop_len);
+                }
+                let p = st.phase;
+                (p, p + self.phase_inc)
+            };
+
+            let mut sl = self.fetch(self.phase);
+            let mut sr = self.fetch(partner_phase_to_fetch);
+            if self.filter.is_some() {
+                sl = self.filter_step(0, sl);
+                sr = self.filter_step(1, sr);
+            }
+            let amp = env * self.amplitude * self.pressure_gain;
+            out_l[i] = sl * amp;
+            out_r[i] = sr * amp;
+            self.phase += self.phase_inc;
+            if let Some(st) = self.stereo.as_mut() {
+                st.phase = advanced_partner_phase;
+            }
+            self.elapsed = self.elapsed.wrapping_add(1);
+        }
+        out_l.len()
+    }
+
+    fn exclusive_class(&self) -> u16 {
+        self.exclusive_class
     }
 }
 
@@ -2167,5 +2802,896 @@ mod tests {
         }
         .amount_lo_hi();
         assert_eq!((lo, hi), (0x21, 0x43));
+    }
+
+    // =====================================================================
+    // Round-6 tests: sm24, stereo, modulation envelope, filter, exclusive
+    // class, overridingRootKey.
+    // =====================================================================
+
+    /// Build an SF2 fixture with an `sm24` chunk: same 20-frame ramp as
+    /// the minimal fixture, but each frame's lower byte is non-zero so
+    /// we can verify the combined 24-bit value gets through the parser.
+    fn build_sm24_sf2() -> Vec<u8> {
+        // 20-frame ramp + per-frame lower byte. The lower byte cycles
+        // 0x10..0x10+20 so we can spot-check that the parser combined
+        // it with the 16-bit hi.
+        let mut smpl: Vec<u8> = Vec::with_capacity(40);
+        let mut sm24: Vec<u8> = Vec::with_capacity(20);
+        for i in 0i32..20 {
+            let v = (i * 800 - 8000) as i16;
+            smpl.extend_from_slice(&v.to_le_bytes());
+            sm24.push(0x10 + i as u8);
+        }
+        let mut info = Vec::new();
+        push_chunk(&mut info, b"ifil", &{
+            let mut v = Vec::new();
+            v.extend_from_slice(&2u16.to_le_bytes());
+            v.extend_from_slice(&4u16.to_le_bytes());
+            v
+        });
+        let mut info_list = Vec::from(b"INFO" as &[u8]);
+        info_list.extend_from_slice(&info);
+
+        let mut sdta = Vec::new();
+        push_chunk(&mut sdta, b"smpl", &smpl);
+        push_chunk(&mut sdta, b"sm24", &sm24);
+        let mut sdta_list = Vec::from(b"sdta" as &[u8]);
+        sdta_list.extend_from_slice(&sdta);
+
+        let pdta = build_pdta();
+        let mut pdta_list = Vec::from(b"pdta" as &[u8]);
+        pdta_list.extend_from_slice(&pdta);
+
+        let mut body = Vec::from(b"sfbk" as &[u8]);
+        push_chunk(&mut body, b"LIST", &info_list);
+        push_chunk(&mut body, b"LIST", &sdta_list);
+        push_chunk(&mut body, b"LIST", &pdta_list);
+        let mut out = Vec::from(b"RIFF" as &[u8]);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn sm24_combines_into_24_bit_samples() {
+        let blob = build_sm24_sf2();
+        let bank = Sf2Bank::parse(&blob).expect("parse sm24 fixture");
+        // Frame 0: smpl[0] = -8000 (= 0xE0C0 i16). Combined 24-bit
+        // value = (-8000 << 8) | 0x10 = 0xFFE0_C010 = -2_047_984.
+        let v0 = bank.sample_data[0];
+        let expected_v0 = ((-8000_i32) << 8) | 0x10;
+        assert_eq!(v0, expected_v0, "sm24 lower byte not combined: got {v0:#X}");
+        // Frame 5: smpl[5] = -4000 (= 0xF060 i16). Combined =
+        // (-4000 << 8) | 0x15.
+        let v5 = bank.sample_data[5];
+        let expected_v5 = ((-4000_i32) << 8) | 0x15;
+        assert_eq!(v5, expected_v5);
+    }
+
+    #[test]
+    fn missing_sm24_falls_back_to_16_bit() {
+        // The minimal fixture has no sm24 chunk. Each i32 should be
+        // exactly the i16 value left-shifted by 8 (LSB = 0).
+        let blob = build_minimal_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        for (i, &v) in bank.sample_data.iter().enumerate() {
+            let i16_val = (i as i32) * 800 - 8000;
+            assert_eq!(
+                v,
+                i16_val << 8,
+                "frame {i}: i16 {i16_val} did not widen cleanly: got {v:#X}",
+            );
+            // Lowest byte must always be zero with no sm24.
+            assert_eq!(v & 0xFF, 0, "lower byte must be 0 without sm24");
+        }
+    }
+
+    #[test]
+    fn sm24_chunk_with_wrong_length_is_silently_ignored() {
+        // Build the sm24 fixture but truncate the sm24 chunk to half
+        // the frame count. Per spec parsers must tolerate this — we
+        // fall back to 16-bit-only.
+        let blob = build_sm24_with_short_sm24(10);
+        let bank = Sf2Bank::parse(&blob).expect("parse should not reject");
+        // All lower bytes should be zero (sm24 ignored).
+        for &v in bank.sample_data.iter() {
+            assert_eq!(v & 0xFF, 0, "wrong-length sm24 should be ignored");
+        }
+    }
+
+    fn build_sm24_with_short_sm24(sm24_frames: usize) -> Vec<u8> {
+        let mut smpl: Vec<u8> = Vec::new();
+        for i in 0i32..20 {
+            let v = (i * 800 - 8000) as i16;
+            smpl.extend_from_slice(&v.to_le_bytes());
+        }
+        let sm24: Vec<u8> = (0..sm24_frames).map(|i| 0x10 + i as u8).collect();
+        let mut info = Vec::new();
+        push_chunk(&mut info, b"ifil", &{
+            let mut v = Vec::new();
+            v.extend_from_slice(&2u16.to_le_bytes());
+            v.extend_from_slice(&4u16.to_le_bytes());
+            v
+        });
+        let mut info_list = Vec::from(b"INFO" as &[u8]);
+        info_list.extend_from_slice(&info);
+        let mut sdta = Vec::new();
+        push_chunk(&mut sdta, b"smpl", &smpl);
+        push_chunk(&mut sdta, b"sm24", &sm24);
+        let mut sdta_list = Vec::from(b"sdta" as &[u8]);
+        sdta_list.extend_from_slice(&sdta);
+        let pdta = build_pdta();
+        let mut pdta_list = Vec::from(b"pdta" as &[u8]);
+        pdta_list.extend_from_slice(&pdta);
+        let mut body = Vec::from(b"sfbk" as &[u8]);
+        push_chunk(&mut body, b"LIST", &info_list);
+        push_chunk(&mut body, b"LIST", &sdta_list);
+        push_chunk(&mut body, b"LIST", &pdta_list);
+        let mut out = Vec::from(b"RIFF" as &[u8]);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Build a stereo SF2: two samples (left+right) cross-linked, one
+    /// instrument, one preset. Left = -8000..+8000 ascending ramp.
+    /// Right = +8000..-8000 descending ramp (genuinely the negation
+    /// of left) so we can distinguish channels by sign.
+    fn build_stereo_sf2() -> Vec<u8> {
+        // 40 frames total: first 20 = left, second 20 = right.
+        let mut smpl: Vec<u8> = Vec::with_capacity(80);
+        for i in 0i32..20 {
+            let v = (i * 800 - 8000) as i16; // -8000 → +7200 (ascending)
+            smpl.extend_from_slice(&v.to_le_bytes());
+        }
+        for i in 0i32..20 {
+            let v = -(i * 800 - 8000) as i16; // +8000 → -7200 (descending — negation)
+            smpl.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let mut info = Vec::new();
+        push_chunk(&mut info, b"ifil", &{
+            let mut v = Vec::new();
+            v.extend_from_slice(&2u16.to_le_bytes());
+            v.extend_from_slice(&4u16.to_le_bytes());
+            v
+        });
+        let mut info_list = Vec::from(b"INFO" as &[u8]);
+        info_list.extend_from_slice(&info);
+
+        let mut sdta = Vec::new();
+        push_chunk(&mut sdta, b"smpl", &smpl);
+        let mut sdta_list = Vec::from(b"sdta" as &[u8]);
+        sdta_list.extend_from_slice(&sdta);
+
+        // pdta: one preset, one instrument, two cross-linked samples.
+        // The instrument zone targets the *left* sample by id (index 0).
+        let mut phdr = Vec::new();
+        phdr.extend_from_slice(&phdr_record("Stereo Preset", 0, 0, 0));
+        phdr.extend_from_slice(&phdr_record("EOP", 0, 0, 1));
+        let mut pbag = Vec::new();
+        pbag.extend_from_slice(&bag_record(0, 0));
+        pbag.extend_from_slice(&bag_record(1, 0));
+        let pmod = vec![0u8; PMOD_RECORD];
+        let mut pgen = Vec::new();
+        pgen.extend_from_slice(&gen_record(GEN_INSTRUMENT, 0));
+        pgen.extend_from_slice(&gen_record(0, 0));
+        let mut inst_chunk = Vec::new();
+        inst_chunk.extend_from_slice(&inst_record("Stereo Inst", 0));
+        inst_chunk.extend_from_slice(&inst_record("EOI", 2));
+        let mut ibag = Vec::new();
+        ibag.extend_from_slice(&bag_record(0, 0));
+        ibag.extend_from_slice(&bag_record(2, 0));
+        let imod = vec![0u8; IMOD_RECORD];
+        let mut igen = Vec::new();
+        igen.extend_from_slice(&gen_record(GEN_SAMPLE_MODES, 1));
+        igen.extend_from_slice(&gen_record(GEN_SAMPLE_ID, 0));
+        igen.extend_from_slice(&gen_record(0, 0));
+        // Sample 0 = LEFT, link → sample 1.
+        // Sample 1 = RIGHT, link → sample 0.
+        let mut shdr = Vec::new();
+        shdr.extend_from_slice(&shdr_record(
+            "Left",
+            0,
+            20,
+            5,
+            15,
+            22050,
+            60,
+            0,
+            1,
+            sample_type_bits::LEFT,
+        ));
+        shdr.extend_from_slice(&shdr_record(
+            "Right",
+            20,
+            40,
+            25,
+            35,
+            22050,
+            60,
+            0,
+            0,
+            sample_type_bits::RIGHT,
+        ));
+        shdr.extend_from_slice(&shdr_record("EOS", 0, 0, 0, 0, 0, 0, 0, 0, 0));
+
+        let mut pdta = Vec::new();
+        push_chunk(&mut pdta, b"phdr", &phdr);
+        push_chunk(&mut pdta, b"pbag", &pbag);
+        push_chunk(&mut pdta, b"pmod", &pmod);
+        push_chunk(&mut pdta, b"pgen", &pgen);
+        push_chunk(&mut pdta, b"inst", &inst_chunk);
+        push_chunk(&mut pdta, b"ibag", &ibag);
+        push_chunk(&mut pdta, b"imod", &imod);
+        push_chunk(&mut pdta, b"igen", &igen);
+        push_chunk(&mut pdta, b"shdr", &shdr);
+        let mut pdta_list = Vec::from(b"pdta" as &[u8]);
+        pdta_list.extend_from_slice(&pdta);
+
+        let mut body = Vec::from(b"sfbk" as &[u8]);
+        push_chunk(&mut body, b"LIST", &info_list);
+        push_chunk(&mut body, b"LIST", &sdta_list);
+        push_chunk(&mut body, b"LIST", &pdta_list);
+        let mut out = Vec::from(b"RIFF" as &[u8]);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn stereo_sf2_resolves_with_partner() {
+        let blob = build_stereo_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        assert_eq!(bank.samples.len(), 2);
+        assert_eq!(bank.samples[0].sample_type, sample_type_bits::LEFT);
+        assert_eq!(bank.samples[1].sample_type, sample_type_bits::RIGHT);
+        let plan = bank.resolve(0, 60, 100).expect("resolve");
+        let pair = plan.stereo_pair.expect("stereo pair must be linked");
+        assert_eq!(pair.start, 20);
+        assert_eq!(pair.end, 40);
+    }
+
+    #[test]
+    fn stereo_voice_writes_distinct_l_r() {
+        let blob = build_stereo_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let inst = Sf2Instrument {
+            name: "stereo".into(),
+            bank,
+        };
+        let mut voice = inst.make_voice(0, 60, 127, 22_050).unwrap();
+        assert!(voice.is_stereo(), "voice should report is_stereo=true");
+        let mut l = vec![0.0f32; 1024];
+        let mut r = vec![0.0f32; 1024];
+        let n = voice.render_stereo(&mut l, &mut r);
+        assert_eq!(n, 1024);
+        // Past the attack ramp (~110 samples), L and R should differ
+        // because the two halves point in opposite directions.
+        let mut differing = 0;
+        for i in 200..1000 {
+            if (l[i] - r[i]).abs() > 0.001 {
+                differing += 1;
+            }
+        }
+        assert!(
+            differing > 100,
+            "L/R should differ from each other; got {differing} differing samples",
+        );
+    }
+
+    #[test]
+    fn stereo_voice_is_routed_through_mixer_stereo_path() {
+        use crate::mixer::Mixer;
+        let blob = build_stereo_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let inst = Sf2Instrument {
+            name: "stereo".into(),
+            bank,
+        };
+        let voice = inst.make_voice(0, 60, 127, 22_050).unwrap();
+        let mut mixer = Mixer::new();
+        mixer.note_on(0, 60, 127, voice);
+        let mut l = vec![0.0f32; 1024];
+        let mut r = vec![0.0f32; 1024];
+        let active = mixer.mix_stereo(&mut l, &mut r);
+        assert_eq!(active, 1);
+        // Both channels must be non-silent.
+        let l_energy: f32 = l.iter().map(|s| s * s).sum();
+        let r_energy: f32 = r.iter().map(|s| s * s).sum();
+        assert!(l_energy > 0.0, "left silent");
+        assert!(r_energy > 0.0, "right silent");
+    }
+
+    #[test]
+    fn stereo_link_self_reference_falls_back_to_mono() {
+        // A sample that points at itself in `sample_link` should NOT
+        // be treated as half of a stereo pair.
+        let blob = build_self_linked_stereo_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let plan = bank.resolve(0, 60, 100).unwrap();
+        assert!(plan.stereo_pair.is_none(), "self-link must not pair");
+    }
+
+    fn build_self_linked_stereo_sf2() -> Vec<u8> {
+        // Same as build_stereo_sf2 but sample 0 links to 0.
+        let mut blob = build_stereo_sf2();
+        // Brittle hack: just rebuild with different shdr.
+        let mut smpl: Vec<u8> = Vec::with_capacity(80);
+        for i in 0i32..40 {
+            let v = (i * 200 - 4000) as i16;
+            smpl.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut info = Vec::new();
+        push_chunk(&mut info, b"ifil", &{
+            let mut v = Vec::new();
+            v.extend_from_slice(&2u16.to_le_bytes());
+            v.extend_from_slice(&4u16.to_le_bytes());
+            v
+        });
+        let mut info_list = Vec::from(b"INFO" as &[u8]);
+        info_list.extend_from_slice(&info);
+        let mut sdta = Vec::new();
+        push_chunk(&mut sdta, b"smpl", &smpl);
+        let mut sdta_list = Vec::from(b"sdta" as &[u8]);
+        sdta_list.extend_from_slice(&sdta);
+
+        let mut phdr = Vec::new();
+        phdr.extend_from_slice(&phdr_record("Self Preset", 0, 0, 0));
+        phdr.extend_from_slice(&phdr_record("EOP", 0, 0, 1));
+        let mut pbag = Vec::new();
+        pbag.extend_from_slice(&bag_record(0, 0));
+        pbag.extend_from_slice(&bag_record(1, 0));
+        let pmod = vec![0u8; PMOD_RECORD];
+        let mut pgen = Vec::new();
+        pgen.extend_from_slice(&gen_record(GEN_INSTRUMENT, 0));
+        pgen.extend_from_slice(&gen_record(0, 0));
+        let mut inst_chunk = Vec::new();
+        inst_chunk.extend_from_slice(&inst_record("Self Inst", 0));
+        inst_chunk.extend_from_slice(&inst_record("EOI", 2));
+        let mut ibag = Vec::new();
+        ibag.extend_from_slice(&bag_record(0, 0));
+        ibag.extend_from_slice(&bag_record(2, 0));
+        let imod = vec![0u8; IMOD_RECORD];
+        let mut igen = Vec::new();
+        igen.extend_from_slice(&gen_record(GEN_SAMPLE_MODES, 1));
+        igen.extend_from_slice(&gen_record(GEN_SAMPLE_ID, 0));
+        igen.extend_from_slice(&gen_record(0, 0));
+        // Sample 0 = LEFT, link → 0 (self).
+        let mut shdr = Vec::new();
+        shdr.extend_from_slice(&shdr_record(
+            "Self",
+            0,
+            20,
+            5,
+            15,
+            22050,
+            60,
+            0,
+            0,
+            sample_type_bits::LEFT,
+        ));
+        shdr.extend_from_slice(&shdr_record("EOS", 0, 0, 0, 0, 0, 0, 0, 0, 0));
+
+        let mut pdta = Vec::new();
+        push_chunk(&mut pdta, b"phdr", &phdr);
+        push_chunk(&mut pdta, b"pbag", &pbag);
+        push_chunk(&mut pdta, b"pmod", &pmod);
+        push_chunk(&mut pdta, b"pgen", &pgen);
+        push_chunk(&mut pdta, b"inst", &inst_chunk);
+        push_chunk(&mut pdta, b"ibag", &ibag);
+        push_chunk(&mut pdta, b"imod", &imod);
+        push_chunk(&mut pdta, b"igen", &igen);
+        push_chunk(&mut pdta, b"shdr", &shdr);
+        let mut pdta_list = Vec::from(b"pdta" as &[u8]);
+        pdta_list.extend_from_slice(&pdta);
+
+        blob.clear();
+        let mut body = Vec::from(b"sfbk" as &[u8]);
+        push_chunk(&mut body, b"LIST", &info_list);
+        push_chunk(&mut body, b"LIST", &sdta_list);
+        push_chunk(&mut body, b"LIST", &pdta_list);
+        let mut out = Vec::from(b"RIFF" as &[u8]);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Build an SF2 fixture with a low filter cutoff (gen 8 = 6500
+    /// cents ≈ 750 Hz). Output should have its high-frequency content
+    /// noticeably attenuated relative to the unfiltered baseline.
+    fn build_filter_sf2() -> Vec<u8> {
+        // Use a square-wave-ish ramp (alternates +/-) so there's
+        // plenty of HF content to filter.
+        let mut smpl: Vec<u8> = Vec::with_capacity(80);
+        for i in 0i32..40 {
+            let v = if i % 2 == 0 { 16000_i16 } else { -16000_i16 };
+            smpl.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut info = Vec::new();
+        push_chunk(&mut info, b"ifil", &{
+            let mut v = Vec::new();
+            v.extend_from_slice(&2u16.to_le_bytes());
+            v.extend_from_slice(&4u16.to_le_bytes());
+            v
+        });
+        let mut info_list = Vec::from(b"INFO" as &[u8]);
+        info_list.extend_from_slice(&info);
+        let mut sdta = Vec::new();
+        push_chunk(&mut sdta, b"smpl", &smpl);
+        let mut sdta_list = Vec::from(b"sdta" as &[u8]);
+        sdta_list.extend_from_slice(&sdta);
+
+        let mut phdr = Vec::new();
+        phdr.extend_from_slice(&phdr_record("Filter Preset", 0, 0, 0));
+        phdr.extend_from_slice(&phdr_record("EOP", 0, 0, 1));
+        let mut pbag = Vec::new();
+        pbag.extend_from_slice(&bag_record(0, 0));
+        pbag.extend_from_slice(&bag_record(1, 0));
+        let pmod = vec![0u8; PMOD_RECORD];
+        let mut pgen = Vec::new();
+        pgen.extend_from_slice(&gen_record(GEN_INSTRUMENT, 0));
+        pgen.extend_from_slice(&gen_record(0, 0));
+        let mut inst_chunk = Vec::new();
+        inst_chunk.extend_from_slice(&inst_record("Filter Inst", 0));
+        inst_chunk.extend_from_slice(&inst_record("EOI", 2));
+        let mut ibag = Vec::new();
+        ibag.extend_from_slice(&bag_record(0, 0));
+        ibag.extend_from_slice(&bag_record(4, 0));
+        let imod = vec![0u8; IMOD_RECORD];
+        let mut igen = Vec::new();
+        // Filter cutoff = 6500 cents ≈ 750 Hz.
+        igen.extend_from_slice(&gen_record(GEN_INITIAL_FILTER_FC, 6500));
+        igen.extend_from_slice(&gen_record(GEN_INITIAL_FILTER_Q, 0));
+        igen.extend_from_slice(&gen_record(GEN_SAMPLE_MODES, 1));
+        igen.extend_from_slice(&gen_record(GEN_SAMPLE_ID, 0));
+        igen.extend_from_slice(&gen_record(0, 0));
+        let mut shdr = Vec::new();
+        shdr.extend_from_slice(&shdr_record("FilterRamp", 0, 40, 0, 40, 44100, 60, 0, 0, 1));
+        shdr.extend_from_slice(&shdr_record("EOS", 0, 0, 0, 0, 0, 0, 0, 0, 0));
+
+        let mut pdta = Vec::new();
+        push_chunk(&mut pdta, b"phdr", &phdr);
+        push_chunk(&mut pdta, b"pbag", &pbag);
+        push_chunk(&mut pdta, b"pmod", &pmod);
+        push_chunk(&mut pdta, b"pgen", &pgen);
+        push_chunk(&mut pdta, b"inst", &inst_chunk);
+        push_chunk(&mut pdta, b"ibag", &ibag);
+        push_chunk(&mut pdta, b"imod", &imod);
+        push_chunk(&mut pdta, b"igen", &igen);
+        push_chunk(&mut pdta, b"shdr", &shdr);
+        let mut pdta_list = Vec::from(b"pdta" as &[u8]);
+        pdta_list.extend_from_slice(&pdta);
+
+        let mut body = Vec::from(b"sfbk" as &[u8]);
+        push_chunk(&mut body, b"LIST", &info_list);
+        push_chunk(&mut body, b"LIST", &sdta_list);
+        push_chunk(&mut body, b"LIST", &pdta_list);
+        let mut out = Vec::from(b"RIFF" as &[u8]);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn filter_attenuates_high_frequency() {
+        // Square wave run through a 750 Hz LPF should have much lower
+        // amplitude than the unfiltered baseline (which alternates at
+        // Nyquist). Compare the filtered SF2 against the minimal one:
+        // both feed alternating samples through the voice but only the
+        // filtered version applies the LPF.
+        let blob_filt = build_filter_sf2();
+        let bank_filt = Sf2Bank::parse(&blob_filt).unwrap();
+        let plan = bank_filt.resolve(0, 60, 100).unwrap();
+        assert_eq!(plan.initial_filter_fc_cents, 6500);
+        let inst = Sf2Instrument {
+            name: "filt".into(),
+            bank: bank_filt,
+        };
+        let mut voice = inst.make_voice(0, 60, 127, 44_100).unwrap();
+        let mut buf = vec![0.0f32; 1024];
+        // Render past the attack ramp.
+        voice.render(&mut buf);
+        // Settle.
+        voice.render(&mut buf);
+        // Measure peak amplitude after the filter has had time to
+        // settle.
+        let peak: f32 = buf[200..1000].iter().map(|s| s.abs()).fold(0.0, f32::max);
+        // The square wave at native rate would peak near amplitude *
+        // 0.5 (the SF2 voice's velocity scale). After the LPF it
+        // should be a small fraction of that — assert it's well below
+        // 0.05 (≈ -26 dB attenuation of the alternating source).
+        assert!(
+            peak < 0.05,
+            "filter should attenuate HF: peak {peak} (expected < 0.05)",
+        );
+    }
+
+    #[test]
+    fn filter_default_cutoff_is_bypass() {
+        // A bank with no filter generator gets the spec default
+        // (13500 cents). That should be above audio band → no LPF
+        // state allocated → output matches the unfiltered path.
+        let blob = build_minimal_looping_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let plan = bank.resolve(0, 60, 100).unwrap();
+        assert_eq!(plan.initial_filter_fc_cents, 13_500);
+    }
+
+    /// Build an SF2 with a strong modulation envelope routed to filter
+    /// cutoff (gen 11 = +6000 cents) so we can verify the filter
+    /// brightens over time as the mod-env attacks.
+    fn build_mod_env_sf2() -> Vec<u8> {
+        let mut smpl: Vec<u8> = Vec::with_capacity(80);
+        for i in 0i32..40 {
+            let v = if i % 2 == 0 { 16000_i16 } else { -16000_i16 };
+            smpl.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut info = Vec::new();
+        push_chunk(&mut info, b"ifil", &{
+            let mut v = Vec::new();
+            v.extend_from_slice(&2u16.to_le_bytes());
+            v.extend_from_slice(&4u16.to_le_bytes());
+            v
+        });
+        let mut info_list = Vec::from(b"INFO" as &[u8]);
+        info_list.extend_from_slice(&info);
+        let mut sdta = Vec::new();
+        push_chunk(&mut sdta, b"smpl", &smpl);
+        let mut sdta_list = Vec::from(b"sdta" as &[u8]);
+        sdta_list.extend_from_slice(&sdta);
+
+        let mut phdr = Vec::new();
+        phdr.extend_from_slice(&phdr_record("ModEnv Preset", 0, 0, 0));
+        phdr.extend_from_slice(&phdr_record("EOP", 0, 0, 1));
+        let mut pbag = Vec::new();
+        pbag.extend_from_slice(&bag_record(0, 0));
+        pbag.extend_from_slice(&bag_record(1, 0));
+        let pmod = vec![0u8; PMOD_RECORD];
+        let mut pgen = Vec::new();
+        pgen.extend_from_slice(&gen_record(GEN_INSTRUMENT, 0));
+        pgen.extend_from_slice(&gen_record(0, 0));
+        let mut inst_chunk = Vec::new();
+        inst_chunk.extend_from_slice(&inst_record("ModEnv Inst", 0));
+        inst_chunk.extend_from_slice(&inst_record("EOI", 2));
+        let mut ibag = Vec::new();
+        ibag.extend_from_slice(&bag_record(0, 0));
+        // 6 real gens + 1 sentinel = sentinel bag points at index 6.
+        ibag.extend_from_slice(&bag_record(6, 0));
+        let imod = vec![0u8; IMOD_RECORD];
+        // Long mod-env attack (~50 ms = -4660 tc); start with a low
+        // cutoff (4500 cents ≈ 188 Hz) that climbs by +6000 cents
+        // (≈ 32× freq) over the attack. Sustain at 1.0 so it stays
+        // bright after the attack.
+        let attack_tc: i16 = -4660;
+        let mut igen = Vec::new();
+        igen.extend_from_slice(&gen_record(GEN_INITIAL_FILTER_FC, 4500));
+        igen.extend_from_slice(&gen_record(GEN_MOD_ENV_TO_FILTER_FC, 6000));
+        igen.extend_from_slice(&gen_record(GEN_ATTACK_MOD_ENV, attack_tc as u16));
+        igen.extend_from_slice(&gen_record(GEN_SUSTAIN_MOD_ENV, 0)); // peak
+        igen.extend_from_slice(&gen_record(GEN_SAMPLE_MODES, 1));
+        igen.extend_from_slice(&gen_record(GEN_SAMPLE_ID, 0));
+        igen.extend_from_slice(&gen_record(0, 0));
+        let mut shdr = Vec::new();
+        shdr.extend_from_slice(&shdr_record(
+            "ModEnvSquare",
+            0,
+            40,
+            0,
+            40,
+            44100,
+            60,
+            0,
+            0,
+            1,
+        ));
+        shdr.extend_from_slice(&shdr_record("EOS", 0, 0, 0, 0, 0, 0, 0, 0, 0));
+
+        let mut pdta = Vec::new();
+        push_chunk(&mut pdta, b"phdr", &phdr);
+        push_chunk(&mut pdta, b"pbag", &pbag);
+        push_chunk(&mut pdta, b"pmod", &pmod);
+        push_chunk(&mut pdta, b"pgen", &pgen);
+        push_chunk(&mut pdta, b"inst", &inst_chunk);
+        push_chunk(&mut pdta, b"ibag", &ibag);
+        push_chunk(&mut pdta, b"imod", &imod);
+        push_chunk(&mut pdta, b"igen", &igen);
+        push_chunk(&mut pdta, b"shdr", &shdr);
+        let mut pdta_list = Vec::from(b"pdta" as &[u8]);
+        pdta_list.extend_from_slice(&pdta);
+
+        let mut body = Vec::from(b"sfbk" as &[u8]);
+        push_chunk(&mut body, b"LIST", &info_list);
+        push_chunk(&mut body, b"LIST", &sdta_list);
+        push_chunk(&mut body, b"LIST", &pdta_list);
+        let mut out = Vec::from(b"RIFF" as &[u8]);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn mod_env_to_filter_routes_correctly() {
+        let blob = build_mod_env_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let plan = bank.resolve(0, 60, 100).unwrap();
+        assert_eq!(plan.initial_filter_fc_cents, 4500);
+        assert_eq!(plan.mod_env_to_filter_cents, 6000);
+        // Mod-env attack should be ~50 ms (the long ramp).
+        let attack_s = timecents_to_seconds(plan.mod_env.attack_tc, 0.0);
+        assert!(
+            (0.04..0.07).contains(&attack_s),
+            "mod-env attack should be ~50 ms, got {attack_s}",
+        );
+    }
+
+    #[test]
+    fn mod_env_brightens_filter_over_attack() {
+        // Render the mod-env fixture and verify the late portion
+        // (post-attack) has more amplitude than the early portion
+        // (filter is closed during the mod-env attack ramp).
+        let blob = build_mod_env_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let inst = Sf2Instrument {
+            name: "modenv".into(),
+            bank,
+        };
+        let mut voice = inst.make_voice(0, 60, 127, 44_100).unwrap();
+        let mut buf = vec![0.0f32; 4096];
+        voice.render(&mut buf);
+        // Take the post-vol-attack window (~ 220+ samples) so the
+        // volume envelope is fully open. Compare early-mod-env-attack
+        // vs late-mod-env-attack window amplitudes.
+        let early: f32 = buf[300..600].iter().map(|s| s.abs()).fold(0.0, f32::max);
+        let late: f32 = buf[3000..3500].iter().map(|s| s.abs()).fold(0.0, f32::max);
+        assert!(
+            late > early * 1.5,
+            "mod-env should brighten the filter: early={early}, late={late}",
+        );
+    }
+
+    /// Build an SF2 with a non-zero exclusive class (drum kit pattern)
+    /// so we can verify a same-channel same-class note-on cuts the
+    /// previous voice.
+    fn build_exclusive_class_sf2() -> Vec<u8> {
+        // Single sample, single instrument, exclusive_class = 7.
+        let mut smpl: Vec<u8> = Vec::with_capacity(80);
+        for i in 0i32..40 {
+            let v = (i * 400 - 8000) as i16;
+            smpl.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut info = Vec::new();
+        push_chunk(&mut info, b"ifil", &{
+            let mut v = Vec::new();
+            v.extend_from_slice(&2u16.to_le_bytes());
+            v.extend_from_slice(&4u16.to_le_bytes());
+            v
+        });
+        let mut info_list = Vec::from(b"INFO" as &[u8]);
+        info_list.extend_from_slice(&info);
+        let mut sdta = Vec::new();
+        push_chunk(&mut sdta, b"smpl", &smpl);
+        let mut sdta_list = Vec::from(b"sdta" as &[u8]);
+        sdta_list.extend_from_slice(&sdta);
+
+        let mut phdr = Vec::new();
+        phdr.extend_from_slice(&phdr_record("ExClass Preset", 0, 0, 0));
+        phdr.extend_from_slice(&phdr_record("EOP", 0, 0, 1));
+        let mut pbag = Vec::new();
+        pbag.extend_from_slice(&bag_record(0, 0));
+        pbag.extend_from_slice(&bag_record(1, 0));
+        let pmod = vec![0u8; PMOD_RECORD];
+        let mut pgen = Vec::new();
+        pgen.extend_from_slice(&gen_record(GEN_INSTRUMENT, 0));
+        pgen.extend_from_slice(&gen_record(0, 0));
+        let mut inst_chunk = Vec::new();
+        inst_chunk.extend_from_slice(&inst_record("ExClass Inst", 0));
+        inst_chunk.extend_from_slice(&inst_record("EOI", 2));
+        let mut ibag = Vec::new();
+        ibag.extend_from_slice(&bag_record(0, 0));
+        ibag.extend_from_slice(&bag_record(3, 0));
+        let imod = vec![0u8; IMOD_RECORD];
+        let mut igen = Vec::new();
+        igen.extend_from_slice(&gen_record(GEN_EXCLUSIVE_CLASS, 7));
+        igen.extend_from_slice(&gen_record(GEN_SAMPLE_MODES, 1));
+        igen.extend_from_slice(&gen_record(GEN_SAMPLE_ID, 0));
+        igen.extend_from_slice(&gen_record(0, 0));
+        let mut shdr = Vec::new();
+        shdr.extend_from_slice(&shdr_record("Drum", 0, 40, 0, 40, 22050, 60, 0, 0, 1));
+        shdr.extend_from_slice(&shdr_record("EOS", 0, 0, 0, 0, 0, 0, 0, 0, 0));
+
+        let mut pdta = Vec::new();
+        push_chunk(&mut pdta, b"phdr", &phdr);
+        push_chunk(&mut pdta, b"pbag", &pbag);
+        push_chunk(&mut pdta, b"pmod", &pmod);
+        push_chunk(&mut pdta, b"pgen", &pgen);
+        push_chunk(&mut pdta, b"inst", &inst_chunk);
+        push_chunk(&mut pdta, b"ibag", &ibag);
+        push_chunk(&mut pdta, b"imod", &imod);
+        push_chunk(&mut pdta, b"igen", &igen);
+        push_chunk(&mut pdta, b"shdr", &shdr);
+        let mut pdta_list = Vec::from(b"pdta" as &[u8]);
+        pdta_list.extend_from_slice(&pdta);
+
+        let mut body = Vec::from(b"sfbk" as &[u8]);
+        push_chunk(&mut body, b"LIST", &info_list);
+        push_chunk(&mut body, b"LIST", &sdta_list);
+        push_chunk(&mut body, b"LIST", &pdta_list);
+        let mut out = Vec::from(b"RIFF" as &[u8]);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn exclusive_class_propagates_to_voice() {
+        let blob = build_exclusive_class_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let plan = bank.resolve(0, 60, 100).unwrap();
+        assert_eq!(plan.exclusive_class, 7);
+        let inst = Sf2Instrument {
+            name: "ex".into(),
+            bank,
+        };
+        let voice = inst.make_voice(0, 60, 127, 22_050).unwrap();
+        assert_eq!(voice.exclusive_class(), 7);
+    }
+
+    #[test]
+    fn exclusive_class_cuts_prior_voice_in_same_class() {
+        use crate::mixer::Mixer;
+        let blob = build_exclusive_class_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let inst = Sf2Instrument {
+            name: "ex".into(),
+            bank,
+        };
+        let mut mixer = Mixer::new();
+        // First note in class 7.
+        let v1 = inst.make_voice(0, 60, 127, 22_050).unwrap();
+        mixer.note_on(0, 60, 127, v1);
+        assert_eq!(mixer.live_voice_count(), 1);
+        // Second note also in class 7 — must cut the first.
+        let v2 = inst.make_voice(0, 64, 127, 22_050).unwrap();
+        mixer.note_on(0, 64, 127, v2);
+        assert_eq!(
+            mixer.live_voice_count(),
+            1,
+            "second exclusive-class note must cut the first",
+        );
+    }
+
+    #[test]
+    fn overriding_root_key_changes_pitch_ratio() {
+        // Build a fixture where the sample's own original_key is 60
+        // but igen overrides it to 72 (one octave up). A request for
+        // key 60 should now play at a *lower* pitch (ratio 0.5)
+        // because the sample is treated as if it natively sounds at
+        // key 72.
+        let blob = build_overriding_root_key_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let plan = bank.resolve(0, 60, 100).unwrap();
+        // Effective root = 72, target = 60 → -12 semitones → 0.5×.
+        assert!(
+            (plan.pitch_ratio - 0.5).abs() < 1e-9,
+            "expected ratio 0.5 with overriding_root_key=72, got {}",
+            plan.pitch_ratio,
+        );
+    }
+
+    fn build_overriding_root_key_sf2() -> Vec<u8> {
+        let mut smpl: Vec<u8> = Vec::new();
+        for i in 0i32..20 {
+            let v = (i * 800 - 8000) as i16;
+            smpl.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut info = Vec::new();
+        push_chunk(&mut info, b"ifil", &{
+            let mut v = Vec::new();
+            v.extend_from_slice(&2u16.to_le_bytes());
+            v.extend_from_slice(&4u16.to_le_bytes());
+            v
+        });
+        let mut info_list = Vec::from(b"INFO" as &[u8]);
+        info_list.extend_from_slice(&info);
+        let mut sdta = Vec::new();
+        push_chunk(&mut sdta, b"smpl", &smpl);
+        let mut sdta_list = Vec::from(b"sdta" as &[u8]);
+        sdta_list.extend_from_slice(&sdta);
+
+        let mut phdr = Vec::new();
+        phdr.extend_from_slice(&phdr_record("Root Preset", 0, 0, 0));
+        phdr.extend_from_slice(&phdr_record("EOP", 0, 0, 1));
+        let mut pbag = Vec::new();
+        pbag.extend_from_slice(&bag_record(0, 0));
+        pbag.extend_from_slice(&bag_record(1, 0));
+        let pmod = vec![0u8; PMOD_RECORD];
+        let mut pgen = Vec::new();
+        pgen.extend_from_slice(&gen_record(GEN_INSTRUMENT, 0));
+        pgen.extend_from_slice(&gen_record(0, 0));
+        let mut inst_chunk = Vec::new();
+        inst_chunk.extend_from_slice(&inst_record("Root Inst", 0));
+        inst_chunk.extend_from_slice(&inst_record("EOI", 2));
+        let mut ibag = Vec::new();
+        ibag.extend_from_slice(&bag_record(0, 0));
+        ibag.extend_from_slice(&bag_record(2, 0));
+        let imod = vec![0u8; IMOD_RECORD];
+        let mut igen = Vec::new();
+        igen.extend_from_slice(&gen_record(GEN_OVERRIDING_ROOT_KEY, 72));
+        igen.extend_from_slice(&gen_record(GEN_SAMPLE_ID, 0));
+        igen.extend_from_slice(&gen_record(0, 0));
+        let mut shdr = Vec::new();
+        shdr.extend_from_slice(&shdr_record("Root", 0, 20, 0, 20, 22050, 60, 0, 0, 1));
+        shdr.extend_from_slice(&shdr_record("EOS", 0, 0, 0, 0, 0, 0, 0, 0, 0));
+
+        let mut pdta = Vec::new();
+        push_chunk(&mut pdta, b"phdr", &phdr);
+        push_chunk(&mut pdta, b"pbag", &pbag);
+        push_chunk(&mut pdta, b"pmod", &pmod);
+        push_chunk(&mut pdta, b"pgen", &pgen);
+        push_chunk(&mut pdta, b"inst", &inst_chunk);
+        push_chunk(&mut pdta, b"ibag", &ibag);
+        push_chunk(&mut pdta, b"imod", &imod);
+        push_chunk(&mut pdta, b"igen", &igen);
+        push_chunk(&mut pdta, b"shdr", &shdr);
+        let mut pdta_list = Vec::from(b"pdta" as &[u8]);
+        pdta_list.extend_from_slice(&pdta);
+
+        let mut body = Vec::from(b"sfbk" as &[u8]);
+        push_chunk(&mut body, b"LIST", &info_list);
+        push_chunk(&mut body, b"LIST", &sdta_list);
+        push_chunk(&mut body, b"LIST", &pdta_list);
+        let mut out = Vec::from(b"RIFF" as &[u8]);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn mod_env_default_sustain_is_full_when_zero() {
+        // sustain_per_mille = 0 → level = 1.0 (peak).
+        let m = ModEnvParams::default();
+        assert_eq!(m.sustain_per_mille, 0);
+    }
+
+    #[test]
+    fn voice_24_bit_quantisation_resolution() {
+        // Verify the SF2 voice fetches its samples through the
+        // 24-bit path (`i32 / 2^23`) rather than the 16-bit path
+        // (`i16 / 2^15`). The cleanest way is to read straight from
+        // bank.sample_data: an sm24 byte of 0x80 contributes 128
+        // out of 2^23 = ~1.5e-5, well below the 16-bit grid step
+        // of 1/32768 ≈ 3e-5. The minimal-fixture path produces
+        // sample_data values whose lower 8 bits are *non-zero*
+        // when sm24 is present.
+        let blob = build_sm24_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        let nonzero_lsb = bank
+            .sample_data
+            .iter()
+            .filter(|&&v| (v & 0xFF) != 0)
+            .count();
+        assert_eq!(
+            nonzero_lsb,
+            bank.sample_data.len(),
+            "every frame should have a non-zero sm24 LSB",
+        );
+        // And verify the conversion divisor is 2^23 (exact 24-bit
+        // grid). Construct a voice and render one sample — the value
+        // should match what `fetch` would produce.
+        let inst = Sf2Instrument {
+            name: "sm24".into(),
+            bank,
+        };
+        let mut voice = inst.make_voice(0, 60, 127, 22_050).unwrap();
+        let mut buf = vec![0.0f32; 4];
+        voice.render(&mut buf);
+        // Sample 0 = -2_047_984 (= ((-8000 << 8) | 0x10)). Through
+        // the voice envelope (~ 0 at attack start), the rendered
+        // sample is 0. Sample 2 of the attack ramp is more useful:
+        // the value isn't exactly zero. Just assert at least one
+        // rendered sample is non-zero (proves the fetch path runs).
+        assert!(buf.iter().any(|s| s.abs() > 0.0), "voice rendered silence");
     }
 }

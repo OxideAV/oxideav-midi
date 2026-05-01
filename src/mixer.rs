@@ -320,7 +320,29 @@ impl Mixer {
     /// pitch bend and aftertouch are applied to the freshly-allocated
     /// voice so a note triggered while the bend wheel is held picks up
     /// the offset on its first sample.
+    ///
+    /// When the new voice declares a non-zero
+    /// [`Voice::exclusive_class`], every prior voice on the same channel
+    /// with the same class is hard-stopped before the new voice is
+    /// inserted (SF2 generator 57 — drum kits use this for hi-hat
+    /// open/closed pairs).
     pub fn note_on(&mut self, channel: u8, key: u8, velocity: u8, mut voice: Box<dyn Voice>) {
+        // Exclusive-class cut: drop every prior voice on this channel
+        // with the same non-zero class id. Done before allocating the
+        // new slot so the freed slot is preferred by `pick_slot`.
+        let new_class = voice.exclusive_class();
+        if new_class != 0 {
+            for slot in self.slots.iter_mut() {
+                if slot.channel == channel {
+                    if let Some(v) = slot.voice.as_ref() {
+                        if v.exclusive_class() == new_class {
+                            slot.voice = None;
+                            slot.sustained = false;
+                        }
+                    }
+                }
+            }
+        }
         let st = self.channels[channel as usize % NUM_CHANNELS];
         let cents = pitch_bend_to_cents(st.pitch_bend, st.pitch_bend_range_cents);
         if cents != 0 {
@@ -386,14 +408,22 @@ impl Mixer {
         }
 
         let mut active = 0;
-        // Per-voice scratch buffer to render into before panning. We
-        // could re-render in-place but that would force the voice to
-        // know about the stereo bus; keeping the voice mono is the
-        // round-2/3 contract.
+        // Per-voice scratch buffers. Mono path renders into `mono` then
+        // pans into the L/R bus. Stereo path renders directly into
+        // `lscratch` / `rscratch` (one set kept around so the voice
+        // isn't forced to allocate per chunk) and *bypasses* the pan
+        // law — a true stereo SF2 zone has its own image baked in.
         let mut mono = vec![0.0f32; left.len()];
+        let mut lscratch = vec![0.0f32; left.len()];
+        let mut rscratch = vec![0.0f32; left.len()];
         for slot in self.slots.iter_mut() {
+            let stereo = slot.voice.as_ref().map(|v| v.is_stereo()).unwrap_or(false);
             let n = if let Some(v) = slot.voice.as_mut() {
-                let n = v.render(&mut mono);
+                let n = if stereo {
+                    v.render_stereo(&mut lscratch, &mut rscratch)
+                } else {
+                    v.render(&mut mono)
+                };
                 if n == 0 && v.done() {
                     slot.voice = None;
                     continue;
@@ -409,17 +439,35 @@ impl Mixer {
             // Constant-power pan: θ in [0, π/2], left = cos(θ), right = sin(θ).
             let pan_norm = (st.pan as f32 / 127.0).clamp(0.0, 1.0);
             let theta = pan_norm * std::f32::consts::FRAC_PI_2;
-            let l_gain = theta.cos() * vol * self.mix_gain;
-            let r_gain = theta.sin() * vol * self.mix_gain;
 
-            for i in 0..n {
-                let s = mono[i];
-                left[i] += s * l_gain;
-                right[i] += s * r_gain;
+            if stereo {
+                // Stereo voice: keep its inherent L/R image, but still
+                // honour the channel's volume CC. Pan applies as a
+                // *balance* rather than a true pan: pan=64 → 1.0/1.0,
+                // pan=0 → 1.0/0.0, pan=127 → 0.0/1.0. This matches the
+                // GM "balance control" interpretation for stereo
+                // sources, where pan rotates the image rather than
+                // re-panning a mono signal.
+                let l_balance = (theta.cos() * std::f32::consts::SQRT_2).min(1.0);
+                let r_balance = (theta.sin() * std::f32::consts::SQRT_2).min(1.0);
+                let lg = vol * self.mix_gain * l_balance;
+                let rg = vol * self.mix_gain * r_balance;
+                for i in 0..n {
+                    left[i] += lscratch[i] * lg;
+                    right[i] += rscratch[i] * rg;
+                }
+            } else {
+                let l_gain = theta.cos() * vol * self.mix_gain;
+                let r_gain = theta.sin() * vol * self.mix_gain;
+                for i in 0..n {
+                    let s = mono[i];
+                    left[i] += s * l_gain;
+                    right[i] += s * r_gain;
+                }
             }
             active += 1;
 
-            // If the voice produced fewer than `mono.len()` samples it
+            // If the voice produced fewer than the buffer size it
             // exhausted itself mid-chunk; mark it done so the next mix
             // pass frees the slot. The voice's own `done()` flag is
             // already set in this case (see Voice::render contract).
