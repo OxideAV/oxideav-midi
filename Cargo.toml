@@ -1,0 +1,17 @@
+[package]
+name = "oxideav-midi"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-midi"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust MIDI — Standard MIDI File (SMF) parser + transport metadata + soft-synth scaffold (SoundFont 2 / SFZ / DLS / pure-tone fallback). External instruments are loaded from disk; nothing is bundled in the binary."
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-midi"
+keywords = ["multimedia", "midi", "audio", "synth", "smf"]
+categories = ["multimedia::audio", "multimedia::encoding"]
+
+[dependencies]
+oxideav-core = "0.1"
