@@ -44,7 +44,13 @@ pub trait Voice: Send {
 }
 
 /// Source of voices for one MIDI program (a "bank").
-pub trait Instrument: Send {
+///
+/// `Send + Sync` so an `Arc<dyn Instrument>` is `Send`-able into the
+/// `MidiDecoder` (which itself must be `Send` per the `Decoder` trait).
+/// `make_voice` takes `&self` so concrete impls only need shared
+/// references to whatever cross-cutting state they hold (sample arena
+/// in [`sf2::Sf2Bank`] etc.).
+pub trait Instrument: Send + Sync {
     /// Human-readable name for diagnostics. Implementations should
     /// return something stable — a filename, a "TimGM6mb GM Set", or
     /// `"pure-tone fallback"` for the canary.
