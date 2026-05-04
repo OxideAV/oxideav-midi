@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 9 — SFZ + DLS voice generators (task #410)
+
+- **Shared sample-playback voice** (`instruments::sample_voice`). Mono
+  in, mono out; the [`mixer`](src/mixer.rs) handles stereo panning.
+  Covers the DAHDSR amplitude envelope (delay / attack / hold / decay /
+  sustain / release), four loop modes (`NoLoop`, `OneShot`,
+  `LoopContinuous`, `LoopSustain`), pitch bend via the existing
+  `Voice::set_pitch_bend_cents` hook, channel/poly aftertouch via
+  `Voice::set_pressure`, exclusive-class drum cuts, and a sine vibrato
+  LFO with rate / depth / start-delay.
+- **Minimal RIFF/WAVE PCM decoder** (`instruments::wav_pcm`). Decodes
+  8-bit unsigned, 16-bit signed LE, 24-bit signed LE, 32-bit signed LE
+  PCM, and 32-bit IEEE_FLOAT into mono f32. Stereo / multi-channel WAVs
+  are mixed down to mono by averaging channels (round-2 voice
+  generation will keep stereo intact).
+- **SFZ voice generator**. `SfzInstrument::make_voice` walks the
+  flattened region table for the highest-priority match on `(key,
+  velocity)`, decodes the WAV bytes loaded by `SfzInstrument::open`,
+  shifts pitch off `pitch_keycenter` + `tune` + `transpose`, and
+  instantiates a `SamplePlayer` honoring the region's `loop_*` opcodes
+  + an amplitude envelope from `ampeg_delay/attack/hold/decay/sustain/
+  release` + a vibrato LFO from `lfo01_freq` / `lfo01_pitch` /
+  `lfo01_delay` (with `vibrato_*` aliases).
+- **DLS Level 1 + 2 voice generator**. `DlsInstrument::make_voice`
+  picks the matching instrument by MIDI program (bank-MSB / LSB
+  matching is round 2), picks a region by `(key, velocity)`, resolves
+  `wlnk.table_index` → `ptbl` cue → wave-pool entry, decodes the PCM
+  via `wav_pcm::decode_pcm_bytes`, and plays the sample through the
+  shared `SamplePlayer`. Region-level `wsmp` overrides the wave-level
+  default per the spec; `WLOOP_TYPE_FORWARD` (0) maps to
+  `LoopContinuous`, `WLOOP_TYPE_RELEASE` (1) maps to `LoopSustain`.
+  `art1`/`art2` connection-block evaluation is round 2 — the parsed
+  blocks remain on the bank.
+- **`InstrumentSource` builder** + `MidiDecoder::with_instrument_source`.
+  Caller passes `InstrumentSource::sf2(path)` / `sfz(path)` / `dls(path)`
+  / `Tone` and the decoder picks the right loader. Format detection is
+  *not* by extension — the caller picks the variant.
+- **Tests added**: 13 net new lib-side (5 sample_voice, 4 wav_pcm, 3
+  SFZ voice-generation, 2 DLS voice-generation, minus the 2 existing
+  `make_voice_returns_unsupported` tests that were replaced/upgraded
+  to actually exercise the round-1 voice path) + 3 integration
+  (`tests/voice_round_trip.rs`) exercising end-to-end SFZ/SF2/DLS
+  rendering through `MidiDecoder` with an RMS non-silence assertion.
+  Total: 156 lib + 6 integration = 162 passing (was 143 + 3 = 146).
+
 ### Round 8 — DLS Level 1 + 2 sample-loader (task #409)
 
 - **DLS RIFF parser**: walks the `RIFF`/`DLS ` form and pulls the

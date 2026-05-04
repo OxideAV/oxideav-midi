@@ -7,34 +7,51 @@
 //!
 //! - [`sf2`] is a working SoundFont 2 reader + voice generator: it
 //!   loads a `.sf2` bank into memory, cross-resolves the preset →
-//!   instrument → zone → sample chain, and renders 16-bit PCM at the
-//!   requested pitch via linear interpolation. (Modulators, sm24,
-//!   stereo linking, and full envelopes/filters are pending.)
-//! - [`sfz`] is a working text patch reader: it strips comments, walks
-//!   `<control>` / `<global>` / `<master>` / `<group>` / `<region>`
-//!   sections, flattens inheritance into one fully-resolved opcode map
-//!   per region, and (when constructed via
-//!   [`sfz::SfzInstrument::open`]) reads every referenced sample off
-//!   disk. `make_voice` is round-2 — it returns `Error::Unsupported`
-//!   today; the parsed [`sfz::SfzInstrument::regions`] table is the
-//!   public surface round-1 surfaces.
-//! - [`dls`] is a working DLS Level 1 + Level 2 RIFF reader: it walks
-//!   the `DLS ` form, pulls the `colh` / `vers` / `ptbl` / `lins` /
-//!   `wvpl` chunks apart, and surfaces a fully-resolved bank
-//!   ([`dls::DlsBank`]) of instruments → regions → wave-pool samples
-//!   with their `wsmp` loop info, `wlnk` cue-table references, and
-//!   `art1` / `art2` connection blocks. `make_voice` is round 2 — it
-//!   still returns `Error::Unsupported`; the parsed bank is the
-//!   public surface round 1 surfaces.
+//!   instrument → zone → sample chain, and renders sm24-aware 24-bit
+//!   PCM at the requested pitch via linear interpolation. Honours the
+//!   volume + modulation DAHDSR envelopes, the initial low-pass biquad
+//!   filter, mod-env → pitch / filter routing, exclusive-class drum
+//!   cuts, and native stereo zones.
+//! - [`sfz`] is a working text patch reader **plus voice generator**.
+//!   The reader strips comments, walks `<control>` / `<global>` /
+//!   `<master>` / `<group>` / `<region>` sections, flattens
+//!   inheritance into one fully-resolved opcode map per region, and
+//!   (when constructed via [`sfz::SfzInstrument::open`]) reads every
+//!   referenced sample off disk. `make_voice` decodes the WAV bytes
+//!   (8/16/24/32-bit PCM and IEEE_FLOAT), picks the matching region
+//!   by (key, velocity), shifts pitch off `pitch_keycenter` + `tune` +
+//!   `transpose`, and runs a DAHDSR amplitude envelope (`ampeg_*`) +
+//!   vibrato LFO (`lfo01_*`).
+//! - [`dls`] is a working DLS Level 1 + Level 2 RIFF reader **plus
+//!   voice generator**. The reader walks the `DLS ` form, pulls the
+//!   `colh` / `vers` / `ptbl` / `lins` / `wvpl` chunks apart, and
+//!   surfaces a fully-resolved bank ([`dls::DlsBank`]) of instruments
+//!   → regions → wave-pool samples with their `wsmp` loop info,
+//!   `wlnk` cue-table references, and `art1` / `art2` connection
+//!   blocks. `make_voice` picks the matching instrument by program,
+//!   picks a region by (key, velocity), resolves wlnk → ptbl →
+//!   wave-pool, decodes the PCM, and plays the sample through the
+//!   shared [`sample_voice::SamplePlayer`]. `art1`/`art2` connection-
+//!   block evaluation is deferred to round 2.
+//! - [`sample_voice`] is the shared sample-playback voice both `sfz`
+//!   and `dls` use. Mono in, mono out — the [`mixer`](crate::mixer)
+//!   handles stereo panning. Covers DAHDSR amplitude envelope, four
+//!   loop modes (no-loop / one-shot / continuous / sustain), pitch
+//!   bend, and a vibrato LFO (rate/depth/delay).
+//! - [`wav_pcm`] is a minimal RIFF/WAVE PCM decoder — 8-bit unsigned,
+//!   16-bit signed LE, 24-bit signed LE, 32-bit signed LE PCM, and
+//!   32-bit IEEE_FLOAT — used by the SFZ and DLS sample loaders.
 //! - [`tone::ToneInstrument`] is the canary: if no SoundFont is
 //!   available, the synth still produces *something*.
 
 use oxideav_core::Result;
 
 pub mod dls;
+pub mod sample_voice;
 pub mod sf2;
 pub mod sfz;
 pub mod tone;
+pub mod wav_pcm;
 
 /// One voice rendered into a planar f32 buffer.
 ///

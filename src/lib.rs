@@ -21,23 +21,35 @@
 //!       envelopes, the initial low-pass biquad filter, mod-env →
 //!       pitch / filter routing, exclusive-class drum cuts, and
 //!       native stereo zones.
-//!     * **[`instruments::sfz`]** — text patch reader. Strips
-//!       comments, walks `<control>` / `<global>` / `<master>` /
-//!       `<group>` / `<region>` sections, flattens inheritance into
-//!       one fully-resolved opcode map per region, and (via
+//!     * **[`instruments::sfz`]** — text patch reader **plus voice
+//!       generator**. Strips comments, walks `<control>` /
+//!       `<global>` / `<master>` / `<group>` / `<region>` sections,
+//!       flattens inheritance into one fully-resolved opcode map per
+//!       region, and (via
 //!       [`SfzInstrument::open`](instruments::sfz::SfzInstrument::open))
-//!       reads every referenced sample off disk. Voice generation is
-//!       still pending — `make_voice` returns [`Error::Unsupported`].
+//!       reads every referenced sample off disk. Voice generation
+//!       decodes the WAV sample bytes, picks the matching region by
+//!       (key, velocity), shifts pitch off `pitch_keycenter` + `tune` +
+//!       `transpose`, and runs a DAHDSR amplitude envelope
+//!       (`ampeg_*`) + vibrato LFO (`lfo01_*`).
 //!     * **[`instruments::dls`]** — DLS (Downloadable Sounds)
-//!       Level 1 + Level 2 RIFF reader. Walks the `DLS ` form,
-//!       parses the `colh` / `vers` / `ptbl` pool table /
-//!       `lins-list` instrument table / `wvpl-list` wave pool, and
-//!       surfaces a fully-cross-resolved
+//!       Level 1 + Level 2 RIFF reader **plus voice generator**.
+//!       Walks the `DLS ` form, parses the `colh` / `vers` / `ptbl`
+//!       pool table / `lins-list` instrument table / `wvpl-list`
+//!       wave pool, and surfaces a fully-cross-resolved
 //!       [`DlsBank`](instruments::dls::DlsBank) of instruments →
-//!       regions → wave-pool samples with their `wsmp` loops, `wlnk`
-//!       cue references, and `art1` / `art2` articulation
-//!       connection blocks. `make_voice` is round 2 — it returns
-//!       [`Error::Unsupported`].
+//!       regions → wave-pool samples with their `wsmp` loops,
+//!       `wlnk` cue references, and `art1` / `art2` articulation
+//!       connection blocks. `make_voice` resolves the wlnk → ptbl →
+//!       wave-pool entry, decodes the PCM, and plays the sample
+//!       through [`SamplePlayer`](instruments::sample_voice::SamplePlayer).
+//!       `art1`/`art2` connection-block evaluation is round 2.
+//!     * **[`instruments::sample_voice`]** — shared sample-playback
+//!       voice (mono in, mono out) used by both SFZ and DLS. Covers
+//!       DAHDSR amplitude envelope, four loop modes, pitch bend,
+//!       and a vibrato LFO.
+//!     * **[`instruments::wav_pcm`]** — minimal RIFF/WAVE PCM
+//!       decoder used by the SFZ and DLS sample loaders.
 //!     * **[`instruments::tone`]** — sine/triangle/saw/square
 //!       fallback so the synth produces *something* even when no
 //!       on-disk bank is present.
@@ -73,6 +85,7 @@ pub mod paths;
 pub mod scheduler;
 pub mod smf;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use oxideav_core::{
@@ -80,6 +93,9 @@ use oxideav_core::{
     Error, Frame, Packet, Result,
 };
 
+use crate::instruments::dls::DlsInstrument;
+use crate::instruments::sf2::Sf2Instrument;
+use crate::instruments::sfz::SfzInstrument;
 use crate::instruments::tone::ToneInstrument;
 use crate::instruments::Instrument;
 use crate::mixer::Mixer;
@@ -210,6 +226,60 @@ impl MidiDecoder {
         Self::new(instrument, OUTPUT_SAMPLE_RATE)
     }
 
+    /// Build a decoder bound to an instrument loaded from a path on
+    /// disk. The format is dispatched by [`InstrumentSource`] so the
+    /// caller picks SFZ / SF2 / DLS explicitly (file extensions are
+    /// not always reliable indicators).
+    pub fn with_instrument_source(source: InstrumentSource) -> Result<Self> {
+        let inst = source.load()?;
+        Ok(Self::new(inst, OUTPUT_SAMPLE_RATE))
+    }
+}
+
+/// Source descriptor for an external instrument bank. Paired with
+/// [`MidiDecoder::with_instrument_source`] so a caller that only knows
+/// "I have an SF2 file at this path" doesn't have to type the full
+/// `Arc::new(Sf2Instrument::open(...))` chain.
+#[derive(Clone, Debug)]
+pub enum InstrumentSource {
+    /// SoundFont 2 bank — loaded via [`Sf2Instrument::open`].
+    Sf2(PathBuf),
+    /// SFZ text patch — loaded via [`SfzInstrument::open`] (samples
+    /// are read off disk relative to the patch's directory).
+    Sfz(PathBuf),
+    /// DLS Level 1 / 2 bank — loaded via [`DlsInstrument::open`].
+    Dls(PathBuf),
+    /// Pure-tone fallback (no on-disk file).
+    Tone,
+}
+
+impl InstrumentSource {
+    /// Load the bank at the named path and wrap it in an `Arc<dyn
+    /// Instrument>`. Returns the underlying error (file-not-found,
+    /// invalid magic, malformed RIFF chunk, etc.) on failure.
+    pub fn load(self) -> Result<Arc<dyn Instrument>> {
+        match self {
+            InstrumentSource::Sf2(p) => Ok(Arc::new(Sf2Instrument::open(&p)?)),
+            InstrumentSource::Sfz(p) => Ok(Arc::new(SfzInstrument::open(&p)?)),
+            InstrumentSource::Dls(p) => Ok(Arc::new(DlsInstrument::open(&p)?)),
+            InstrumentSource::Tone => Ok(Arc::new(ToneInstrument::new())),
+        }
+    }
+
+    /// Convenience constructors mirroring the enum variants. Each
+    /// takes anything `Path`-convertible.
+    pub fn sf2(path: impl AsRef<Path>) -> Self {
+        Self::Sf2(path.as_ref().to_path_buf())
+    }
+    pub fn sfz(path: impl AsRef<Path>) -> Self {
+        Self::Sfz(path.as_ref().to_path_buf())
+    }
+    pub fn dls(path: impl AsRef<Path>) -> Self {
+        Self::Dls(path.as_ref().to_path_buf())
+    }
+}
+
+impl MidiDecoder {
     /// Sample rate the decoder is rendering at. Equal to whatever was
     /// passed to [`new`](Self::new) (default [`OUTPUT_SAMPLE_RATE`] when
     /// constructed via the registry).

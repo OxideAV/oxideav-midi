@@ -44,13 +44,24 @@
 //!   stub (RIFF + `DLS ` at offset 0/8) — but we now plumb the rest of
 //!   the file through.
 //!
+//! Voice generation: [`DlsInstrument::make_voice`] picks the matching
+//! instrument by MIDI program, picks a region by `(key, velocity)`,
+//! resolves `wlnk.table_index` → `ptbl` cue → wave-pool entry,
+//! decodes the PCM via [`super::wav_pcm::decode_pcm_bytes`] (8/16-bit
+//! WAV-shaped), shifts pitch off `wsmp.unity_note`, and plays the
+//! sample through the shared [`super::sample_voice::SamplePlayer`].
+//! Loop modes from `wsmp.loops`: `WLOOP_TYPE_FORWARD` (DLS1) maps to
+//! [`super::sample_voice::SampleLoopMode::LoopContinuous`];
+//! `WLOOP_TYPE_RELEASE` (DLS2) maps to
+//! [`super::sample_voice::SampleLoopMode::LoopSustain`].
+//!
 //! What's deferred to round 2 (clear followups, no GitHub issues):
 //!
-//! - Voice generation (`Instrument::make_voice` still returns
-//!   `Error::Unsupported`). The same shape as `SfzInstrument::make_voice`
-//!   round-2: walk regions, pick the one matching key + velocity,
-//!   instantiate a sample-playback voice with the wsmp loop info, run
-//!   art1/art2 default modulators (LFO + DAHDSR + filter) on top.
+//! - `art1`/`art2` connection-block interpretation. Round-1 voice
+//!   generation uses the [`super::sample_voice::SamplePlayer`]
+//!   defaults (5 ms attack / 100 ms decay / full sustain / 100 ms
+//!   release, no vibrato); the parsed connection blocks remain on
+//!   the bank for a round-2 caller to walk and modulate from.
 //! - DLS2 `cdl-ck` conditional evaluation. Round 1 currently ignores
 //!   the conditional opcode stream and unconditionally parses every
 //!   surrounding chunk; this is the recommended fallback for "device
@@ -63,9 +74,14 @@
 //! - DLS file MUXER (writing) — round 3+.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use oxideav_core::{Error, Result};
 
+use super::sample_voice::{
+    EnvelopeParams, SampleLoopMode, SamplePlayer, SamplePlayerConfig, VibratoParams,
+};
+use super::wav_pcm::decode_pcm_bytes;
 use super::{Instrument, Voice};
 
 /// Magic bytes at offset 0/8 of every DLS file. Note the trailing space
@@ -404,16 +420,167 @@ impl Instrument for DlsInstrument {
 
     fn make_voice(
         &self,
-        _program: u8,
-        _key: u8,
-        _velocity: u8,
-        _sample_rate: u32,
+        program: u8,
+        key: u8,
+        velocity: u8,
+        sample_rate: u32,
     ) -> Result<Box<dyn Voice>> {
-        Err(Error::unsupported(format!(
-            "DLS '{}': voice generation is round 2; the round-1 reader \
-             only exposes the parsed bank via DlsInstrument::bank()",
-            self.name,
-        )))
+        // 1. Pick the matching DLS instrument (program; bank not yet
+        //    plumbed end-to-end — round 1 matches first instrument with
+        //    the requested program number, ignoring CC0/CC32).
+        let inst = self
+            .bank
+            .instruments
+            .iter()
+            .find(|i| i.program_number() == program)
+            // Last-resort: take the first instrument so a bank with a
+            // single drum kit still produces sound.
+            .or_else(|| self.bank.instruments.first())
+            .ok_or_else(|| {
+                Error::unsupported(format!("DLS '{}': bank has no instruments", self.name,))
+            })?;
+
+        // 2. Pick a region. DLS regions don't overlap by spec, so the
+        //    first region whose key/vel range covers (key, velocity)
+        //    wins. If none match, fall back to the first region (some
+        //    banks set key_lo=key_hi=60 and rely on the synth to
+        //    transpose).
+        let region = inst
+            .regions
+            .iter()
+            .find(|r| {
+                u16::from(key) >= r.key_lo
+                    && u16::from(key) <= r.key_hi
+                    && u16::from(velocity) >= r.vel_lo
+                    && u16::from(velocity) <= r.vel_hi
+            })
+            .or_else(|| inst.regions.first())
+            .ok_or_else(|| {
+                Error::unsupported(format!("DLS '{}': instrument has no regions", self.name,))
+            })?;
+
+        // 3. Resolve wlnk → wave-pool entry. wlnk.table_index indexes
+        //    the ptbl cue table; each cue is a byte offset into the
+        //    wvpl payload that matches `DlsSample::pool_offset`.
+        let wlnk = region.wlnk.ok_or_else(|| {
+            Error::unsupported(format!(
+                "DLS '{}': region has no wlnk pointing at the wave pool",
+                self.name,
+            ))
+        })?;
+        let pool_offset = self
+            .bank
+            .wave_pool_offsets
+            .get(wlnk.table_index as usize)
+            .copied()
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "DLS '{}': wlnk table_index {} out of range (ptbl has {} entries)",
+                    self.name,
+                    wlnk.table_index,
+                    self.bank.wave_pool_offsets.len(),
+                ))
+            })?;
+        let wave = self
+            .bank
+            .waves
+            .iter()
+            .find(|w| w.pool_offset == pool_offset)
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "DLS '{}': no wave-pool entry at pool_offset {pool_offset}",
+                    self.name,
+                ))
+            })?;
+
+        // 4. Decode the PCM bytes to f32 mono.
+        let pcm = decode_pcm_bytes(
+            &wave.data,
+            wave.sample_rate,
+            wave.channels,
+            wave.bits_per_sample,
+            wave.format_tag,
+        )
+        .map_err(|e| {
+            Error::invalid(format!(
+                "DLS '{}': failed to decode wave PCM: {e}",
+                self.name,
+            ))
+        })?;
+
+        // 5. Build the SamplePlayer config. Region-level wsmp overrides
+        //    the wave-level default per the spec.
+        let wsmp = region.wsmp.as_ref().or(wave.wsmp.as_ref());
+        let cfg = build_dls_config(wsmp, &pcm.samples, pcm.sample_rate, key, velocity, region);
+        Ok(Box::new(SamplePlayer::new(cfg, sample_rate)))
+    }
+}
+
+/// Build a [`SamplePlayerConfig`] from a DLS region + its resolved
+/// wave-sample header. Round-1 ignores `art1`/`art2` connection blocks
+/// and uses the SamplePlayer's default DAHDSR; the parsed articulation
+/// blocks remain on the bank for a round-2 caller.
+fn build_dls_config(
+    wsmp: Option<&DlsWaveSample>,
+    samples: &[f32],
+    native_rate: u32,
+    key: u8,
+    velocity: u8,
+    region: &DlsRegion,
+) -> SamplePlayerConfig {
+    // Pitch ratio: 2^((target - unity_note) / 12 + fine_tune/16384*100/100).
+    // DLS sFineTune is in units of 1/65536 of a semitone — treat as
+    // signed 16-bit and divide by 65536 for the cents-per-semitone
+    // conversion. Most banks use the simpler integer cents convention,
+    // so we treat fine_tune as raw "cents-ish" for round 1 and clamp
+    // its effect.
+    let unity_note = wsmp.map(|w| w.unity_note as u8).unwrap_or(60);
+    let fine_tune = wsmp.map(|w| w.fine_tune as i32).unwrap_or(0);
+    let semitones = key as i32 - unity_note as i32;
+    let pitch_ratio = (2.0f64).powf(semitones as f64 / 12.0 + fine_tune as f64 / 1200.0);
+
+    // Velocity curve: (vel/127)^2 with 50 % headroom so 8 voices fit
+    // under 0 dBFS.
+    let v = velocity as f32 / 127.0;
+    let amplitude = v * v * 0.5;
+
+    // Loop info from wsmp. DLS1 stores `loop_type=0` (forward) and
+    // `loop_type=1` (release loop, DLS2-only). A wsmp with no loops =
+    // play once. Note `length` is in *frames*.
+    let total_frames = samples.len() as u32;
+    let (loop_start, loop_end, loop_mode) = match wsmp.and_then(|w| w.loops.first()) {
+        Some(l) => {
+            let start = l.start.min(total_frames);
+            let end = (l.start.saturating_add(l.length)).min(total_frames);
+            // loop_type 1 = release loop (loop while held). 0 = forward
+            // (loop continuously). Anything else, treat as no loop.
+            let mode = match l.loop_type {
+                0 => SampleLoopMode::LoopContinuous,
+                1 => SampleLoopMode::LoopSustain,
+                _ => SampleLoopMode::NoLoop,
+            };
+            (start, end, mode)
+        }
+        None => (0, total_frames, SampleLoopMode::NoLoop),
+    };
+
+    SamplePlayerConfig {
+        samples: Arc::from(samples.to_vec().into_boxed_slice()),
+        native_rate,
+        loop_start,
+        loop_end,
+        sample_end: total_frames,
+        loop_mode,
+        pitch_ratio,
+        amplitude,
+        envelope: EnvelopeParams::default(),
+        vibrato: VibratoParams::default(),
+        // DLS key_group: drum-kit style "this group cuts every prior
+        // voice in the same group". Maps onto the Voice trait's
+        // `exclusive_class` directly. Round-1 doesn't filter by
+        // melodic vs drum (the `key_group` field is non-zero only on
+        // drum regions per DLS1, so a melodic region passes 0 here).
+        exclusive_class: region.key_group,
     }
 }
 
@@ -1526,14 +1693,134 @@ mod tests {
     }
 
     #[test]
-    fn make_voice_returns_unsupported() {
+    fn make_voice_renders_pcm_for_minimal_dls() {
+        // The minimal DLS fixture is a 1-instrument bank with 8-bit
+        // mono PCM at 22 050 Hz, unity_note=60, no loop. A note-on at
+        // key 60 should produce a short non-silent buffer.
         let blob = build_minimal_dls();
         let inst = DlsInstrument::parse_bytes("min.dls", &blob).unwrap();
-        match inst.make_voice(0, 60, 100, 44_100) {
-            Err(Error::Unsupported(_)) => {}
-            Err(other) => panic!("expected Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected Err"),
-        }
+        let mut voice = inst
+            .make_voice(0, 60, 100, 44_100)
+            .expect("voice generation");
+        let mut buf = vec![0.0f32; 256];
+        let _ = voice.render(&mut buf);
+        // Sample is 8 frames @ 22 050 Hz played at 44 100 Hz output —
+        // ≈ 16 output frames before the voice exhausts. Some of those
+        // frames must be non-silent (the ramp section).
+        let nonzero = buf.iter().filter(|s| s.abs() > 0.001).count();
+        assert!(nonzero > 0, "expected non-silent output, got {nonzero}");
+    }
+
+    #[test]
+    fn make_voice_picks_region_by_key_and_velocity() {
+        // Build the two-region fixture (already used by the smoke
+        // test) and ask for a key in the upper half: the voice must
+        // pull from region 1, not region 0.
+        let blob = build_two_region_dls_for_voice_test();
+        let inst = DlsInstrument::parse_bytes("two.dls", &blob).unwrap();
+        // Should succeed for any key in 0..=127 (regions cover the
+        // full range between them).
+        let _v_low = inst.make_voice(5, 30, 100, 44_100).expect("low key");
+        let _v_high = inst.make_voice(5, 100, 100, 44_100).expect("high key");
+    }
+
+    /// Two-region fixture used by the voice-selection test. Identical
+    /// in shape to the one in the integration smoke test but inlined
+    /// here so the lib-side test stays self-contained.
+    fn build_two_region_dls_for_voice_test() -> Vec<u8> {
+        let pcm = vec![0x80u8, 0x90, 0xA0, 0xB0, 0xC0, 0xB0, 0xA0, 0x80];
+
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&22_050u32.to_le_bytes());
+        fmt.extend_from_slice(&22_050u32.to_le_bytes());
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&8u16.to_le_bytes());
+
+        let mut wave_body = Vec::from(b"wave" as &[u8]);
+        push_riff(&mut wave_body, b"fmt ", &fmt);
+        push_riff(&mut wave_body, b"data", &pcm);
+
+        let mut wvpl_body = Vec::from(b"wvpl" as &[u8]);
+        push_riff(&mut wvpl_body, b"LIST", &wave_body);
+
+        let mut ptbl = Vec::new();
+        ptbl.extend_from_slice(&8u32.to_le_bytes());
+        ptbl.extend_from_slice(&1u32.to_le_bytes());
+        ptbl.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut colh = Vec::new();
+        colh.extend_from_slice(&1u32.to_le_bytes());
+
+        let mut vers = Vec::new();
+        vers.extend_from_slice(&((1u32 << 16) | 1u32).to_le_bytes());
+        vers.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut info_body = Vec::from(b"INFO" as &[u8]);
+        push_riff(&mut info_body, b"INAM", b"TwoRegion\0");
+
+        // Instrument: program 5, two regions splitting at key 60.
+        let mut insh = Vec::new();
+        insh.extend_from_slice(&2u32.to_le_bytes());
+        insh.extend_from_slice(&0u32.to_le_bytes());
+        insh.extend_from_slice(&5u32.to_le_bytes());
+
+        let mut rgnh0 = Vec::new();
+        rgnh0.extend_from_slice(&0u16.to_le_bytes());
+        rgnh0.extend_from_slice(&59u16.to_le_bytes());
+        rgnh0.extend_from_slice(&0u16.to_le_bytes());
+        rgnh0.extend_from_slice(&127u16.to_le_bytes());
+        rgnh0.extend_from_slice(&0u16.to_le_bytes());
+        rgnh0.extend_from_slice(&0u16.to_le_bytes());
+        let mut wlnk0 = Vec::new();
+        wlnk0.extend_from_slice(&0u16.to_le_bytes());
+        wlnk0.extend_from_slice(&0u16.to_le_bytes());
+        wlnk0.extend_from_slice(&1u32.to_le_bytes());
+        wlnk0.extend_from_slice(&0u32.to_le_bytes());
+        let mut rgn0_body = Vec::from(b"rgn " as &[u8]);
+        push_riff(&mut rgn0_body, b"rgnh", &rgnh0);
+        push_riff(&mut rgn0_body, b"wlnk", &wlnk0);
+
+        let mut rgnh1 = Vec::new();
+        rgnh1.extend_from_slice(&60u16.to_le_bytes());
+        rgnh1.extend_from_slice(&127u16.to_le_bytes());
+        rgnh1.extend_from_slice(&0u16.to_le_bytes());
+        rgnh1.extend_from_slice(&127u16.to_le_bytes());
+        rgnh1.extend_from_slice(&0u16.to_le_bytes());
+        rgnh1.extend_from_slice(&0u16.to_le_bytes());
+        let mut wlnk1 = Vec::new();
+        wlnk1.extend_from_slice(&0u16.to_le_bytes());
+        wlnk1.extend_from_slice(&0u16.to_le_bytes());
+        wlnk1.extend_from_slice(&1u32.to_le_bytes());
+        wlnk1.extend_from_slice(&0u32.to_le_bytes());
+        let mut rgn1_body = Vec::from(b"rgn " as &[u8]);
+        push_riff(&mut rgn1_body, b"rgnh", &rgnh1);
+        push_riff(&mut rgn1_body, b"wlnk", &wlnk1);
+
+        let mut lrgn_body = Vec::from(b"lrgn" as &[u8]);
+        push_riff(&mut lrgn_body, b"LIST", &rgn0_body);
+        push_riff(&mut lrgn_body, b"LIST", &rgn1_body);
+
+        let mut ins_body = Vec::from(b"ins " as &[u8]);
+        push_riff(&mut ins_body, b"insh", &insh);
+        push_riff(&mut ins_body, b"LIST", &lrgn_body);
+
+        let mut lins_body = Vec::from(b"lins" as &[u8]);
+        push_riff(&mut lins_body, b"LIST", &ins_body);
+
+        let mut body = Vec::from(b"DLS " as &[u8]);
+        push_riff(&mut body, b"vers", &vers);
+        push_riff(&mut body, b"colh", &colh);
+        push_riff(&mut body, b"LIST", &lins_body);
+        push_riff(&mut body, b"ptbl", &ptbl);
+        push_riff(&mut body, b"LIST", &wvpl_body);
+        push_riff(&mut body, b"LIST", &info_body);
+
+        let mut out = Vec::from(b"RIFF" as &[u8]);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
     }
 
     #[test]

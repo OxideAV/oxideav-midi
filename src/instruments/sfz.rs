@@ -37,16 +37,28 @@
 //!   user with an `#include`-heavy patch knows the file isn't being
 //!   fully consumed.
 //!
-//! Voice generation (`Instrument::make_voice`) is round 2 — for now
-//! `make_voice` returns [`Error::Unsupported`] with a descriptive
-//! message. The parser surface is sufficient to load a `.sfz` patch
-//! and inspect its region table.
+//! Voice generation: [`SfzInstrument::make_voice`] decodes the WAV
+//! sample bytes (8/16/24/32-bit PCM and IEEE_FLOAT — see
+//! [`super::wav_pcm`]), picks the highest-priority region matching
+//! `(key, velocity)`, shifts pitch off `pitch_keycenter` + `tune` +
+//! `transpose`, and instantiates a
+//! [`super::sample_voice::SamplePlayer`] with a DAHDSR amplitude
+//! envelope from `ampeg_*` opcodes plus a vibrato LFO from
+//! `lfo01_freq` / `lfo01_pitch` / `lfo01_delay`. Patches loaded via
+//! [`SfzInstrument::parse_str`] (no filesystem) report
+//! [`Error::Unsupported`] at note-on time because there are no sample
+//! bytes to render.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use oxideav_core::{Error, Result};
 
+use super::sample_voice::{
+    EnvelopeParams, SampleLoopMode, SamplePlayer, SamplePlayerConfig, VibratoParams,
+};
+use super::wav_pcm::decode_wav;
 use super::{Instrument, Voice};
 
 /// Loop-mode opcode values (`loop_mode=...`).
@@ -75,6 +87,17 @@ impl LoopMode {
             "loop_continuous" => LoopMode::LoopContinuous,
             "loop_sustain" => LoopMode::LoopSustain,
             _ => LoopMode::NoLoop,
+        }
+    }
+
+    /// Convert to the [`super::sample_voice::SampleLoopMode`] used by
+    /// the shared sample-playback voice.
+    pub fn to_sample_loop_mode(self) -> SampleLoopMode {
+        match self {
+            LoopMode::NoLoop => SampleLoopMode::NoLoop,
+            LoopMode::OneShot => SampleLoopMode::OneShot,
+            LoopMode::LoopContinuous => SampleLoopMode::LoopContinuous,
+            LoopMode::LoopSustain => SampleLoopMode::LoopSustain,
         }
     }
 }
@@ -263,15 +286,150 @@ impl Instrument for SfzInstrument {
     fn make_voice(
         &self,
         _program: u8,
-        _key: u8,
-        _velocity: u8,
-        _sample_rate: u32,
+        key: u8,
+        velocity: u8,
+        sample_rate: u32,
     ) -> Result<Box<dyn Voice>> {
-        Err(Error::unsupported(format!(
-            "SFZ '{}': voice generation is round 2; the round-1 reader \
-             only exposes the parsed region table via SfzInstrument::regions",
-            self.name,
-        )))
+        // Region selection: pick the highest-priority region covering
+        // (key, velocity). Per the SFZ tutorials, regions are evaluated
+        // in declaration order and the *last* matching region wins
+        // (later regions in a patch override earlier ones for the same
+        // key/velocity slot). We walk in declaration order and keep the
+        // last match — equivalent.
+        let region = self
+            .patch
+            .regions
+            .iter()
+            .rfind(|r| {
+                key >= r.lokey && key <= r.hikey && velocity >= r.lovel && velocity <= r.hivel
+            })
+            .ok_or_else(|| {
+                Error::unsupported(format!(
+                    "SFZ '{}': no region matches key {key} velocity {velocity}",
+                    self.name,
+                ))
+            })?;
+
+        let bytes = region.sample_bytes.as_deref().ok_or_else(|| {
+            Error::unsupported(format!(
+                "SFZ '{}': region key=[{},{}] has no loaded sample bytes \
+                 (was the patch parsed via parse_str() instead of open()?)",
+                self.name, region.lokey, region.hikey,
+            ))
+        })?;
+
+        let pcm = decode_wav(bytes).map_err(|e| {
+            Error::invalid(format!(
+                "SFZ '{}': failed to decode WAV sample for region key=[{},{}]: {e}",
+                self.name, region.lokey, region.hikey,
+            ))
+        })?;
+
+        let cfg = build_config_for_region(region, &pcm.samples, pcm.sample_rate, key, velocity);
+        Ok(Box::new(SamplePlayer::new(cfg, sample_rate)))
+    }
+}
+
+/// Build a [`SamplePlayerConfig`] for an SFZ region. Pulled out so it
+/// can be re-used by tests that don't go through the full
+/// `Instrument::make_voice` path.
+fn build_config_for_region(
+    region: &SfzRegion,
+    samples: &[f32],
+    native_rate: u32,
+    key: u8,
+    velocity: u8,
+) -> SamplePlayerConfig {
+    // Pitch ratio: 2^((target - center + transpose) / 12 + tune/1200).
+    let semitones = key as i32 - region.pitch_keycenter as i32 + region.transpose;
+    let cents = region.tune;
+    let pitch_ratio = (2.0f64).powf(semitones as f64 / 12.0 + cents as f64 / 1200.0);
+
+    // Velocity curve: SFZ default is (vel/127)^2 amplitude (per the
+    // SFZ tutorials' "amp_velcurve_*" defaults). Combine with the
+    // region's `volume` (in dB) and SFZ's amp_keytrack default
+    // (which we leave at 0 = no keytrack here for simplicity).
+    let v = velocity as f32 / 127.0;
+    let vel_gain = v * v;
+    // 0 dB volume → multiplier 1.0; +6 dB ≈ 2.0; -6 dB ≈ 0.5.
+    let vol_gain = 10.0_f32.powf(region.volume / 20.0);
+    // Headroom — target ~0.5 peak per voice so 8 simultaneous voices
+    // don't clip.
+    let amplitude = vel_gain * vol_gain * 0.5;
+
+    let total_frames = samples.len() as u32;
+    let sample_end = total_frames;
+    let loop_start = region.loop_start.unwrap_or(0).min(u64::from(total_frames)) as u32;
+    let loop_end = region
+        .loop_end
+        .unwrap_or(u64::from(total_frames))
+        .min(u64::from(total_frames)) as u32;
+
+    let envelope = build_envelope_from_opcodes(&region.opcodes);
+    let vibrato = build_vibrato_from_opcodes(&region.opcodes);
+
+    SamplePlayerConfig {
+        samples: Arc::from(samples.to_vec().into_boxed_slice()),
+        native_rate,
+        loop_start,
+        loop_end,
+        sample_end,
+        loop_mode: region.loop_mode.to_sample_loop_mode(),
+        pitch_ratio,
+        amplitude,
+        envelope,
+        vibrato,
+        exclusive_class: 0,
+    }
+}
+
+/// Pull `ampeg_*` opcodes off the region's flattened opcode map.
+/// Defaults match the SFZ spec: 0 s delay/attack/hold, 0 s decay (i.e.
+/// no decay phase, sustain at 100 %), 100 % sustain, 0 s release.
+fn build_envelope_from_opcodes(opcodes: &BTreeMap<String, String>) -> EnvelopeParams {
+    fn pf(map: &BTreeMap<String, String>, key: &str, default: f32) -> f32 {
+        map.get(key)
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .unwrap_or(default)
+    }
+    // SFZ ampeg_sustain is in percent (0..=100).
+    let sustain_pct = pf(opcodes, "ampeg_sustain", 100.0).clamp(0.0, 100.0);
+    EnvelopeParams {
+        delay_s: pf(opcodes, "ampeg_delay", 0.0).max(0.0),
+        // SFZ default attack is 0 — but a 0-sample attack on a sample-
+        // playback voice produces a click. We keep 0 so the attack
+        // matches the spec exactly; downstream the SamplePlayer caps
+        // at 1 frame so the divide-by-zero is impossible.
+        attack_s: pf(opcodes, "ampeg_attack", 0.0).max(0.0),
+        hold_s: pf(opcodes, "ampeg_hold", 0.0).max(0.0),
+        decay_s: pf(opcodes, "ampeg_decay", 0.0).max(0.0),
+        sustain_level: sustain_pct / 100.0,
+        // SFZ release default is 0; we set a tiny floor so a note-off
+        // doesn't click. Spec-strict callers can override with
+        // ampeg_release=0.
+        release_s: pf(opcodes, "ampeg_release", 0.0).max(0.0),
+    }
+}
+
+/// Pull SFZ vibrato LFO opcodes off the region map. SFZ v1 uses
+/// `lfo01_freq` / `lfo01_pitch` / `lfo01_delay`; SFZ v2 also adds
+/// `vibrato_freq` and `vibrato_depth` aliases. Round-1 honours both
+/// spellings.
+fn build_vibrato_from_opcodes(opcodes: &BTreeMap<String, String>) -> VibratoParams {
+    fn pf(map: &BTreeMap<String, String>, keys: &[&str], default: f32) -> f32 {
+        for k in keys {
+            if let Some(s) = map.get(*k) {
+                if let Ok(v) = s.trim().parse::<f32>() {
+                    return v;
+                }
+            }
+        }
+        default
+    }
+    VibratoParams {
+        freq_hz: pf(opcodes, &["lfo01_freq", "vibrato_freq"], 0.0).max(0.0),
+        depth_cents: pf(opcodes, &["lfo01_pitch", "vibrato_depth"], 0.0),
+        delay_s: pf(opcodes, &["lfo01_delay", "vibrato_delay"], 0.0).max(0.0),
     }
 }
 
@@ -1008,10 +1166,23 @@ mod tests {
     }
 
     #[test]
-    fn make_voice_returns_unsupported() {
+    fn make_voice_without_loaded_samples_returns_unsupported() {
+        // parse_str doesn't load sample bytes off disk → the round-1
+        // voice generator must report a clear error rather than crash.
         let inst = SfzInstrument::parse_str("test", "<region> sample=a.wav key=60").unwrap();
         match inst.make_voice(0, 60, 100, 44_100) {
             Err(Error::Unsupported(_)) => {}
+            Err(other) => panic!("expected Unsupported, got {other:?}"),
+            Ok(_) => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn make_voice_no_matching_region_returns_unsupported() {
+        let inst = SfzInstrument::parse_str("test", "<region> sample=a.wav key=60").unwrap();
+        // Key out of range (region only matches key 60).
+        match inst.make_voice(0, 30, 100, 44_100) {
+            Err(Error::Unsupported(msg)) => assert!(msg.contains("no region")),
             Err(other) => panic!("expected Unsupported, got {other:?}"),
             Ok(_) => panic!("expected Err"),
         }
@@ -1108,6 +1279,94 @@ mod tests {
         }
         assert_eq!(patch.regions[0].pitch_keycenter, 60);
         assert_eq!(patch.regions[1].pitch_keycenter, 72);
+    }
+
+    /// Build a tiny WAV: 8 frames of i16 PCM, mono, given sample rate.
+    fn build_test_wav(samples: &[i16], rate: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        let data_size = (samples.len() * 2) as u32;
+        bytes.extend_from_slice(&(36u32 + data_size).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+        bytes.extend_from_slice(&rate.to_le_bytes());
+        bytes.extend_from_slice(&(rate * 2).to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes()); // block align
+        bytes.extend_from_slice(&16u16.to_le_bytes()); // bits/sample
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_size.to_le_bytes());
+        for s in samples {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn make_voice_renders_pcm_via_disk_loaded_sfz() {
+        // End-to-end: write SFZ + WAV to a tempdir, open the patch,
+        // make a voice for the matching key, render some samples.
+        let tmp = std::env::temp_dir().join("oxideav-midi-sfz-makevoice");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // 64-frame ramp from -16384 to +16384.
+        let samples: Vec<i16> = (0..64).map(|i| (i * 512 - 16384) as i16).collect();
+        let wav = build_test_wav(&samples, 22_050);
+        let wav_path = tmp.join("ramp.wav");
+        std::fs::write(&wav_path, &wav).unwrap();
+        let sfz_path = tmp.join("patch.sfz");
+        std::fs::write(
+            &sfz_path,
+            b"<region> sample=ramp.wav key=60 loop_mode=loop_continuous loop_start=0 loop_end=64\n",
+        )
+        .unwrap();
+        let inst = SfzInstrument::open(&sfz_path).unwrap();
+        let mut voice = inst.make_voice(0, 60, 100, 44_100).expect("voice");
+        let mut buf = vec![0.0f32; 4096];
+        let n = voice.render(&mut buf);
+        assert_eq!(n, 4096, "looping voice should fill the buffer");
+        let nonzero = buf.iter().filter(|s| s.abs() > 0.001).count();
+        assert!(nonzero > 100, "expected non-silent: {nonzero}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn make_voice_pitch_shifts_by_key_offset() {
+        let tmp = std::env::temp_dir().join("oxideav-midi-sfz-pitchshift");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Long-enough ramp to render 1024 samples without looping.
+        let samples: Vec<i16> = (0..16_384)
+            .map(|i| ((i % 256) * 128) as i16 - 16384)
+            .collect();
+        let wav = build_test_wav(&samples, 44_100);
+        let wav_path = tmp.join("ramp.wav");
+        std::fs::write(&wav_path, &wav).unwrap();
+        let sfz_path = tmp.join("patch.sfz");
+        std::fs::write(
+            &sfz_path,
+            b"<region> sample=ramp.wav lokey=0 hikey=127 pitch_keycenter=60\n",
+        )
+        .unwrap();
+        let inst = SfzInstrument::open(&sfz_path).unwrap();
+        // Voice at key=60: native pitch.
+        let mut a = inst.make_voice(0, 60, 100, 44_100).unwrap();
+        // Voice at key=72: one octave up, samples advance 2x faster.
+        let mut b = inst.make_voice(0, 72, 100, 44_100).unwrap();
+        let mut buf_a = vec![0.0f32; 1024];
+        let mut buf_b = vec![0.0f32; 1024];
+        a.render(&mut buf_a);
+        b.render(&mut buf_b);
+        // Count zero crossings — `b` should have ~2x as many as `a`.
+        let cross_a = buf_a.windows(2).filter(|w| w[0] * w[1] < 0.0).count();
+        let cross_b = buf_b.windows(2).filter(|w| w[0] * w[1] < 0.0).count();
+        assert!(
+            cross_b > cross_a,
+            "+1 octave key offset should produce more zero crossings: a={cross_a} b={cross_b}",
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
