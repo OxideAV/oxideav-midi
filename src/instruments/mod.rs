@@ -10,9 +10,17 @@
 //!   instrument → zone → sample chain, and renders 16-bit PCM at the
 //!   requested pitch via linear interpolation. (Modulators, sm24,
 //!   stereo linking, and full envelopes/filters are pending.)
-//! - [`sfz`] and [`dls`] are still magic-byte detector stubs;
-//!   `make_voice` returns `Error::Unsupported` for both. Loaders are
-//!   round-3.
+//! - [`sfz`] is a working text patch reader: it strips comments, walks
+//!   `<control>` / `<global>` / `<master>` / `<group>` / `<region>`
+//!   sections, flattens inheritance into one fully-resolved opcode map
+//!   per region, and (when constructed via
+//!   [`sfz::SfzInstrument::open`]) reads every referenced sample off
+//!   disk. `make_voice` is round-2 — it returns `Error::Unsupported`
+//!   today; the parsed [`sfz::SfzInstrument::regions`] table is the
+//!   public surface round-1 surfaces.
+//! - [`dls`] is still a magic-byte detector stub; `make_voice` returns
+//!   `Error::Unsupported`. Loader work is blocked on the DLS Level 1/2
+//!   specification landing in `docs/audio/midi/instrument-formats/`.
 //! - [`tone::ToneInstrument`] is the canary: if no SoundFont is
 //!   available, the synth still produces *something*.
 

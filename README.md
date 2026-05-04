@@ -42,10 +42,22 @@ framework but usable standalone.
   against the loaded data; total samples capped at 256 Mi frames,
   total pdta records capped at 16 Mi, so malformed files cannot
   allocate beyond the spec ceiling.
-- `instruments::sfz` / `instruments::dls` — magic-byte detector stubs;
-  `make_voice` returns `Error::Unsupported`. Loader work is blocked on
-  the SFZ specification + the DLS Level 1/2 specification landing in
-  `docs/audio/midi/extensions/`.
+- `instruments::sfz` — text patch reader. Tokenises SFZ syntax (line
+  + block comments, headers, opcode `name=value` pairs with
+  space-bearing values), walks `<control>` / `<global>` / `<master>` /
+  `<group>` / `<region>` sections, flattens inheritance into one
+  fully-resolved opcode map per region, and (via `SfzInstrument::open`)
+  reads every referenced sample off disk against the SFZ file's
+  directory + the active `default_path`. Strongly-typed fields:
+  `lokey` / `hikey` / `lovel` / `hivel`, `pitch_keycenter`, `key`
+  (sets all three), `loop_start` / `loop_end` / `loop_mode`, `tune` /
+  `transpose`, `volume`, `pan`, `trigger`. Note names (`C4`, `c#4`,
+  `Db5`) parse alongside decimal MIDI keys. Unknown opcodes survive
+  in `region.opcodes` for round-2 voice generation. `#include` is
+  rejected with `Error::Unsupported`; `#define` is preserved verbatim.
+- `instruments::dls` — magic-byte detector stub; `make_voice` returns
+  `Error::Unsupported`. Loader work is blocked on the DLS Level 1/2
+  specification landing in `docs/audio/midi/instrument-formats/`.
 - `instruments::tone` — pure-tone fallback (sine / triangle / saw /
   square) so the synth produces *something* even with no on-disk
   bank.
@@ -72,9 +84,11 @@ and the voice pool have run dry. Without an on-disk bank the
 registry-built decoder uses the pure-tone fallback; for SoundFont 2
 playback build a `MidiDecoder` directly with an `Sf2Instrument`.
 
-Coverage today (round 6): full SF2 voice with sm24 24-bit samples,
+Coverage today (round 7): full SF2 voice with sm24 24-bit samples,
 stereo zones, DAHDSR volume + modulation envelopes, low-pass biquad
 filter (gens 8/9), modEnv→pitch / modEnv→filter routing (gens 7/11),
 exclusive-class drum cuts (gen 57), pitch bend with RPN 0 range,
-channel/poly aftertouch. SFZ + DLS readers blocked on their
-respective specifications landing in `docs/audio/midi/extensions/`.
+channel/poly aftertouch; **SFZ text patch parser** (load + dump
+regions, sample-bytes loaded from disk against `default_path`). DLS
+reader still blocked on the DLS Level 1/2 specification landing in
+`docs/audio/midi/instrument-formats/`.

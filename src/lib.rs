@@ -21,9 +21,17 @@
 //!       envelopes, the initial low-pass biquad filter, mod-env →
 //!       pitch / filter routing, exclusive-class drum cuts, and
 //!       native stereo zones.
-//!     * **[`instruments::sfz`]** / **[`instruments::dls`]** —
-//!       magic-byte detector stubs; `make_voice` returns
-//!       [`Error::Unsupported`]. Loaders are round-4.
+//!     * **[`instruments::sfz`]** — text patch reader. Strips
+//!       comments, walks `<control>` / `<global>` / `<master>` /
+//!       `<group>` / `<region>` sections, flattens inheritance into
+//!       one fully-resolved opcode map per region, and (via
+//!       [`SfzInstrument::open`](instruments::sfz::SfzInstrument::open))
+//!       reads every referenced sample off disk. Voice generation is
+//!       still pending — `make_voice` returns [`Error::Unsupported`].
+//!     * **[`instruments::dls`]** — magic-byte detector stub;
+//!       `make_voice` returns [`Error::Unsupported`]. Loader is
+//!       blocked on the DLS Level 1/2 specification landing in
+//!       `docs/audio/midi/instrument-formats/`.
 //!     * **[`instruments::tone`]** — sine/triangle/saw/square
 //!       fallback so the synth produces *something* even when no
 //!       on-disk bank is present.
