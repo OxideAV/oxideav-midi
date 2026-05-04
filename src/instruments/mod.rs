@@ -18,9 +18,14 @@
 //!   disk. `make_voice` is round-2 — it returns `Error::Unsupported`
 //!   today; the parsed [`sfz::SfzInstrument::regions`] table is the
 //!   public surface round-1 surfaces.
-//! - [`dls`] is still a magic-byte detector stub; `make_voice` returns
-//!   `Error::Unsupported`. Loader work is blocked on the DLS Level 1/2
-//!   specification landing in `docs/audio/midi/instrument-formats/`.
+//! - [`dls`] is a working DLS Level 1 + Level 2 RIFF reader: it walks
+//!   the `DLS ` form, pulls the `colh` / `vers` / `ptbl` / `lins` /
+//!   `wvpl` chunks apart, and surfaces a fully-resolved bank
+//!   ([`dls::DlsBank`]) of instruments → regions → wave-pool samples
+//!   with their `wsmp` loop info, `wlnk` cue-table references, and
+//!   `art1` / `art2` connection blocks. `make_voice` is round 2 — it
+//!   still returns `Error::Unsupported`; the parsed bank is the
+//!   public surface round 1 surfaces.
 //! - [`tone::ToneInstrument`] is the canary: if no SoundFont is
 //!   available, the synth still produces *something*.
 

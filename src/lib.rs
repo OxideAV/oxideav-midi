@@ -28,10 +28,16 @@
 //!       [`SfzInstrument::open`](instruments::sfz::SfzInstrument::open))
 //!       reads every referenced sample off disk. Voice generation is
 //!       still pending — `make_voice` returns [`Error::Unsupported`].
-//!     * **[`instruments::dls`]** — magic-byte detector stub;
-//!       `make_voice` returns [`Error::Unsupported`]. Loader is
-//!       blocked on the DLS Level 1/2 specification landing in
-//!       `docs/audio/midi/instrument-formats/`.
+//!     * **[`instruments::dls`]** — DLS (Downloadable Sounds)
+//!       Level 1 + Level 2 RIFF reader. Walks the `DLS ` form,
+//!       parses the `colh` / `vers` / `ptbl` pool table /
+//!       `lins-list` instrument table / `wvpl-list` wave pool, and
+//!       surfaces a fully-cross-resolved
+//!       [`DlsBank`](instruments::dls::DlsBank) of instruments →
+//!       regions → wave-pool samples with their `wsmp` loops, `wlnk`
+//!       cue references, and `art1` / `art2` articulation
+//!       connection blocks. `make_voice` is round 2 — it returns
+//!       [`Error::Unsupported`].
 //!     * **[`instruments::tone`]** — sine/triangle/saw/square
 //!       fallback so the synth produces *something* even when no
 //!       on-disk bank is present.

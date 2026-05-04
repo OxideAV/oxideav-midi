@@ -1,10 +1,12 @@
-//! Round-7 smoke: load an SFZ patch, dump regions; load an SF2 bank,
-//! dump preset list. Exercises the public API surface that round-2
-//! voice generation will build on.
+//! Round-8 smoke: load an SFZ patch, dump regions; load an SF2 bank,
+//! dump preset list; load a DLS bank, dump instrument + region table.
+//! Exercises the public API surface that round-2 voice generation
+//! will build on.
 
 use std::path::Path;
 
 use oxideav_midi::instruments::{
+    dls::{DlsArtKind, DlsInstrument},
     sf2::Sf2Instrument,
     sfz::{LoopMode, SfzInstrument},
 };
@@ -251,4 +253,208 @@ fn shdr_record(
     r[42..44].copy_from_slice(&sample_link.to_le_bytes());
     r[44..46].copy_from_slice(&sample_type.to_le_bytes());
     r
+}
+
+// ----- DLS smoke: dump instrument + region table -----
+
+#[test]
+fn dls_dump_instrument_and_region_table() {
+    // Hand-built minimal DLS Level 1 file: 1 instrument (bank 0,
+    // program 5), 2 regions splitting the keyboard at C4, 1 wave-pool
+    // sample shared across both regions, plus an instrument-level
+    // articulation block. Exercises the parser end-to-end and
+    // demonstrates the public API a round-2 voice generator will
+    // consume.
+    let blob = build_two_region_dls();
+    let inst = DlsInstrument::parse_bytes("smoke.dls", &blob).expect("parse DLS");
+    let bank = inst.bank();
+
+    // Top-level metadata + pool table.
+    assert_eq!(bank.declared_instrument_count, 1);
+    assert_eq!(bank.version.map(|v| (v.0, v.1)), Some((1, 1)));
+    assert_eq!(bank.info.name.as_deref(), Some("SmokeBank"));
+    assert_eq!(bank.wave_pool_offsets.len(), 1);
+
+    // Wave pool: one 8-bit mono sample @ 22050 Hz.
+    assert_eq!(bank.waves.len(), 1);
+    assert_eq!(bank.waves[0].channels, 1);
+    assert_eq!(bank.waves[0].sample_rate, 22_050);
+    assert_eq!(bank.waves[0].bits_per_sample, 8);
+
+    // Instruments: one melodic instrument carrying two regions.
+    assert_eq!(bank.instruments.len(), 1);
+    let i0 = &bank.instruments[0];
+    assert!(!i0.is_drum());
+    assert_eq!(i0.program_number(), 5);
+    assert_eq!(i0.regions.len(), 2);
+    assert_eq!(i0.declared_region_count, 2);
+    assert_eq!(i0.articulation.len(), 1);
+    assert_eq!(i0.articulation[0].kind, DlsArtKind::Art1);
+
+    // Region 0: lower half (0..=59), Region 1: upper half (60..=127).
+    assert_eq!(i0.regions[0].key_lo, 0);
+    assert_eq!(i0.regions[0].key_hi, 59);
+    assert_eq!(i0.regions[1].key_lo, 60);
+    assert_eq!(i0.regions[1].key_hi, 127);
+    // Both regions point at wave-pool entry 0.
+    assert_eq!(i0.regions[0].wlnk.unwrap().table_index, 0);
+    assert_eq!(i0.regions[1].wlnk.unwrap().table_index, 0);
+
+    // Dump (the round-2 voice generator will iterate this list).
+    let dump: Vec<String> = i0
+        .regions
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            format!(
+                "region {}: key=[{}, {}] vel=[{}, {}] wlnk_idx={:?} arts={}",
+                i,
+                r.key_lo,
+                r.key_hi,
+                r.vel_lo,
+                r.vel_hi,
+                r.wlnk.map(|w| w.table_index),
+                r.articulation.len(),
+            )
+        })
+        .collect();
+    assert_eq!(dump.len(), 2);
+    assert!(dump[0].contains("[0, 59]"));
+    assert!(dump[1].contains("[60, 127]"));
+}
+
+fn build_two_region_dls() -> Vec<u8> {
+    // 8 frames of 8-bit unsigned PCM (silence + ramp).
+    let pcm = vec![0x80u8, 0x90, 0xA0, 0xB0, 0xC0, 0xB0, 0xA0, 0x80];
+
+    let mut fmt = Vec::new();
+    fmt.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    fmt.extend_from_slice(&1u16.to_le_bytes()); // mono
+    fmt.extend_from_slice(&22_050u32.to_le_bytes());
+    fmt.extend_from_slice(&22_050u32.to_le_bytes());
+    fmt.extend_from_slice(&1u16.to_le_bytes()); // block align
+    fmt.extend_from_slice(&8u16.to_le_bytes()); // bits/sample
+
+    let mut wave_body = Vec::from(b"wave" as &[u8]);
+    push_riff_chunk(&mut wave_body, b"fmt ", &fmt);
+    push_riff_chunk(&mut wave_body, b"data", &pcm);
+
+    let mut wvpl_body = Vec::from(b"wvpl" as &[u8]);
+    push_riff_chunk(&mut wvpl_body, b"LIST", &wave_body);
+
+    // ptbl: one cue at offset 0.
+    let mut ptbl = Vec::new();
+    ptbl.extend_from_slice(&8u32.to_le_bytes());
+    ptbl.extend_from_slice(&1u32.to_le_bytes());
+    ptbl.extend_from_slice(&0u32.to_le_bytes());
+
+    let mut colh = Vec::new();
+    colh.extend_from_slice(&1u32.to_le_bytes());
+
+    let mut vers = Vec::new();
+    vers.extend_from_slice(&((1u32 << 16) | 1u32).to_le_bytes());
+    vers.extend_from_slice(&0u32.to_le_bytes());
+
+    let mut info_body = Vec::from(b"INFO" as &[u8]);
+    push_riff_chunk(&mut info_body, b"INAM", b"SmokeBank\0");
+
+    // Instrument body: insh + lrgn (2 regions) + lart (1 connection).
+    let mut insh = Vec::new();
+    insh.extend_from_slice(&2u32.to_le_bytes()); // cRegions
+    insh.extend_from_slice(&0u32.to_le_bytes()); // ulBank
+    insh.extend_from_slice(&5u32.to_le_bytes()); // ulInstrument = 5
+
+    // Region 0: keys 0..=59.
+    let mut rgnh0 = Vec::new();
+    rgnh0.extend_from_slice(&0u16.to_le_bytes());
+    rgnh0.extend_from_slice(&59u16.to_le_bytes());
+    rgnh0.extend_from_slice(&0u16.to_le_bytes());
+    rgnh0.extend_from_slice(&127u16.to_le_bytes());
+    rgnh0.extend_from_slice(&0u16.to_le_bytes());
+    rgnh0.extend_from_slice(&0u16.to_le_bytes());
+
+    let mut wlnk0 = Vec::new();
+    wlnk0.extend_from_slice(&0u16.to_le_bytes());
+    wlnk0.extend_from_slice(&0u16.to_le_bytes());
+    wlnk0.extend_from_slice(&1u32.to_le_bytes());
+    wlnk0.extend_from_slice(&0u32.to_le_bytes());
+
+    let mut wsmp0 = Vec::new();
+    wsmp0.extend_from_slice(&20u32.to_le_bytes());
+    wsmp0.extend_from_slice(&60u16.to_le_bytes());
+    wsmp0.extend_from_slice(&0i16.to_le_bytes());
+    wsmp0.extend_from_slice(&0i32.to_le_bytes());
+    wsmp0.extend_from_slice(&0u32.to_le_bytes());
+    wsmp0.extend_from_slice(&0u32.to_le_bytes());
+
+    let mut rgn0_body = Vec::from(b"rgn " as &[u8]);
+    push_riff_chunk(&mut rgn0_body, b"rgnh", &rgnh0);
+    push_riff_chunk(&mut rgn0_body, b"wsmp", &wsmp0);
+    push_riff_chunk(&mut rgn0_body, b"wlnk", &wlnk0);
+
+    // Region 1: keys 60..=127.
+    let mut rgnh1 = Vec::new();
+    rgnh1.extend_from_slice(&60u16.to_le_bytes());
+    rgnh1.extend_from_slice(&127u16.to_le_bytes());
+    rgnh1.extend_from_slice(&0u16.to_le_bytes());
+    rgnh1.extend_from_slice(&127u16.to_le_bytes());
+    rgnh1.extend_from_slice(&0u16.to_le_bytes());
+    rgnh1.extend_from_slice(&0u16.to_le_bytes());
+
+    let mut wlnk1 = Vec::new();
+    wlnk1.extend_from_slice(&0u16.to_le_bytes());
+    wlnk1.extend_from_slice(&0u16.to_le_bytes());
+    wlnk1.extend_from_slice(&1u32.to_le_bytes());
+    wlnk1.extend_from_slice(&0u32.to_le_bytes());
+
+    let mut rgn1_body = Vec::from(b"rgn " as &[u8]);
+    push_riff_chunk(&mut rgn1_body, b"rgnh", &rgnh1);
+    push_riff_chunk(&mut rgn1_body, b"wlnk", &wlnk1);
+
+    let mut lrgn_body = Vec::from(b"lrgn" as &[u8]);
+    push_riff_chunk(&mut lrgn_body, b"LIST", &rgn0_body);
+    push_riff_chunk(&mut lrgn_body, b"LIST", &rgn1_body);
+
+    // art1 (instrument-level): EG1 → attenuation, scale 0.
+    let mut art1 = Vec::new();
+    art1.extend_from_slice(&8u32.to_le_bytes()); // cbSize
+    art1.extend_from_slice(&1u32.to_le_bytes()); // 1 connection
+    art1.extend_from_slice(&0x0004u16.to_le_bytes()); // CONN_SRC_EG1
+    art1.extend_from_slice(&0x0000u16.to_le_bytes()); // CONN_SRC_NONE
+    art1.extend_from_slice(&0x0001u16.to_le_bytes()); // CONN_DST_ATTENUATION (DLS1)
+    art1.extend_from_slice(&0x0000u16.to_le_bytes());
+    art1.extend_from_slice(&0i32.to_le_bytes());
+
+    let mut lart_body = Vec::from(b"lart" as &[u8]);
+    push_riff_chunk(&mut lart_body, b"art1", &art1);
+
+    let mut ins_body = Vec::from(b"ins " as &[u8]);
+    push_riff_chunk(&mut ins_body, b"insh", &insh);
+    push_riff_chunk(&mut ins_body, b"LIST", &lrgn_body);
+    push_riff_chunk(&mut ins_body, b"LIST", &lart_body);
+
+    let mut lins_body = Vec::from(b"lins" as &[u8]);
+    push_riff_chunk(&mut lins_body, b"LIST", &ins_body);
+
+    let mut body = Vec::from(b"DLS " as &[u8]);
+    push_riff_chunk(&mut body, b"vers", &vers);
+    push_riff_chunk(&mut body, b"colh", &colh);
+    push_riff_chunk(&mut body, b"LIST", &lins_body);
+    push_riff_chunk(&mut body, b"ptbl", &ptbl);
+    push_riff_chunk(&mut body, b"LIST", &wvpl_body);
+    push_riff_chunk(&mut body, b"LIST", &info_body);
+
+    let mut out = Vec::from(b"RIFF" as &[u8]);
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+fn push_riff_chunk(out: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
+    out.extend_from_slice(tag);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    if payload.len() % 2 == 1 {
+        out.push(0);
+    }
 }

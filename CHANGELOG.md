@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 8 — DLS Level 1 + 2 sample-loader (task #409)
+
+- **DLS RIFF parser**: walks the `RIFF`/`DLS ` form and pulls the
+  `colh` collection header, optional `vers` version stamp, `ptbl`
+  pool table, `lins` instrument list, `wvpl` wave pool, and
+  top-level `INFO` metadata into a fully-resolved
+  [`DlsBank`](src/instruments/dls.rs). Instruments → regions →
+  wave-pool samples are cross-referenced; nothing references back
+  into the source bytes.
+- **Wave pool**: every `wave-list` entry is parsed for its standard
+  WAV `fmt ` + `data` chunks plus the optional `wsmp` per-wave loop
+  / pitch / gain header. Sample bytes are kept in their on-disk
+  form (8-bit unsigned or 16-bit LE signed); decode is round-2.
+- **Instrument table**: each `ins ` LIST surfaces its bank/program
+  (decoded into `bank_msb` / `bank_lsb` / `program_number` and the
+  `is_drum()` bit-31 helper), instrument name from a per-instrument
+  `INFO/INAM`, and an instrument-level articulation list parsed
+  from `lart` (DLS1) or `lar2` (DLS2) sub-LISTs.
+- **Regions**: `rgnh` (key + velocity range, fusOptions, key group,
+  optional DLS2 `usLayer`), `wsmp` (per-region overrides), `wlnk`
+  (cue-table reference), and per-region articulation. DLS2 `rgn2`
+  LISTs parse alongside DLS1 `rgn ` and are flagged via
+  `DlsRegion::is_level2`.
+- **Articulation**: `art1-ck` and `art2-ck` connection blocks
+  (12-byte records: source / control / destination / transform /
+  scale) parse into `Vec<DlsArticulationBlock>` tagged with
+  `DlsArtKind::{Art1, Art2}` so the round-2 voice generator picks
+  the right enum table (DLS1 spec page 43 / DLS2 spec tables 8-10).
+  Connection enums are stored as raw `u16`s — no interpretation in
+  round 1.
+- **Magic-byte stub becomes real probe + parser**: `is_dls()` and
+  the new `DlsInstrument::probe()` honour the `RIFF`/`DLS ` magic;
+  `DlsInstrument::open()` and `parse_bytes()` plumb through to the
+  full bank parser. `make_voice()` still returns
+  `Error::Unsupported` (round-2 work, same shape as the SFZ
+  followup).
+- **Bounds + caps**: every chunk length is checked against bytes
+  remaining; pool-table, articulation, and wave-pool counts are
+  capped at `MAX_RECORDS` (1 Mi); cumulative wave-data bytes capped
+  at `MAX_WAVE_BYTES` (256 MiB).
+- **Tests added**: 13 lib-side (magic detection, minimal-DLS
+  parse + wave pool + instrument + region + articulation, DLS2
+  rgnh-with-usLayer, art2 block, wsmp loop record, error paths
+  for non-DLS / truncated outer / non-DLS path, drum-bit decode,
+  open round-trip through disk) + 1 integration smoke
+  (`tests/sfz_sf2_dls_smoke.rs`) building a 2-region DLS in
+  memory and dumping the instrument + region table. Total: 143
+  lib + 3 integration = 146 passing (was 130 + 2 = 132).
+- **Smoke test renamed** from `tests/sfz_sf2_smoke.rs` to
+  `tests/sfz_sf2_dls_smoke.rs` to reflect the wider coverage.
+
 ### Round 7 — SFZ text patch reader (task #127)
 
 - **SFZ parser**: tokenises SFZ syntax (line `// ...` + block
