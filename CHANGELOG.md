@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/OxideAV/oxideav-midi/compare/v0.0.0...v0.0.1) - 2026-05-04
+
+### Other
+
+- SFZ + DLS voice generators (task #410)
+- DLS Level 1 + 2 RIFF reader (parse + dump bank)
+- SFZ text patch reader (load + dump regions)
+
 ### Round 9 — SFZ + DLS voice generators (task #410)
 
 - **Shared sample-playback voice** (`instruments::sample_voice`). Mono
