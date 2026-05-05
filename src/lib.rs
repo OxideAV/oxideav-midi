@@ -494,7 +494,7 @@ mod tests {
         let mut reg = CodecRegistry::new();
         register_codecs(&mut reg);
         let params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
-        let mut dec = reg.make_decoder(&params).unwrap();
+        let mut dec = reg.first_decoder(&params).unwrap();
         let pkt = Packet::new(0, TimeBase::new(1, 44_100), b"not midi".to_vec());
         let err = dec.send_packet(&pkt).unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)));
@@ -505,7 +505,7 @@ mod tests {
         let mut reg = CodecRegistry::new();
         register_codecs(&mut reg);
         let params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
-        let mut dec = reg.make_decoder(&params).unwrap();
+        let mut dec = reg.first_decoder(&params).unwrap();
         let pkt = Packet::new(0, TimeBase::new(1, 44_100), minimal_smf());
         dec.send_packet(&pkt).unwrap();
         // The empty-file SMF (one EOT, nothing else) drains immediately.
