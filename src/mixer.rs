@@ -107,7 +107,8 @@ pub struct ChannelState {
     pub pitch_bend: u16,
     /// Pitch-bend range in cents (default 200 = ±2 semitones per GM
     /// recommended practice). Updated via RPN 0 (CC 100/101 = 0/0,
-    /// CC 6 = MSB semitones, CC 38 = LSB cents).
+    /// CC 6 = MSB semitones, CC 38 = LSB cents). MPE Receivers default
+    /// this to 4800 (±48 semitones) on Member Channels at MCM time.
     pub pitch_bend_range_cents: u16,
     /// Channel pressure (mono aftertouch) as the raw `0..=127` scalar.
     /// Default 0 = no pressure modulation.
@@ -117,6 +118,34 @@ pub struct ChannelState {
     /// CC-6 / CC-38 writes. We default to null so a CC 6 with no prior
     /// RPN selection doesn't accidentally clobber the bend range.
     pub rpn: u16,
+    /// CC 1 (Modulation Wheel), 0..=127. Default 0. Routes through the
+    /// channel's [`Self::mod_depth_range_cents`] before being passed to
+    /// the voice as a pitch-mod depth.
+    pub mod_wheel: u8,
+    /// RPN 5 — Modulation Depth Range, in cents. Per CA-26 the default
+    /// is implementation-defined; GM2 prescribes 50 cents and we follow
+    /// suit. `mod_wheel` scaled into `[0, mod_depth_range_cents]` cents
+    /// is delivered to held voices via [`Voice::set_mod_depth_cents`].
+    pub mod_depth_range_cents: u16,
+    /// RPN 1 — Channel Fine Tuning, in cents. 14-bit RPN value maps
+    /// linearly to ±100 cents (centre is data-entry 0x40/0x00). Summed
+    /// per spec with master fine tuning into the effective pitch
+    /// offset.
+    pub channel_fine_tune_cents: i16,
+    /// Raw 14-bit accumulator for the RPN-1 data-entry pair, kept on
+    /// the channel state so a CC 6 / CC 38 sequence composes
+    /// bit-exact (MSB sets the top 7 bits, LSB sets the bottom 7).
+    /// Not normally read directly — callers should look at
+    /// [`Self::channel_fine_tune_cents`].
+    pub channel_fine_tune_raw_14: u16,
+    /// RPN 2 — Channel Coarse Tuning, in semitones (-64..=+63). CC 6
+    /// data-entry MSB sets it directly; CC 38 LSB is ignored per spec
+    /// ("the LSB is always 0"). Summed with master coarse tuning.
+    pub channel_coarse_tune_semitones: i16,
+    /// MPE role of this channel. `Manager` and `Member` channels behave
+    /// differently for routing of per-note vs. zone-wide CCs / Pitch
+    /// Bend / Channel Pressure. `None` outside any active MPE zone.
+    pub mpe_role: MpeRole,
 }
 
 impl Default for ChannelState {
@@ -130,6 +159,121 @@ impl Default for ChannelState {
             pitch_bend_range_cents: 200,
             channel_pressure: 0,
             rpn: 0x3FFF,
+            mod_wheel: 0,
+            mod_depth_range_cents: 50,
+            channel_fine_tune_cents: 0,
+            channel_fine_tune_raw_14: 0x2000,
+            channel_coarse_tune_semitones: 0,
+            mpe_role: MpeRole::None,
+        }
+    }
+}
+
+impl ChannelState {
+    /// MPE-aware "does a CC/PB/pressure on `event_channel` reach the
+    /// voice held on `slot_channel`?" — the test compiled into
+    /// `reapply_mod_wheel_for_channel` / `set_timbre`. Returns `true`
+    /// when:
+    ///   * The event channel is the slot channel (always — channel
+    ///     CCs are channel-scoped by default).
+    ///   * Or `event_role` is an MPE Manager and the slot's channel
+    ///     belongs to the same zone (Member or Manager).
+    ///
+    /// The `event_role` is the **event-sending channel's** role,
+    /// since the dispatch site already has it in hand.
+    pub fn matches_for_zone_broadcast(
+        &self,
+        slot_channel: u8,
+        event_channel: u8,
+        event_role: &MpeRole,
+    ) -> bool {
+        if slot_channel == event_channel {
+            return true;
+        }
+        match event_role {
+            MpeRole::Manager(kind) => {
+                matches!((self.mpe_role, kind), (MpeRole::Member(k), z) if k == *z)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A channel's role inside an MPE zone. Per M1-100-UM §2.3 + Appendix E,
+/// the Manager Channel carries zone-wide messages (Damper, Program
+/// Change, etc.) while Member Channels host per-note expression
+/// (Pitch Bend, Channel Pressure, CC #74) that combines with the
+/// Manager's value before reaching the voice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MpeRole {
+    /// Not in an MPE zone. Channel-voice messages route normally.
+    None,
+    /// Manager Channel for an MPE zone — its pitch bend / pressure /
+    /// CC74 broadcast to every sounding note across the whole zone
+    /// (combined per Appendix C with the per-note Member Channel
+    /// value).
+    Manager(MpeZoneKind),
+    /// Member Channel — pitch bend / pressure / CC74 only affect notes
+    /// sounding on this very channel. Per Appendix D & §A.4, control
+    /// values are *tracked* even when no note is sounding, so a future
+    /// Note On picks them up.
+    Member(MpeZoneKind),
+}
+
+impl MpeRole {
+    /// `true` for both `Manager` and `Member`.
+    pub fn is_mpe(self) -> bool {
+        !matches!(self, MpeRole::None)
+    }
+
+    /// `true` only for `Manager(_)`.
+    pub fn is_manager(self) -> bool {
+        matches!(self, MpeRole::Manager(_))
+    }
+}
+
+/// Which MPE zone a channel belongs to. Lower zone uses Manager
+/// Channel 1 + Member Channels rising from 2; Upper zone uses Manager
+/// Channel 16 + Members descending from 15.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MpeZoneKind {
+    /// Lower zone — Manager = channel 0 (MIDI 1).
+    Lower,
+    /// Upper zone — Manager = channel 15 (MIDI 16).
+    Upper,
+}
+
+/// An MPE zone configuration: which channels are Manager + Members and
+/// what their Pitch Bend Sensitivities are. Built by the mixer in
+/// response to the MPE Configuration Message (MCM, RPN 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MpeZone {
+    /// `Lower` or `Upper`.
+    pub kind: MpeZoneKind,
+    /// Number of Member Channels in this zone (`1..=15`). `0` would
+    /// deactivate the zone, so the value is only meaningful for active
+    /// zones.
+    pub members: u8,
+}
+
+impl MpeZone {
+    /// Channel index (0..=15) of this zone's Manager Channel.
+    pub fn manager_channel(self) -> u8 {
+        match self.kind {
+            MpeZoneKind::Lower => 0,
+            MpeZoneKind::Upper => 15,
+        }
+    }
+
+    /// Iterator over Member Channel indices (0..=15) in this zone.
+    /// Lower zone: 1..=members. Upper zone: 15-members..=14. Returns
+    /// an empty range for zero-member zones (which shouldn't exist
+    /// since `set_mpe_zone` interprets that as "deactivate").
+    pub fn member_channels(self) -> Vec<u8> {
+        let n = self.members.min(15);
+        match self.kind {
+            MpeZoneKind::Lower => (1..=n).collect(),
+            MpeZoneKind::Upper => (15 - n..=14).collect(),
         }
     }
 }
@@ -147,6 +291,22 @@ pub struct Mixer {
     /// voices in the worst case still stays under unity if we apply a
     /// modest mix bus gain. Round-4 may swap in a smarter limiter.
     mix_gain: f32,
+    /// Master Volume (Universal Real Time SysEx `7F 7F 04 01`, 14-bit
+    /// 0..=0x3FFF). Default = 0x3FFF (= unity). Applied at mix time as
+    /// an additional global gain factor on every voice.
+    master_volume_14: u16,
+    /// Master Fine Tuning (CA-25), in signed cents within ±100.
+    /// Default 0. Summed with per-channel fine tune + pitch bend.
+    master_fine_tune_cents: i16,
+    /// Master Coarse Tuning (CA-25), in semitones within `-64..=+63`.
+    /// Default 0. Summed with per-channel coarse tune.
+    master_coarse_tune_semitones: i16,
+    /// Active MPE Lower Zone, if any. Created by an MCM with `n=0` /
+    /// `mm>=1`; cleared by an MCM with `mm=0`.
+    mpe_lower: Option<MpeZone>,
+    /// Active MPE Upper Zone, if any. Created by an MCM with `n=15`
+    /// (= 0xF) / `mm>=1`; cleared by an MCM with `mm=0`.
+    mpe_upper: Option<MpeZone>,
 }
 
 impl Default for Mixer {
@@ -166,6 +326,11 @@ impl Mixer {
             channels: [ChannelState::default(); NUM_CHANNELS],
             next_age: 1,
             mix_gain: 0.5,
+            master_volume_14: 0x3FFF,
+            master_fine_tune_cents: 0,
+            master_coarse_tune_semitones: 0,
+            mpe_lower: None,
+            mpe_upper: None,
         }
     }
 
@@ -184,40 +349,192 @@ impl Mixer {
     /// in `0..=16383` (centre = `0x2000`); the conversion to cents
     /// uses the channel's current `pitch_bend_range_cents` (default
     /// 200 = ±2 semitones, the GM recommended range — overridden via
-    /// RPN 0). Every still-held voice on `channel` is updated at once.
+    /// RPN 0).
+    ///
+    /// The cents value pushed to the voice is the **sum** of:
+    ///   * `pitch_bend_to_cents(value, channel.pitch_bend_range_cents)`,
+    ///   * `channel.channel_fine_tune_cents` (RPN 1),
+    ///   * `channel.channel_coarse_tune_semitones * 100` (RPN 2),
+    ///   * `master_fine_tune_cents` (CA-25),
+    ///   * `master_coarse_tune_semitones * 100` (CA-25), and
+    ///   * for **MPE Member** channels, the Manager Channel's pitch
+    ///     bend per Appendix C (managers control the whole zone).
+    ///
+    /// Drum channels (MIDI ch 10 = index 9) are exempt from CA-25's
+    /// note-shifting per the spec ("MUST NOT result in MIDI
+    /// note-shifting" — different key = different drum sound).
     pub fn set_pitch_bend(&mut self, channel: u8, value: u16) {
         let ch = channel as usize % NUM_CHANNELS;
         let v = value & 0x3FFF;
         self.channels[ch].pitch_bend = v;
-        let cents = pitch_bend_to_cents(v, self.channels[ch].pitch_bend_range_cents);
-        for slot in self.slots.iter_mut() {
-            if slot.channel == channel {
-                if let Some(voice) = slot.voice.as_mut() {
-                    voice.set_pitch_bend_cents(cents);
+
+        // If this is an MPE Manager Channel, the bend reaches every
+        // voice in the zone *combined* with that member channel's own
+        // per-note bend. Per Appendix C we sum the two values in
+        // cents.
+        let role = self.channels[ch].mpe_role;
+        let is_drum = ch == 9;
+
+        if let MpeRole::Manager(zone_kind) = role {
+            // Update every voice in the zone (Manager-held notes too).
+            let zone = match zone_kind {
+                MpeZoneKind::Lower => self.mpe_lower,
+                MpeZoneKind::Upper => self.mpe_upper,
+            };
+            if let Some(z) = zone {
+                for slot in self.slots.iter_mut() {
+                    let slot_ch = slot.channel as usize % NUM_CHANNELS;
+                    if slot.channel == channel
+                        || slot.channel == z.manager_channel()
+                        || z.member_channels().contains(&slot.channel)
+                    {
+                        if let Some(voice) = slot.voice.as_mut() {
+                            let total = Self::compose_pitch_cents(
+                                &self.channels[slot_ch],
+                                self.channels[ch].pitch_bend,
+                                self.channels[ch].pitch_bend_range_cents,
+                                self.master_fine_tune_cents,
+                                self.master_coarse_tune_semitones,
+                                slot_ch == 9,
+                            );
+                            voice.set_pitch_bend_cents(total);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Non-MPE or MPE Member: apply only to voices on this
+            // exact channel.
+            for slot in self.slots.iter_mut() {
+                if slot.channel == channel {
+                    if let Some(voice) = slot.voice.as_mut() {
+                        // For a Member channel, also fold in the
+                        // Manager's currently-held bend.
+                        let total = if let MpeRole::Member(zone_kind) = role {
+                            let mgr_ch = match zone_kind {
+                                MpeZoneKind::Lower => 0u8,
+                                MpeZoneKind::Upper => 15u8,
+                            };
+                            let mgr_state = &self.channels[mgr_ch as usize];
+                            let member_cents =
+                                pitch_bend_to_cents(v, self.channels[ch].pitch_bend_range_cents);
+                            let mgr_cents = pitch_bend_to_cents(
+                                mgr_state.pitch_bend,
+                                mgr_state.pitch_bend_range_cents,
+                            );
+                            let mut total = member_cents + mgr_cents;
+                            if !is_drum {
+                                total += self.channels[ch].channel_fine_tune_cents as i32;
+                                total +=
+                                    self.channels[ch].channel_coarse_tune_semitones as i32 * 100;
+                                total += self.master_fine_tune_cents as i32;
+                                total += self.master_coarse_tune_semitones as i32 * 100;
+                            }
+                            total
+                        } else {
+                            Self::compose_pitch_cents(
+                                &self.channels[ch],
+                                v,
+                                self.channels[ch].pitch_bend_range_cents,
+                                self.master_fine_tune_cents,
+                                self.master_coarse_tune_semitones,
+                                is_drum,
+                            )
+                        };
+                        voice.set_pitch_bend_cents(total);
+                    }
                 }
             }
         }
     }
 
+    /// Static helper: combine pitch bend + per-channel tuning + master
+    /// tuning into a single cents value. Pulled out so the MPE
+    /// per-zone broadcast path can compute the per-slot sum without
+    /// borrowing `self` mutably twice.
+    fn compose_pitch_cents(
+        ch_state: &ChannelState,
+        bend_14: u16,
+        bend_range_cents: u16,
+        master_fine_cents: i16,
+        master_coarse_semis: i16,
+        is_drum: bool,
+    ) -> i32 {
+        let mut total = pitch_bend_to_cents(bend_14, bend_range_cents);
+        if !is_drum {
+            total += ch_state.channel_fine_tune_cents as i32;
+            total += ch_state.channel_coarse_tune_semitones as i32 * 100;
+            total += master_fine_cents as i32;
+            total += master_coarse_semis as i32 * 100;
+        }
+        total
+    }
+
     /// Apply channel pressure (mono aftertouch, MIDI status `Dn`). The
     /// `0..=127` value modulates volume on every still-held voice on
     /// `channel`.
+    ///
+    /// MPE rules (§2.2.7 + Appendix D): on a **Manager Channel** the
+    /// pressure affects every voice in the zone, combined with each
+    /// member channel's own most-recent pressure. On a **Member
+    /// Channel** it only affects voices held on that very channel and
+    /// composes with the Manager's pressure for the routed-to-voice
+    /// value. Outside MPE the routing is the plain per-channel
+    /// behaviour.
     pub fn set_channel_pressure(&mut self, channel: u8, value: u8) {
         let ch = channel as usize % NUM_CHANNELS;
         self.channels[ch].channel_pressure = value;
-        let p = (value as f32 / 127.0).clamp(0.0, 1.0);
+        let role = self.channels[ch].mpe_role;
         for slot in self.slots.iter_mut() {
-            if slot.channel == channel {
+            let slot_ch = slot.channel as usize % NUM_CHANNELS;
+            let routes = match role {
+                MpeRole::Manager(kind) => {
+                    let zone = match kind {
+                        MpeZoneKind::Lower => self.mpe_lower,
+                        MpeZoneKind::Upper => self.mpe_upper,
+                    };
+                    if let Some(z) = zone {
+                        slot.channel == z.manager_channel()
+                            || z.member_channels().contains(&slot.channel)
+                    } else {
+                        slot.channel == channel
+                    }
+                }
+                _ => slot.channel == channel,
+            };
+            if routes {
                 if let Some(voice) = slot.voice.as_mut() {
-                    voice.set_pressure(p);
+                    let combined = Self::compose_pressure(
+                        self.channels[slot_ch].channel_pressure,
+                        match self.channels[slot_ch].mpe_role {
+                            MpeRole::Member(kind) => {
+                                let mgr = match kind {
+                                    MpeZoneKind::Lower => 0,
+                                    MpeZoneKind::Upper => 15,
+                                };
+                                self.channels[mgr].channel_pressure
+                            }
+                            _ => 0,
+                        },
+                    );
+                    voice.set_pressure(combined);
                 }
             }
         }
     }
 
     /// Apply polyphonic key pressure (per-key aftertouch, MIDI status
-    /// `An`). Only voices matching `(channel, key)` are touched.
+    /// `An`). Only voices matching `(channel, key)` are touched. Per
+    /// MPE §2.2.7, Polyphonic Key Pressure **shall not** be sent on
+    /// Member Channels (it doesn't make sense — each Member already
+    /// hosts one Active Note that channel pressure covers); we silently
+    /// drop a stray PolyPressure on a Member to avoid clobbering an
+    /// unrelated key's voice via the lookup.
     pub fn set_poly_pressure(&mut self, channel: u8, key: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        if matches!(self.channels[ch].mpe_role, MpeRole::Member(_)) {
+            return;
+        }
         let p = (value as f32 / 127.0).clamp(0.0, 1.0);
         for slot in self.slots.iter_mut() {
             if slot.channel == channel && slot.key == key {
@@ -226,6 +543,17 @@ impl Mixer {
                 }
             }
         }
+    }
+
+    /// Combine MPE Member + Manager channel pressures into a single
+    /// 0..=1 pressure scalar. We pick the larger of the two per
+    /// Appendix D's "implementor-defined combining" — taking the max
+    /// is the simplest combining rule that matches the spec's intent
+    /// ("the two should be combined meaningfully") without
+    /// double-counting overlapping inputs.
+    fn compose_pressure(member_0_127: u8, manager_0_127: u8) -> f32 {
+        let m = member_0_127.max(manager_0_127);
+        (m as f32 / 127.0).clamp(0.0, 1.0)
     }
 
     /// Update the currently-selected RPN. Called from the scheduler in
@@ -243,29 +571,350 @@ impl Mixer {
     }
 
     /// Apply a data-entry CC (CC 6 = MSB, CC 38 = LSB) to whatever the
-    /// currently-selected RPN is. Round-4 only honours RPN 0
-    /// (pitch-bend range): CC 6 = semitone count, CC 38 = additional
-    /// cents. Other RPNs are silently ignored.
+    /// currently-selected RPN is. Round 75 honours:
+    ///   * **RPN 0** (`MSB=00 LSB=00`) — Pitch Bend Sensitivity.
+    ///     CC 6 = semitone count, CC 38 = additional cents.
+    ///   * **RPN 1** (`MSB=00 LSB=01`) — Channel Fine Tuning. The
+    ///     14-bit data-entry value (MSB×128 + LSB) is treated as a
+    ///     two's-complement bend around centre 0x2000 and maps
+    ///     linearly to `±100` cents per the MIDI 1.0 spec.
+    ///   * **RPN 2** (`MSB=00 LSB=02`) — Channel Coarse Tuning. CC 6
+    ///     directly carries a signed semitone offset centred on 0x40;
+    ///     the spec says CC 38 LSB is always 0 (mirroring CA-25
+    ///     master-coarse-tuning) so we ignore it.
+    ///   * **RPN 5** (`MSB=00 LSB=05`) — Modulation Depth Range
+    ///     (CA-26). CC 6 = whole-cent count of mod-wheel depth, CC 38
+    ///     = additional fractional cents (treated as 0..=99).
+    ///   * **RPN 6** (`MSB=00 LSB=06`) — MPE Configuration Message
+    ///     (M1-100-UM §2.2.1). CC 6 = number of Member Channels.
+    ///     CC 38 has no function per spec. The MCM is only honoured
+    ///     when the channel matches one of the two valid Manager
+    ///     Channels (0 = Lower, 15 = Upper); other channels are
+    ///     silently ignored per the MPE spec ("All other values are
+    ///     invalid and should be ignored.").
+    ///
+    /// Other RPNs are silently ignored.
     pub fn set_data_entry(&mut self, channel: u8, value: u8, is_msb: bool) {
         let ch = channel as usize % NUM_CHANNELS;
-        if self.channels[ch].rpn != 0 {
-            // Only RPN 0 (pitch-bend range) matters in round 4.
-            return;
+        let rpn = self.channels[ch].rpn;
+        match rpn {
+            0 => {
+                let cur = self.channels[ch].pitch_bend_range_cents;
+                let new = if is_msb {
+                    // CC 6: semitone portion. Replace the "hundreds" digit
+                    // (semitones * 100) and keep the LSB cents.
+                    value as u16 * 100 + (cur % 100)
+                } else {
+                    // CC 38: cents portion (0..=99).
+                    (cur / 100) * 100 + (value as u16 % 100)
+                };
+                self.channels[ch].pitch_bend_range_cents = new.max(1); // never zero
+                                                                       // Re-apply the live bend with the new range so still-held voices
+                                                                       // pick up the change immediately.
+                let bend = self.channels[ch].pitch_bend;
+                self.set_pitch_bend(channel, bend);
+            }
+            1 => {
+                // Channel Fine Tuning. The two data-entry bytes form a
+                // 14-bit value centred on 0x2000; the resulting
+                // displacement is `±100` cents (i.e. one semitone).
+                // The raw accumulator lives on the channel state so
+                // an MSB-then-LSB sequence composes bit-exact, then
+                // we derive the cents view from it.
+                let cur = self.channels[ch].channel_fine_tune_raw_14;
+                let new14 = if is_msb {
+                    (cur & 0x007F) | ((value as u16 & 0x7F) << 7)
+                } else {
+                    (cur & 0x3F80) | (value as u16 & 0x7F)
+                };
+                self.channels[ch].channel_fine_tune_raw_14 = new14;
+                let cents = (new14.min(0x3FFF) as i32 - 0x2000) * 100 / 0x2000;
+                self.channels[ch].channel_fine_tune_cents = cents as i16;
+                self.reapply_pitch_for_channel(channel);
+            }
+            2 if is_msb => {
+                // Channel Coarse Tuning. CC 6 carries a signed
+                // semitone count centred on 0x40 (-64..=+63 per
+                // CA-25's relationship). CC 38 (LSB) is silently
+                // ignored per spec — "the LSB is always 0".
+                let semis = value as i16 - 0x40;
+                self.channels[ch].channel_coarse_tune_semitones = semis;
+                self.reapply_pitch_for_channel(channel);
+            }
+            5 => {
+                let cur = self.channels[ch].mod_depth_range_cents;
+                let new = if is_msb {
+                    value as u16 * 100 + (cur % 100)
+                } else {
+                    (cur / 100) * 100 + (value as u16 % 100)
+                };
+                // Clamp to a sane envelope (±2 octaves) so a stray
+                // CC 6 = 127 (= 12 700 cents) doesn't pop the timbre
+                // out of audibility.
+                self.channels[ch].mod_depth_range_cents = new.min(2400);
+                self.reapply_mod_wheel_for_channel(channel);
+            }
+            6 => {
+                // MPE Configuration Message — only the MSB carries the
+                // member-channel count; the LSB has no function per
+                // §2.2.1.
+                if !is_msb {
+                    return;
+                }
+                let zone_kind = match channel & 0x0F {
+                    0x0 => Some(MpeZoneKind::Lower),
+                    0xF => Some(MpeZoneKind::Upper),
+                    _ => None,
+                };
+                if let Some(kind) = zone_kind {
+                    self.set_mpe_zone(kind, value & 0x0F);
+                }
+            }
+            _ => { /* Other RPNs (3/4 tuning bank+program, etc.) not modelled. */ }
         }
-        let cur = self.channels[ch].pitch_bend_range_cents;
-        let new = if is_msb {
-            // CC 6: semitone portion. Replace the "hundreds" digit
-            // (semitones * 100) and keep the LSB cents.
-            value as u16 * 100 + (cur % 100)
-        } else {
-            // CC 38: cents portion (0..=99).
-            (cur / 100) * 100 + (value as u16 % 100)
-        };
-        self.channels[ch].pitch_bend_range_cents = new.max(1); // never zero
-                                                               // Re-apply the live bend with the new range so still-held voices
-                                                               // pick up the change immediately.
+    }
+
+    /// Re-evaluate the effective pitch offset on every voice held on
+    /// `channel`. Combines RPN 1 (channel fine tune) + RPN 2 (channel
+    /// coarse tune) + master fine + master coarse + the live pitch
+    /// bend; called whenever any of those terms change. Drum channels
+    /// (MIDI ch 10 = index 9) are exempt from tuning per CA-25's
+    /// "MUST NOT result in MIDI note-shifting" rule — playing a
+    /// drum-key at a different pitch picks a different sound.
+    fn reapply_pitch_for_channel(&mut self, channel: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
         let bend = self.channels[ch].pitch_bend;
+        // set_pitch_bend already routes through the channel state into
+        // every held voice.
         self.set_pitch_bend(channel, bend);
+    }
+
+    /// Re-evaluate the effective mod-wheel depth on every voice held on
+    /// `channel`. Called when CC 1 changes or when RPN 5 widens / shrinks
+    /// the range.
+    fn reapply_mod_wheel_for_channel(&mut self, channel: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let st = self.channels[ch];
+        // Manager-channel mod-wheel is propagated to every voice in
+        // its MPE zone (§2.3.1: "Damper Pedal can be expected to
+        // affect all Sounding Notes across the Manager Channel and
+        // all Member Channels"). For non-MPE channels the depth
+        // routes only to that channel's own voices.
+        let depth_cents = (st.mod_wheel as i32) * (st.mod_depth_range_cents as i32) / 127;
+        for slot in self.slots.iter_mut() {
+            if self.channels[slot.channel as usize % NUM_CHANNELS].matches_for_zone_broadcast(
+                slot.channel,
+                channel,
+                &st.mpe_role,
+            ) {
+                if let Some(v) = slot.voice.as_mut() {
+                    v.set_mod_depth_cents(depth_cents);
+                }
+            }
+        }
+    }
+
+    /// Update CC 1 (Modulation Wheel) on a channel. Stored on the
+    /// channel state and immediately routed through
+    /// [`Voice::set_mod_depth_cents`] for every held voice that the
+    /// MPE rules say this CC applies to.
+    pub fn set_mod_wheel(&mut self, channel: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].mod_wheel = value & 0x7F;
+        self.reapply_mod_wheel_for_channel(channel);
+    }
+
+    /// Set CC #74 (Brightness / MPE Timbre, the "third dimension"). The
+    /// raw 0..=127 value is forwarded to every voice this channel-CC
+    /// reaches: per-channel for non-MPE, per-zone for MPE Manager,
+    /// per-channel-only (= the held member-channel notes) for MPE
+    /// Member.
+    pub fn set_timbre(&mut self, channel: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let role = self.channels[ch].mpe_role;
+        for slot in self.slots.iter_mut() {
+            if self.channels[slot.channel as usize % NUM_CHANNELS].matches_for_zone_broadcast(
+                slot.channel,
+                channel,
+                &role,
+            ) {
+                if let Some(v) = slot.voice.as_mut() {
+                    v.set_timbre(value & 0x7F);
+                }
+            }
+        }
+    }
+
+    // ─────────────────────────── master tuning ───────────────────────────
+
+    /// Master Volume (Universal Real Time SysEx `7F 7F 04 01`). The
+    /// argument is the raw 14-bit MIDI scalar (`0..=0x3FFF`), centre =
+    /// max. Applied as a multiplicative gain on every voice at mix
+    /// time, mapped linearly (`master_volume_14 / 0x3FFF`); per the
+    /// spec a *fully* loud setting is the default. Round 75 doesn't
+    /// model the GS / GM2 "scribbled-curve" non-linearity.
+    pub fn set_master_volume_14(&mut self, value: u16) {
+        self.master_volume_14 = value.min(0x3FFF);
+    }
+
+    /// Current Master Volume scalar (14-bit, 0..=0x3FFF).
+    pub fn master_volume_14(&self) -> u16 {
+        self.master_volume_14
+    }
+
+    /// Master Fine Tuning (CA-25). The two arguments are the raw
+    /// LSB/MSB bytes from the SysEx payload; we combine them into a
+    /// 14-bit value centred on 0x2000 and map it linearly to
+    /// `100/8192 × (value - 0x2000)` cents per the spec table.
+    pub fn set_master_fine_tuning(&mut self, lsb: u8, msb: u8) {
+        let combined = ((msb as i32 & 0x7F) << 7) | (lsb as i32 & 0x7F);
+        let cents = (combined - 0x2000) * 100 / 0x2000;
+        self.master_fine_tune_cents = cents as i16;
+        for ch in 0..NUM_CHANNELS {
+            self.reapply_pitch_for_channel(ch as u8);
+        }
+    }
+
+    /// Master Coarse Tuning (CA-25). CC 38 LSB is always 0 per spec;
+    /// CC 6 MSB carries a signed semitone count centred on 0x40
+    /// (-64..=+63).
+    pub fn set_master_coarse_tuning(&mut self, _lsb: u8, msb: u8) {
+        // Per CA-25 page 2: "Note that the LSB is always 0."
+        let semis = msb as i16 - 0x40;
+        self.master_coarse_tune_semitones = semis;
+        for ch in 0..NUM_CHANNELS {
+            self.reapply_pitch_for_channel(ch as u8);
+        }
+    }
+
+    /// Current Master Fine Tuning, in cents.
+    pub fn master_fine_tune_cents(&self) -> i16 {
+        self.master_fine_tune_cents
+    }
+
+    /// Current Master Coarse Tuning, in semitones.
+    pub fn master_coarse_tune_semitones(&self) -> i16 {
+        self.master_coarse_tune_semitones
+    }
+
+    // ─────────────────────────── MPE plumbing ───────────────────────────
+
+    /// Activate / deactivate one MPE zone. `members = 0` deactivates
+    /// the zone per §2.2.1 ("Sending an MCM with the number of
+    /// Member Channels set to zero deactivates that zone"). When a
+    /// zone is (de)activated the receiver must stop all Sounding Notes
+    /// and reset all controls on each channel entering or leaving MPE
+    /// control (§2.2.3) — we honour that by `all_notes_off` on the
+    /// affected channels and re-seeding their PB sensitivity per
+    /// §2.2.5 defaults.
+    pub fn set_mpe_zone(&mut self, kind: MpeZoneKind, members: u8) {
+        // Per §2.2.1: "No MIDI Channel shall be assigned to more than
+        // one Zone at a time." If the new zone would steal channels
+        // from the other zone, the spec mandates the most recent MCM
+        // wins and the other zone is shrunk (or deactivated if it has
+        // no remaining Members). We model the simpler-but-spec-
+        // compliant rule: per §A.2, a typical receiver only models
+        // one zone at a time and Member Channels grow/decay from the
+        // Manager Channel outward.
+        let new_zone = if members == 0 {
+            None
+        } else {
+            Some(MpeZone {
+                kind,
+                members: members.min(15),
+            })
+        };
+        // Step 1: reset every channel currently in this zone.
+        let old_zone = match kind {
+            MpeZoneKind::Lower => self.mpe_lower,
+            MpeZoneKind::Upper => self.mpe_upper,
+        };
+        if let Some(z) = old_zone {
+            self.reset_mpe_zone_channels(z);
+        }
+        // Step 2: assign the new zone.
+        match kind {
+            MpeZoneKind::Lower => self.mpe_lower = new_zone,
+            MpeZoneKind::Upper => self.mpe_upper = new_zone,
+        }
+        // Step 3: tag the channels with their new roles & defaults.
+        if let Some(z) = new_zone {
+            // Drop conflicting assignments from the *other* zone: per
+            // §2.2.1, the most recent MCM wins.
+            let other = match kind {
+                MpeZoneKind::Lower => self.mpe_upper,
+                MpeZoneKind::Upper => self.mpe_lower,
+            };
+            if let Some(o) = other {
+                let members_now: Vec<u8> = z.member_channels();
+                let o_members: Vec<u8> = o.member_channels();
+                if o_members.iter().any(|m| members_now.contains(m))
+                    || members_now.contains(&o.manager_channel())
+                {
+                    // Conflict — shrink/deactivate the other zone.
+                    let surviving: Vec<u8> = o_members
+                        .into_iter()
+                        .filter(|m| !members_now.contains(m))
+                        .collect();
+                    if surviving.is_empty() {
+                        match o.kind {
+                            MpeZoneKind::Lower => self.mpe_lower = None,
+                            MpeZoneKind::Upper => self.mpe_upper = None,
+                        }
+                    } else {
+                        let new_other = MpeZone {
+                            kind: o.kind,
+                            members: surviving.len() as u8,
+                        };
+                        match o.kind {
+                            MpeZoneKind::Lower => self.mpe_lower = Some(new_other),
+                            MpeZoneKind::Upper => self.mpe_upper = Some(new_other),
+                        }
+                    }
+                }
+            }
+            self.tag_mpe_zone_channels(z);
+        }
+    }
+
+    /// `Some(zone)` if `kind` is currently active; `None` otherwise.
+    pub fn mpe_zone(&self, kind: MpeZoneKind) -> Option<MpeZone> {
+        match kind {
+            MpeZoneKind::Lower => self.mpe_lower,
+            MpeZoneKind::Upper => self.mpe_upper,
+        }
+    }
+
+    /// Drop every voice on the channels that participate in `zone`
+    /// (Manager + Members) and reset their per-channel state to the
+    /// non-MPE default. Called when a zone gets reconfigured.
+    fn reset_mpe_zone_channels(&mut self, zone: MpeZone) {
+        let mut ch_list = zone.member_channels();
+        ch_list.push(zone.manager_channel());
+        for ch in ch_list {
+            // Stop sounding notes on this channel.
+            for slot in self.slots.iter_mut() {
+                if slot.channel == ch {
+                    slot.voice = None;
+                    slot.sustained = false;
+                }
+            }
+            // Restore default ChannelState (preserves nothing).
+            self.channels[ch as usize] = ChannelState::default();
+        }
+    }
+
+    /// Tag every channel of `zone` with its MPE role and default
+    /// pitch-bend sensitivity per §2.2.5: 48 semitones on Members,
+    /// 2 semitones on Manager.
+    fn tag_mpe_zone_channels(&mut self, zone: MpeZone) {
+        let mgr = zone.manager_channel();
+        self.channels[mgr as usize].mpe_role = MpeRole::Manager(zone.kind);
+        self.channels[mgr as usize].pitch_bend_range_cents = 200;
+        for ch in zone.member_channels() {
+            self.channels[ch as usize].mpe_role = MpeRole::Member(zone.kind);
+            self.channels[ch as usize].pitch_bend_range_cents = 4800;
+        }
     }
 
     /// Apply CC 64 (sustain pedal). When the value crosses below the
@@ -343,13 +992,52 @@ impl Mixer {
                 }
             }
         }
-        let st = self.channels[channel as usize % NUM_CHANNELS];
-        let cents = pitch_bend_to_cents(st.pitch_bend, st.pitch_bend_range_cents);
+        let ch = channel as usize % NUM_CHANNELS;
+        let st = self.channels[ch];
+        let is_drum = ch == 9;
+        // Compose pitch bend + per-channel fine/coarse + master
+        // fine/coarse + (for MPE Members) the Manager Channel's bend
+        // — picks up tuning on the new voice's very first sample so
+        // a note triggered while the bend wheel is held doesn't pop.
+        let mut cents = Self::compose_pitch_cents(
+            &st,
+            st.pitch_bend,
+            st.pitch_bend_range_cents,
+            self.master_fine_tune_cents,
+            self.master_coarse_tune_semitones,
+            is_drum,
+        );
+        if let MpeRole::Member(zone_kind) = st.mpe_role {
+            let mgr = match zone_kind {
+                MpeZoneKind::Lower => 0,
+                MpeZoneKind::Upper => 15,
+            };
+            let mgr_state = self.channels[mgr];
+            cents += pitch_bend_to_cents(mgr_state.pitch_bend, mgr_state.pitch_bend_range_cents);
+        }
         if cents != 0 {
             voice.set_pitch_bend_cents(cents);
         }
-        if st.channel_pressure != 0 {
-            voice.set_pressure(st.channel_pressure as f32 / 127.0);
+        // Compose Member + Manager channel pressure for MPE; otherwise
+        // just hand the channel's value through.
+        let pressure_byte = match st.mpe_role {
+            MpeRole::Member(zone_kind) => {
+                let mgr = match zone_kind {
+                    MpeZoneKind::Lower => 0,
+                    MpeZoneKind::Upper => 15,
+                };
+                st.channel_pressure.max(self.channels[mgr].channel_pressure)
+            }
+            _ => st.channel_pressure,
+        };
+        if pressure_byte != 0 {
+            voice.set_pressure(pressure_byte as f32 / 127.0);
+        }
+        // Mod-wheel depth (CC 1 scaled by RPN 5) carries to a fresh
+        // voice the same way bend does.
+        let depth_cents = (st.mod_wheel as i32) * (st.mod_depth_range_cents as i32) / 127;
+        if depth_cents != 0 {
+            voice.set_mod_depth_cents(depth_cents);
         }
         let idx = self.pick_slot();
         let age = self.next_age;
@@ -433,9 +1121,11 @@ impl Mixer {
                 continue;
             };
 
-            // Per-channel volume / pan. Both folded once per chunk.
+            // Per-channel volume / pan + universal master volume.
+            // Folded once per chunk.
             let st = self.channels[slot.channel as usize % NUM_CHANNELS];
             let vol = st.volume as f32 / 127.0;
+            let master = self.master_volume_14 as f32 / 0x3FFF as f32;
             // Constant-power pan: θ in [0, π/2], left = cos(θ), right = sin(θ).
             let pan_norm = (st.pan as f32 / 127.0).clamp(0.0, 1.0);
             let theta = pan_norm * std::f32::consts::FRAC_PI_2;
@@ -450,15 +1140,15 @@ impl Mixer {
                 // re-panning a mono signal.
                 let l_balance = (theta.cos() * std::f32::consts::SQRT_2).min(1.0);
                 let r_balance = (theta.sin() * std::f32::consts::SQRT_2).min(1.0);
-                let lg = vol * self.mix_gain * l_balance;
-                let rg = vol * self.mix_gain * r_balance;
+                let lg = vol * master * self.mix_gain * l_balance;
+                let rg = vol * master * self.mix_gain * r_balance;
                 for i in 0..n {
                     left[i] += lscratch[i] * lg;
                     right[i] += rscratch[i] * rg;
                 }
             } else {
-                let l_gain = theta.cos() * vol * self.mix_gain;
-                let r_gain = theta.sin() * vol * self.mix_gain;
+                let l_gain = theta.cos() * vol * master * self.mix_gain;
+                let r_gain = theta.sin() * vol * master * self.mix_gain;
                 for i in 0..n {
                     let s = mono[i];
                     left[i] += s * l_gain;
@@ -505,14 +1195,16 @@ mod tests {
     /// A test voice that produces a constant DC value for `total`
     /// samples then reports `done`. Lets us assert mix arithmetic
     /// without standing up a full SF2 fixture. Also records the last
-    /// pitch-bend / pressure value pushed in via the optional Voice
-    /// methods so tests can assert routing.
+    /// pitch-bend / pressure / mod-depth / timbre value pushed in via
+    /// the optional Voice methods so tests can assert routing.
     struct ConstVoice {
         value: f32,
         remaining: usize,
         done: bool,
         last_bend_cents: std::sync::Arc<std::sync::Mutex<i32>>,
         last_pressure: std::sync::Arc<std::sync::Mutex<f32>>,
+        last_mod_depth_cents: std::sync::Arc<std::sync::Mutex<i32>>,
+        last_timbre: std::sync::Arc<std::sync::Mutex<u8>>,
     }
     impl Voice for ConstVoice {
         fn render(&mut self, out: &mut [f32]) -> usize {
@@ -542,6 +1234,12 @@ mod tests {
         fn set_pressure(&mut self, p: f32) {
             *self.last_pressure.lock().unwrap() = p;
         }
+        fn set_mod_depth_cents(&mut self, cents: i32) {
+            *self.last_mod_depth_cents.lock().unwrap() = cents;
+        }
+        fn set_timbre(&mut self, v: u8) {
+            *self.last_timbre.lock().unwrap() = v;
+        }
     }
 
     fn voice(value: f32, samples: usize) -> Box<dyn Voice> {
@@ -551,11 +1249,15 @@ mod tests {
             done: false,
             last_bend_cents: std::sync::Arc::new(std::sync::Mutex::new(0)),
             last_pressure: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
+            last_mod_depth_cents: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            last_timbre: std::sync::Arc::new(std::sync::Mutex::new(0)),
         })
     }
 
     type BendCell = std::sync::Arc<std::sync::Mutex<i32>>;
     type PressureCell = std::sync::Arc<std::sync::Mutex<f32>>;
+    type DepthCell = std::sync::Arc<std::sync::Mutex<i32>>;
+    type TimbreCell = std::sync::Arc<std::sync::Mutex<u8>>;
 
     /// Build a [`ConstVoice`] plus shared handles to its `last_bend_cents`
     /// / `last_pressure` cells so the test can read the values back after
@@ -563,14 +1265,45 @@ mod tests {
     fn instrumented_voice(value: f32, samples: usize) -> (Box<dyn Voice>, BendCell, PressureCell) {
         let bend = std::sync::Arc::new(std::sync::Mutex::new(0));
         let press = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+        let depth = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let timbre = std::sync::Arc::new(std::sync::Mutex::new(0));
         let v = Box::new(ConstVoice {
             value,
             remaining: samples,
             done: false,
             last_bend_cents: bend.clone(),
             last_pressure: press.clone(),
+            last_mod_depth_cents: depth,
+            last_timbre: timbre,
         });
         (v, bend, press)
+    }
+
+    /// Full instrumented voice + handles for *every* cell.
+    fn instrumented_voice_full(
+        value: f32,
+        samples: usize,
+    ) -> (
+        Box<dyn Voice>,
+        BendCell,
+        PressureCell,
+        DepthCell,
+        TimbreCell,
+    ) {
+        let bend = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let press = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+        let depth = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let timbre = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let v = Box::new(ConstVoice {
+            value,
+            remaining: samples,
+            done: false,
+            last_bend_cents: bend.clone(),
+            last_pressure: press.clone(),
+            last_mod_depth_cents: depth.clone(),
+            last_timbre: timbre.clone(),
+        });
+        (v, bend, press, depth, timbre)
     }
 
     #[test]
@@ -809,5 +1542,396 @@ mod tests {
         m.set_data_entry(0, 12, true);
         // Default range (200) must be untouched.
         assert_eq!(m.channel_state(0).pitch_bend_range_cents, 200);
+    }
+
+    // ──────────────────────── Round-75: master tuning + RPN 1/2/5 + MPE ────────────────────────
+
+    fn select_rpn(m: &mut Mixer, channel: u8, msb: u8, lsb: u8) {
+        m.set_rpn_byte(channel, msb, true);
+        m.set_rpn_byte(channel, lsb, false);
+    }
+
+    #[test]
+    fn rpn_1_channel_fine_tune_data_entry_sets_cents() {
+        let mut m = Mixer::new();
+        select_rpn(&mut m, 0, 0, 1); // RPN 1 = Channel Fine Tuning
+                                     // Centre (MSB=0x40 LSB=0x00) → 0 cents.
+        m.set_data_entry(0, 0x40, true);
+        m.set_data_entry(0, 0x00, false);
+        assert_eq!(m.channel_state(0).channel_fine_tune_cents, 0);
+        // Max positive (MSB=0x7F LSB=0x7F) → ~+100 cents.
+        m.set_data_entry(0, 0x7F, true);
+        m.set_data_entry(0, 0x7F, false);
+        let c = m.channel_state(0).channel_fine_tune_cents;
+        assert!((99..=100).contains(&c), "got {c}");
+        // Max negative (MSB=0x00 LSB=0x00) → -100 cents.
+        m.set_data_entry(0, 0x00, true);
+        m.set_data_entry(0, 0x00, false);
+        assert_eq!(m.channel_state(0).channel_fine_tune_cents, -100);
+    }
+
+    #[test]
+    fn rpn_2_channel_coarse_tune_data_entry_sets_semitones() {
+        let mut m = Mixer::new();
+        select_rpn(&mut m, 0, 0, 2);
+        m.set_data_entry(0, 0x40, true); // centre = 0 semis
+        assert_eq!(m.channel_state(0).channel_coarse_tune_semitones, 0);
+        m.set_data_entry(0, 0x4C, true); // +12 semis = one octave up
+        assert_eq!(m.channel_state(0).channel_coarse_tune_semitones, 12);
+        m.set_data_entry(0, 0x34, true); // -12 semis
+        assert_eq!(m.channel_state(0).channel_coarse_tune_semitones, -12);
+        // CC 38 LSB ignored per spec.
+        m.set_data_entry(0, 0x7F, false);
+        assert_eq!(m.channel_state(0).channel_coarse_tune_semitones, -12);
+    }
+
+    #[test]
+    fn rpn_5_modulation_depth_range_updates_range() {
+        let mut m = Mixer::new();
+        select_rpn(&mut m, 0, 0, 5);
+        // CC 38 = 0 first to clear the default fractional (50 cents),
+        // then CC 6 = 1 → 100 cents whole.
+        m.set_data_entry(0, 0, false);
+        m.set_data_entry(0, 1, true);
+        assert_eq!(m.channel_state(0).mod_depth_range_cents, 100);
+        // CC 38 = 50 → adds 50 cents on top.
+        m.set_data_entry(0, 50, false);
+        assert_eq!(m.channel_state(0).mod_depth_range_cents, 150);
+    }
+
+    #[test]
+    fn channel_fine_tune_offsets_pitch_on_held_voice() {
+        let mut m = Mixer::new();
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        // Centre bend = 0; with +50 cents fine tune, the routed cents
+        // should be +50.
+        select_rpn(&mut m, 0, 0, 1);
+        // MSB=0x60 (= 0x60<<7 = 12288), LSB=0 → raw 0x3000.
+        // cents = (0x3000 - 0x2000) * 100 / 0x2000 = 4096 * 100 / 8192 = 50.
+        m.set_data_entry(0, 0x60, true);
+        m.set_data_entry(0, 0x00, false);
+        // Re-apply the live pitch bend (which is centre 0x2000) so the
+        // voice picks up the new fine-tune sum.
+        m.set_pitch_bend(0, 0x2000);
+        let cents = *bend_cell.lock().unwrap();
+        assert!(
+            (49..=50).contains(&cents),
+            "expected fine-tune routed to +50, got {cents}",
+        );
+    }
+
+    #[test]
+    fn channel_coarse_tune_routes_one_octave_up() {
+        let mut m = Mixer::new();
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        select_rpn(&mut m, 0, 0, 2);
+        m.set_data_entry(0, 0x4C, true); // +12 semis
+        m.set_pitch_bend(0, 0x2000);
+        let cents = *bend_cell.lock().unwrap();
+        assert_eq!(
+            cents, 1200,
+            "expected +1200 cents (one octave), got {cents}"
+        );
+    }
+
+    #[test]
+    fn drum_channel_ignores_channel_coarse_tune() {
+        // CA-25: "For devices which support Key-based Instruments
+        // (such as drum kits) it is important that this message NOT
+        // result in MIDI note-shifting."
+        let mut m = Mixer::new();
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(9, 36, 100, v); // ch 10 = index 9 = GM drum bus
+        select_rpn(&mut m, 9, 0, 2);
+        m.set_data_entry(9, 0x4C, true); // +12 semis on drum channel
+        m.set_pitch_bend(9, 0x2000);
+        let cents = *bend_cell.lock().unwrap();
+        assert_eq!(cents, 0, "drum channel must not shift pitch, got {cents}");
+    }
+
+    #[test]
+    fn master_fine_tuning_centre_is_zero_cents() {
+        let mut m = Mixer::new();
+        m.set_master_fine_tuning(0x00, 0x40);
+        assert_eq!(m.master_fine_tune_cents(), 0);
+    }
+
+    #[test]
+    fn master_fine_tuning_max_positive_is_near_plus_100() {
+        let mut m = Mixer::new();
+        m.set_master_fine_tuning(0x7F, 0x7F);
+        let c = m.master_fine_tune_cents();
+        assert!((99..=100).contains(&c), "got {c}");
+    }
+
+    #[test]
+    fn master_fine_tuning_routes_to_held_voice() {
+        let mut m = Mixer::new();
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        // +50 cents master fine.
+        m.set_master_fine_tuning(0x00, 0x60);
+        let cents = *bend_cell.lock().unwrap();
+        assert!((49..=50).contains(&cents), "got {cents}");
+    }
+
+    #[test]
+    fn master_coarse_tuning_routes_one_octave() {
+        let mut m = Mixer::new();
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        // +12 semis master coarse.
+        m.set_master_coarse_tuning(0x00, 0x4C);
+        let cents = *bend_cell.lock().unwrap();
+        assert_eq!(cents, 1200);
+    }
+
+    #[test]
+    fn master_volume_scales_mix_output() {
+        let mut m = Mixer::new();
+        m.note_on(0, 60, 100, voice(0.5, 16));
+        // Full master.
+        let mut l1 = vec![0.0; 16];
+        let mut r1 = vec![0.0; 16];
+        m.mix_stereo(&mut l1, &mut r1);
+        // Half master.
+        m.note_on(1, 60, 100, voice(0.5, 16));
+        m.set_master_volume_14(0x2000); // ~half
+        let mut l2 = vec![0.0; 16];
+        let mut r2 = vec![0.0; 16];
+        m.mix_stereo(&mut l2, &mut r2);
+        // Ratio should be ~0.5.
+        let ratio = l2[0] / l1[0];
+        assert!(
+            (0.40..0.60).contains(&ratio),
+            "master-volume ratio {ratio} not in 0.4..0.6",
+        );
+    }
+
+    #[test]
+    fn mod_wheel_routes_to_held_voice_scaled_by_rpn5() {
+        let mut m = Mixer::new();
+        let (v, _, _, depth, _) = instrumented_voice_full(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        // RPN 5 → 100 cents range, CC 1 = 127 → depth = 100 cents.
+        select_rpn(&mut m, 0, 0, 5);
+        m.set_data_entry(0, 0, false); // clear default 50-cent fractional
+        m.set_data_entry(0, 1, true); // CC 6 = 1 semitone → 100 cents
+        m.set_mod_wheel(0, 127);
+        assert_eq!(*depth.lock().unwrap(), 100);
+        // CC 1 = 64 (halfway) → depth ≈ 50.
+        m.set_mod_wheel(0, 64);
+        let d = *depth.lock().unwrap();
+        assert!((50..=51).contains(&d), "got {d}");
+    }
+
+    #[test]
+    fn mod_wheel_applied_at_note_on_when_already_held() {
+        let mut m = Mixer::new();
+        // Configure range + wheel before the note starts.
+        select_rpn(&mut m, 0, 0, 5);
+        m.set_data_entry(0, 0, false);
+        m.set_data_entry(0, 1, true); // 100-cent range
+        m.set_mod_wheel(0, 127);
+        let (v, _, _, depth, _) = instrumented_voice_full(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        assert_eq!(*depth.lock().unwrap(), 100);
+    }
+
+    #[test]
+    fn cc74_timbre_routes_to_held_voice() {
+        let mut m = Mixer::new();
+        let (v, _, _, _, timbre) = instrumented_voice_full(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        m.set_timbre(0, 96);
+        assert_eq!(*timbre.lock().unwrap(), 96);
+    }
+
+    #[test]
+    fn mpe_mcm_lower_zone_assigns_roles() {
+        let mut m = Mixer::new();
+        m.set_mpe_zone(MpeZoneKind::Lower, 4); // 4 member channels
+        assert_eq!(m.mpe_zone(MpeZoneKind::Lower).unwrap().members, 4);
+        // Manager = ch 0, Members = 1..=4.
+        assert!(m.channel_state(0).mpe_role.is_manager());
+        for ch in 1..=4u8 {
+            assert!(matches!(
+                m.channel_state(ch).mpe_role,
+                MpeRole::Member(MpeZoneKind::Lower)
+            ));
+        }
+        // Ch 5 untouched.
+        assert!(matches!(m.channel_state(5).mpe_role, MpeRole::None));
+    }
+
+    #[test]
+    fn mpe_mcm_assigns_pb_sensitivity_defaults() {
+        let mut m = Mixer::new();
+        m.set_mpe_zone(MpeZoneKind::Lower, 4);
+        // §2.2.5: Manager = 2 semis, Members = 48 semis.
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 200);
+        for ch in 1..=4u8 {
+            assert_eq!(
+                m.channel_state(ch).pitch_bend_range_cents,
+                4800,
+                "member ch {ch}",
+            );
+        }
+    }
+
+    #[test]
+    fn mpe_mcm_zero_members_deactivates_zone() {
+        let mut m = Mixer::new();
+        m.set_mpe_zone(MpeZoneKind::Lower, 4);
+        m.set_mpe_zone(MpeZoneKind::Lower, 0);
+        assert!(m.mpe_zone(MpeZoneKind::Lower).is_none());
+        // Every channel back to None.
+        for ch in 0..=15u8 {
+            assert!(matches!(m.channel_state(ch).mpe_role, MpeRole::None));
+        }
+    }
+
+    #[test]
+    fn mpe_upper_zone_assigns_roles_top_down() {
+        let mut m = Mixer::new();
+        m.set_mpe_zone(MpeZoneKind::Upper, 3); // 3 member channels
+                                               // Manager = ch 15, Members = 12..=14.
+        assert!(matches!(
+            m.channel_state(15).mpe_role,
+            MpeRole::Manager(MpeZoneKind::Upper)
+        ));
+        for ch in 12..=14u8 {
+            assert!(matches!(
+                m.channel_state(ch).mpe_role,
+                MpeRole::Member(MpeZoneKind::Upper)
+            ));
+        }
+    }
+
+    #[test]
+    fn mpe_member_pitch_bend_combines_with_manager() {
+        // Appendix C: per-note bend on the Member sums with the
+        // Manager's zone-wide bend.
+        let mut m = Mixer::new();
+        m.set_mpe_zone(MpeZoneKind::Lower, 4);
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(1, 60, 100, v); // member channel
+                                  // Manager bend = +1 semi (range = 200 cents).
+        m.set_pitch_bend(0, 0x3FFF); // full positive at 200 cents = +200 cents
+                                     // Member bend = half-positive at 4800-cent range = +1200 cents.
+        m.set_pitch_bend(1, 0x3000); // 0x3000 - 0x2000 = +4096
+                                     //   = 4096 * 4800 / 8192 = 2400 cents
+        let total = *bend_cell.lock().unwrap();
+        // Manager (200) + Member (2400) = 2600.
+        assert!(
+            (2595..=2600).contains(&total),
+            "expected ~2600, got {total}",
+        );
+    }
+
+    #[test]
+    fn mpe_manager_cc74_broadcasts_to_zone() {
+        let mut m = Mixer::new();
+        m.set_mpe_zone(MpeZoneKind::Lower, 4);
+        let (v1, _, _, _, t1) = instrumented_voice_full(0.5, 1024);
+        let (v2, _, _, _, t2) = instrumented_voice_full(0.5, 1024);
+        m.note_on(1, 60, 100, v1);
+        m.note_on(3, 64, 100, v2);
+        // Manager Channel CC74 should reach every Member's note.
+        m.set_timbre(0, 100);
+        assert_eq!(*t1.lock().unwrap(), 100);
+        assert_eq!(*t2.lock().unwrap(), 100);
+    }
+
+    #[test]
+    fn mpe_member_cc74_does_not_leak_to_other_members() {
+        let mut m = Mixer::new();
+        m.set_mpe_zone(MpeZoneKind::Lower, 4);
+        let (v1, _, _, _, t1) = instrumented_voice_full(0.5, 1024);
+        let (v2, _, _, _, t2) = instrumented_voice_full(0.5, 1024);
+        m.note_on(1, 60, 100, v1);
+        m.note_on(3, 64, 100, v2);
+        // Member Channel 1's CC74 must only reach its own voice.
+        m.set_timbre(1, 90);
+        assert_eq!(*t1.lock().unwrap(), 90);
+        assert_eq!(*t2.lock().unwrap(), 0, "ch3 should not see ch1's CC74");
+    }
+
+    #[test]
+    fn mpe_member_blocks_poly_pressure() {
+        // §2.2.7: "Polyphonic Key Pressure shall not be sent on
+        // Member Channels."
+        let mut m = Mixer::new();
+        m.set_mpe_zone(MpeZoneKind::Lower, 4);
+        let (v, _, press) = instrumented_voice(0.5, 1024);
+        m.note_on(1, 60, 100, v);
+        m.set_poly_pressure(1, 60, 100);
+        assert_eq!(
+            *press.lock().unwrap(),
+            0.0,
+            "poly-pressure must be dropped on Member"
+        );
+    }
+
+    #[test]
+    fn mpe_member_channel_pressure_combines_with_manager_via_max() {
+        let mut m = Mixer::new();
+        m.set_mpe_zone(MpeZoneKind::Lower, 4);
+        let (v, _, press) = instrumented_voice(0.5, 1024);
+        m.note_on(1, 60, 100, v);
+        // Member pressure 60.
+        m.set_channel_pressure(1, 60);
+        let p1 = *press.lock().unwrap();
+        assert!(p1 > 0.0);
+        // Manager pressure 100 — combined = max = 100.
+        m.set_channel_pressure(0, 100);
+        let p2 = *press.lock().unwrap();
+        assert!(p2 > p1, "manager pressure should raise combined value");
+        assert!((p2 - 100.0 / 127.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn mpe_zone_conflict_shrinks_other_zone() {
+        // Lower zone = 8 members (channels 1..=8). Upper zone = 8
+        // members would want channels 7..=14, which overlaps. The
+        // most-recent MCM (Upper) takes precedence and Lower must
+        // shrink.
+        let mut m = Mixer::new();
+        m.set_mpe_zone(MpeZoneKind::Lower, 8);
+        m.set_mpe_zone(MpeZoneKind::Upper, 8);
+        let lower = m.mpe_zone(MpeZoneKind::Lower).unwrap();
+        // Lower must have shrunk to only the non-conflicting members
+        // (1..=6 — since Upper claims 7..=14).
+        assert!(
+            lower.members <= 6,
+            "lower zone should have shrunk, got {} members",
+            lower.members,
+        );
+    }
+
+    #[test]
+    fn mcm_via_data_entry_on_manager_channel_sets_zone() {
+        // Send MCM via the same channels-RPN-data-entry pathway the
+        // scheduler uses: CC 101 = 0, CC 100 = 6, CC 6 = 4.
+        let mut m = Mixer::new();
+        m.set_rpn_byte(0, 0, true); // RPN MSB = 0
+        m.set_rpn_byte(0, 6, false); // RPN LSB = 6
+        m.set_data_entry(0, 4, true); // 4 member channels
+        assert_eq!(m.mpe_zone(MpeZoneKind::Lower).unwrap().members, 4);
+    }
+
+    #[test]
+    fn mcm_on_non_manager_channel_is_ignored() {
+        // §2.2.1: "n=0x0: Lower Zone Manager Channel; n=0xF: Upper
+        // Zone Manager Channel; All other values are invalid and
+        // should be ignored."
+        let mut m = Mixer::new();
+        m.set_rpn_byte(5, 0, true);
+        m.set_rpn_byte(5, 6, false);
+        m.set_data_entry(5, 4, true);
+        assert!(m.mpe_zone(MpeZoneKind::Lower).is_none());
+        assert!(m.mpe_zone(MpeZoneKind::Upper).is_none());
     }
 }

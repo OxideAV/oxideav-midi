@@ -83,6 +83,24 @@ pub trait Voice: Send {
     /// etc.; the round-4 default modulator chain just modulates volume.
     fn set_pressure(&mut self, _pressure: f32) {}
 
+    /// Per-note modulation-wheel depth, expressed as a signed pitch
+    /// offset in cents. The mixer computes this as
+    /// `mod_wheel/127 * channel.mod_depth_range_cents` (per CA-26
+    /// RPN 5 with GM2's default 50-cent range), and the voice routes
+    /// it the same way it routes a vibrato LFO peak deviation: an
+    /// additional pitch sway summed with the existing pitch-bend
+    /// offset. Default is a no-op for voices that don't model
+    /// modulation depth (the tone fallback ignores it).
+    fn set_mod_depth_cents(&mut self, _cents: i32) {}
+
+    /// MPE-style "third dimension of control" (Control Change #74).
+    /// Per the MPE spec §2.2.8 + Appendix D, this carries timbre
+    /// information that affects the live voice independently of pitch
+    /// bend (CC74 = filter brightness on most receivers). The argument
+    /// is the raw `0..=127` scalar; voices map it into their internal
+    /// timbre parameter as they see fit. Default no-op.
+    fn set_timbre(&mut self, _value_0_127: u8) {}
+
     /// `true` when this voice produces native stereo output via
     /// [`render_stereo`](Voice::render_stereo) and should bypass the
     /// mixer's mono-pan law. Default `false` — the mixer renders the

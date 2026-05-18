@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 75 — MPE + RPN expansion + Master Tuning / Master Volume SysEx
+
+- **MIDI Polyphonic Expression (MPE) v1.1** end-to-end
+  (`docs/audio/midi/extensions/M1-100-UM_v1-1_MIDI_Polyphonic_Expression_Specification.pdf`):
+  the MPE Configuration Message (RPN 0x0006 on channel 0 = Lower
+  Manager / channel 15 = Upper Manager) configures one or two zones
+  via [`Mixer::set_mpe_zone`]. Per §2.2.5 the receiver sets Manager
+  Channel PB Sensitivity to 2 semitones and every Member Channel to
+  48 semitones at MCM time. Per §2.2.7 Polyphonic Key Pressure on a
+  Member is silently dropped (the spec says it "shall not be sent").
+  Per Appendix C, Member Channel Pitch Bend sums in cents with the
+  Manager Channel's bend before reaching the held voice. Per §2.2.3,
+  a zone reconfiguration stops every Sounding Note on the affected
+  channels and resets their controllers. New types
+  [`Mixer::MpeZone`] / [`Mixer::MpeRole`] / [`Mixer::MpeZoneKind`]
+  surface the zone topology to callers.
+- **CC #74 ("third dimension of control")** routed through the new
+  [`Voice::set_timbre`] hook. MPE Manager broadcasts to every voice
+  in the zone; Member only reaches its own voice. Non-MPE channels
+  route plainly.
+- **RPN 1 (Channel Fine Tuning)** — 14-bit data-entry value maps
+  linearly to ±100 cents (centre 0x40/0x00). Stored as both the raw
+  accumulator and the derived cents view on `ChannelState` so an
+  MSB-then-LSB sequence composes bit-exact.
+- **RPN 2 (Channel Coarse Tuning)** — CC 6 MSB sets signed semitone
+  offset centred on 0x40 (-64..=+63). CC 38 LSB ignored per spec
+  ("the LSB is always 0").
+- **RPN 5 (Modulation Depth Range)** per
+  `docs/audio/midi/recommended-practices/ca26-RPN05-Modulation-Depth-Range.pdf`:
+  CC 6 sets whole-cent range, CC 38 sets fractional cents (0..=99).
+  Default 50 cents matches the GM 2 recommended practice. Clamped
+  to ≤ 2400 cents (±2 octaves) so a stray CC 6 = 127 can't pop the
+  timbre out of audibility.
+- **CC 1 (Modulation Wheel)** routed via
+  [`Mixer::set_mod_wheel`] → [`Voice::set_mod_depth_cents`] using
+  the channel's RPN-5 range. Applied to every held voice plus
+  picked up at note-on for new voices.
+- **Universal Real-Time SysEx — Master Volume** (`F0 7F <dev> 04 01
+  lsb msb F7`): the 14-bit value applies as a multiplicative global
+  gain at mix time.
+- **Universal Real-Time SysEx — Master Fine Tuning / Master Coarse
+  Tuning** per
+  `docs/audio/midi/recommended-practices/ca25-Master-Fine-Coarse-Tuning-SysEx-Message.pdf`:
+  Fine is ±100 cents centred on 0x40/0x00 (formula
+  `100/8192 × (value - 0x2000)`); Coarse is a signed semitone count
+  centred on 0x40 with the LSB always 0 per spec. Both sum with the
+  per-channel RPN-1 / RPN-2 tuning + the live pitch bend into the
+  effective cents pushed to each voice. Drum channel (MIDI 10 =
+  index 9) is exempt from all tuning per CA-25's "MUST NOT result in
+  MIDI note-shifting" clause.
+- **Universal Non-Real-Time SysEx — GM 1 / GM 2 System On + GM
+  System Off** (sub-IDs `09 01` / `09 02` / `09 03`) reset the
+  mixer's master state to GM defaults: master volume → max, master
+  fine / coarse tuning → centre, all sounding notes off.
+- **Voice trait extension**: `set_mod_depth_cents` + `set_timbre`
+  default-no-op methods so existing voices keep working unchanged.
+- **Per-channel state expansion**: `ChannelState` gains
+  `mod_wheel`, `mod_depth_range_cents`, `channel_fine_tune_cents`,
+  `channel_fine_tune_raw_14`, `channel_coarse_tune_semitones`, and
+  `mpe_role` fields. All zero / centre by default so existing tests
+  see unchanged routing.
+- **Tests added**: 38 new — 27 lib-side mixer (RPN 1 / 2 / 5
+  data-entry, channel + master fine/coarse routing, drum channel
+  exemption, master volume scaling, mod-wheel routing, CC 74
+  routing, MPE zone assignment + role tagging + PB sensitivity
+  defaults + zero-members deactivate + Upper zone, Member + Manager
+  PB combining, Manager CC 74 broadcast, Member CC 74 isolation,
+  Polyphonic Key Pressure dropped on Member, Member + Manager
+  pressure combining, zone-conflict resolution, MCM via the data-
+  entry pathway, MCM on a non-Manager channel ignored), 6 lib-side
+  scheduler (CC 1 / CC 74 / Master Volume / Master Fine / Master
+  Coarse / GM-on routing + MCM via SMF), and 5 new integration
+  (`tests/mpe_and_master_tuning.rs`) checking the public
+  `MidiDecoder` surface. Total: 189 lib + 11 integration = 200
+  passing (was 156 + 6 = 162).
+
+Wall respected: every change in this round used only
+`docs/audio/midi/extensions/M1-100-UM_v1-1_MIDI_Polyphonic_Expression_Specification.pdf`
+(pages 1–28), `docs/audio/midi/recommended-practices/ca25-Master-Fine-Coarse-Tuning-SysEx-Message.pdf`,
+`docs/audio/midi/recommended-practices/ca26-RPN05-Modulation-Depth-Range.pdf`,
+`docs/audio/midi/midi-1.0/Universal-System-Exclusive-Messages.pdf`,
+plus the in-tree crate sources + `oxideav-core`'s public API. No
+external library source consulted, paraphrased, or cross-checked.
+
+
 ## [0.0.1](https://github.com/OxideAV/oxideav-midi/compare/v0.0.0...v0.0.1) - 2026-05-04
 
 ### Other

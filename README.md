@@ -83,12 +83,43 @@ framework but usable standalone.
   to per-voice pressure, RPN 0 (pitch-bend range) handling, and
   exclusive-class drum cuts. Native stereo voices (SF2 stereo zones)
   are rendered through their own L/R buses, bypassing the mono-pan
-  law.
-- `scheduler` — **round-3** SMF event scheduler. Merges every track
-  into a single time-ordered stream, converts ticks → samples against
-  the current tempo + division (`samples_per_tick = us_per_quarter *
-  sample_rate / (1_000_000 * ticks_per_quarter)`), and dispatches
-  every event into the mixer at the right audio sample.
+  law. Round 75 adds: **RPN 1** (channel fine tune, ±100 c) /
+  **RPN 2** (channel coarse tune, ±63 semis) / **RPN 5** (modulation
+  depth range, CA-26) / **RPN 6** (MPE Configuration Message — see
+  below); CC 1 (mod wheel) routed to voices through the new
+  [`Voice::set_mod_depth_cents`] hook; CC 74 (MPE "third dimension" /
+  brightness) routed through [`Voice::set_timbre`]. Master state on
+  the mixer adds **Master Volume** (Universal Real-Time SysEx
+  `7F 7F 04 01`) applied as a global gain at mix-time, and
+  **Master Fine / Master Coarse Tuning** (CA-25, sub-IDs `04 03` /
+  `04 04`) summed with the per-channel fine + coarse tune to derive
+  the effective pitch each voice receives. Drum channel (MIDI 10 =
+  index 9) is exempt from tuning per CA-25.
+- `mixer::MpeZone` / `mixer::MpeRole` — MIDI Polyphonic Expression
+  (M1-100-UM v1.1) support. The MCM (RPN 0x0006 on channel 0 for
+  Lower, channel 15 for Upper) configures one or two zones; each
+  zone's Manager Channel carries zone-wide CCs and its Member
+  Channels host per-note Pitch Bend / Channel Pressure / CC 74.
+  Per Appendix C the Member Channel pitch bend sums in cents with
+  the Manager's bend before reaching the voice. Per §2.2.5 the
+  receiver sets default PB Sensitivity to 2 semitones on the
+  Manager and 48 semitones on every Member at MCM time. Per §2.2.7
+  Polyphonic Key Pressure on a Member is silently dropped. Per
+  §2.2.3 a zone reconfiguration stops every Sounding Note on the
+  affected channels and resets their controllers.
+- `scheduler` — SMF event scheduler. Merges every track into a single
+  time-ordered stream, converts ticks → samples against the current
+  tempo + division (`samples_per_tick = us_per_quarter * sample_rate /
+  (1_000_000 * ticks_per_quarter)`), and dispatches every event into
+  the mixer at the right audio sample. Round 75 wires the Universal
+  Real-Time / Non-Real-Time SysEx surface: GM 1 / GM 2 System On
+  (sub-IDs `09 01` / `09 03`) reset all controllers + master tuning
+  + master volume; GM System Off (`09 02`) does the same; Master
+  Volume (`04 01`), Master Fine Tuning (`04 03`) + Master Coarse
+  Tuning (`04 04`) all route into the mixer's master-state setters.
+  CC 1 / CC 74 are pumped into the new mixer hooks; the MPE
+  Configuration Message (RPN 6 on the Lower / Upper Manager Channel)
+  reaches the mixer via the existing RPN data-entry pipeline.
 - `downloader` — stub that names a planned default bank (TimGM6mb) but
   currently returns `Error::Unsupported`.
 
@@ -100,14 +131,28 @@ and the voice pool have run dry. Without an on-disk bank the
 registry-built decoder uses the pure-tone fallback; for SoundFont 2
 playback build a `MidiDecoder` directly with an `Sf2Instrument`.
 
-Coverage today (round 9): full SF2 voice with sm24 24-bit samples,
+Coverage today (round 75): full SF2 voice with sm24 24-bit samples,
 stereo zones, DAHDSR volume + modulation envelopes, low-pass biquad
 filter (gens 8/9), modEnv→pitch / modEnv→filter routing (gens 7/11),
-exclusive-class drum cuts (gen 57), pitch bend with RPN 0 range,
-channel/poly aftertouch; **SFZ voice generator** with DAHDSR amplitude
-envelope (`ampeg_*`) and vibrato LFO (`lfo01_freq` / `lfo01_pitch`);
-**DLS Level 1 + 2 voice generator** (parser-driven region selection,
-wsmp loop info, unmodulated sample playback — articulation `art1`/
-`art2` block interpretation is round 2). All three instrument paths
-share one `SamplePlayer` voice for sample playback + DAHDSR + vibrato +
-pitch bend.
+exclusive-class drum cuts (gen 57); pitch bend with **RPN 0 / 1 / 2 /
+5 / 6** (range, channel fine tune, channel coarse tune, modulation
+depth range, MPE configuration); channel/poly aftertouch; **SFZ voice
+generator** with DAHDSR amplitude envelope (`ampeg_*`) and vibrato
+LFO (`lfo01_freq` / `lfo01_pitch`); **DLS Level 1 + 2 voice
+generator** (parser-driven region selection, wsmp loop info,
+unmodulated sample playback — articulation `art1`/`art2` block
+interpretation deferred). All three instrument paths share one
+`SamplePlayer` voice for sample playback + DAHDSR + vibrato + pitch
+bend.
+
+Round 75 also delivers the **MIDI Polyphonic Expression (MPE)** v1.1
+control surface (M1-100-UM): MCM-driven Lower / Upper zone
+configuration, per-note pitch bend / channel pressure / CC #74 on
+Member Channels, Appendix-C combining of Member + Manager pitch
+bend, §2.2.5 default 48-semi Member PB sensitivity, §2.2.7 drop of
+Polyphonic Key Pressure on Member Channels, §2.2.3 sounding-note
+reset on zone reconfiguration. Plus **Universal Real-Time SysEx**
+Master Volume (`F0 7F <dev> 04 01 lsb msb F7`), Master Fine /
+Master Coarse Tuning (CA-25, `04 03` / `04 04`), and GM 1 / GM 2
+System On / GM System Off (Non-Real-Time, `09 01` / `09 02` /
+`09 03`).

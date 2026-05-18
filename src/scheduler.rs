@@ -219,10 +219,16 @@ impl Scheduler {
             // SMPTE offset, sequencer-specific, …) carry no playback
             // semantics for round-3.
             Event::Meta(_) => {}
-            // Sysex events are ignored too — GM-on resets and the like
-            // are common, but round-3 has no synth-engine state to
-            // reset besides what `Mixer::all_notes_off` already covers.
-            Event::Sysex { .. } => {}
+            // Sysex events: route the Universal Non-Real-Time / Real-Time
+            // payloads we recognise (GM On/Off, Master Volume, Master
+            // Fine/Coarse Tuning per CA-25). Everything else is silently
+            // ignored — manufacturer-specific blobs carry no playback
+            // semantics for round 75's renderer.
+            Event::Sysex { escape, data } => {
+                if !escape {
+                    dispatch_universal_sysex(data, mixer);
+                }
+            }
         }
     }
 
@@ -263,18 +269,20 @@ impl Scheduler {
                 mixer.channel_state_mut(channel).program = program;
             }
             ChannelBody::ControlChange { controller, value } => match controller {
+                1 => mixer.set_mod_wheel(channel, value), // CC 1 — Modulation Wheel
                 6 => mixer.set_data_entry(channel, value, true), // RPN data MSB
                 7 => mixer.channel_state_mut(channel).volume = value,
                 10 => mixer.channel_state_mut(channel).pan = value,
                 38 => mixer.set_data_entry(channel, value, false), // RPN data LSB
                 64 => mixer.set_sustain(channel, value),
+                74 => mixer.set_timbre(channel, value), // MPE "third dimension" (CC #74)
                 100 => mixer.set_rpn_byte(channel, value, false), // RPN LSB
-                101 => mixer.set_rpn_byte(channel, value, true),  // RPN MSB
+                101 => mixer.set_rpn_byte(channel, value, true), // RPN MSB
                 120 | 123 => {
                     // CC 120 = All Sound Off, CC 123 = All Notes Off.
                     mixer.all_notes_off();
                 }
-                _ => { /* other CCs not modelled in round 4 */ }
+                _ => { /* other CCs not modelled */ }
             },
             ChannelBody::PolyAftertouch { key, pressure } => {
                 mixer.set_poly_pressure(channel, key, pressure);
@@ -319,6 +327,105 @@ impl Scheduler {
         } else {
             0
         }
+    }
+}
+
+/// Walk one decoded SMF [`Event::Sysex`] payload and dispatch any
+/// **Universal** SysEx message we model. The `data` slice is exactly
+/// what [`crate::smf`] stored — the bytes *after* the leading `F0`
+/// (the leading byte itself isn't in the slice). The trailing `F7`
+/// may or may not be present per spec; we accept both shapes.
+///
+/// Recognised payloads (per
+/// `docs/audio/midi/midi-1.0/Universal-System-Exclusive-Messages.pdf`):
+///
+/// * **Non-Real-Time `7E`** — sub-ID #1:
+///   * `09` General MIDI — sub-ID #2 `01` (GM1 On) / `02` (GM Off) /
+///     `03` (GM2 On). All three currently map to
+///     [`Mixer::all_notes_off`] + reset of master volume / fine /
+///     coarse / mod-wheel / RPN state to defaults. GM2 On additionally
+///     bumps the default mod-depth-range to 50 cents (already the
+///     default).
+/// * **Real-Time `7F`** — sub-ID #1 `04` (Device Control):
+///   * `01` Master Volume (`F0 7F <dev> 04 01 lsb msb F7`). 14-bit
+///     value applied via [`Mixer::set_master_volume_14`].
+///   * `03` Master Fine Tuning (CA-25) — applied via
+///     [`Mixer::set_master_fine_tuning`].
+///   * `04` Master Coarse Tuning (CA-25) — applied via
+///     [`Mixer::set_master_coarse_tuning`].
+///
+/// All other Universal SysEx messages (sample dumps, file refs, MTC
+/// cueing, MMC, …) are silently ignored — they carry no semantics for
+/// the round-3 renderer.
+pub fn dispatch_universal_sysex(data: &[u8], mixer: &mut crate::mixer::Mixer) {
+    if data.len() < 3 {
+        return;
+    }
+    // Strip the optional trailing F7 so the payload offsets line up
+    // either way.
+    let payload = if *data.last().unwrap() == 0xF7 {
+        &data[..data.len() - 1]
+    } else {
+        data
+    };
+    match payload[0] {
+        // 7E = Universal Non-Real-Time
+        0x7E => dispatch_universal_non_real_time(payload, mixer),
+        // 7F = Universal Real-Time
+        0x7F => dispatch_universal_real_time(payload, mixer),
+        _ => { /* manufacturer-specific — not modelled */ }
+    }
+}
+
+/// `F0 7E <dev> <sub1> <sub2> ... F7` — the data slice passed here is
+/// `7E <dev> <sub1> <sub2> ...` (trailing F7 already stripped).
+fn dispatch_universal_non_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer) {
+    if payload.len() < 4 {
+        return;
+    }
+    let sub_id1 = payload[2];
+    let sub_id2 = payload[3];
+    if sub_id1 == 0x09 && matches!(sub_id2, 0x01..=0x03) {
+        // General MIDI System On (01) / Off (02) / GM2 On (03).
+        // Reset playback state to GM defaults. Per the MIDI 1.0
+        // spec + GM2 R/P, the receiver "resets all controllers
+        // and turns off all notes" on GM-on.
+        mixer.all_notes_off();
+        mixer.set_master_volume_14(0x3FFF);
+        mixer.set_master_fine_tuning(0, 0x40); // centre
+        mixer.set_master_coarse_tuning(0, 0x40); // centre
+    }
+}
+
+/// `F0 7F <dev> <sub1> <sub2> ... F7` — the data slice passed here is
+/// `7F <dev> <sub1> <sub2> ...` (trailing F7 already stripped).
+fn dispatch_universal_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer) {
+    if payload.len() < 4 {
+        return;
+    }
+    let sub_id1 = payload[2];
+    let sub_id2 = payload[3];
+    if sub_id1 != 0x04 || payload.len() < 6 {
+        return;
+    }
+    // Device Control.
+    match sub_id2 {
+        0x01 => {
+            // Master Volume: `04 01 lsb msb`.
+            let lsb = payload[4] & 0x7F;
+            let msb = payload[5] & 0x7F;
+            let combined = ((msb as u16) << 7) | (lsb as u16);
+            mixer.set_master_volume_14(combined);
+        }
+        0x03 => {
+            // Master Fine Tuning (CA-25): `04 03 lsb msb`.
+            mixer.set_master_fine_tuning(payload[4], payload[5]);
+        }
+        0x04 => {
+            // Master Coarse Tuning (CA-25): `04 04 00 msb`.
+            mixer.set_master_coarse_tuning(payload[4], payload[5]);
+        }
+        _ => {}
     }
 }
 
@@ -560,6 +667,122 @@ mod tests {
         // voice still alive". Detailed routing is covered in mixer tests.
         s.step(8192, &mut mixer, &inst);
         assert_eq!(mixer.live_voice_count(), 1);
+    }
+
+    #[test]
+    fn cc1_mod_wheel_propagates_via_scheduler() {
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[0x00, 0xB0, 1, 100]); // CC 1 = 100
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(4096, &mut mixer, &inst);
+        assert_eq!(mixer.channel_state(0).mod_wheel, 100);
+    }
+
+    #[test]
+    fn cc74_timbre_does_not_panic_via_scheduler() {
+        // CC 74 has no per-channel field on ChannelState (it's a
+        // pure routed message); just check the dispatcher routes
+        // it without panicking.
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // note on
+        ev.extend_from_slice(&[0x10, 0xB0, 74, 96]); // CC 74 = 96
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.live_voice_count(), 1);
+    }
+
+    #[test]
+    fn universal_master_volume_sysex_routes_to_mixer() {
+        // F0 [len=7] 7F 7F 04 01 lsb=0x00 msb=0x40 F7  → 14-bit = 0x2000 (~half).
+        // The SMF Sysex payload includes the trailing F7 + everything
+        // *after* the F0, so its length is 7 bytes.
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[0x00, 0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x01, 0x00, 0x40, 0xF7]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.master_volume_14(), 0x2000);
+    }
+
+    #[test]
+    fn universal_master_fine_tuning_sysex_routes() {
+        // F0 [len=7] 7F 7F 04 03 lsb=0x00 msb=0x60 F7  → +50 cents.
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[0x00, 0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x03, 0x00, 0x60, 0xF7]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        let c = mixer.master_fine_tune_cents();
+        assert!((49..=50).contains(&c), "got {c}");
+    }
+
+    #[test]
+    fn universal_master_coarse_tuning_sysex_routes() {
+        // F0 [len=7] 7F 7F 04 04 00 0x4C F7  → +12 semis.
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[0x00, 0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x04, 0x00, 0x4C, 0xF7]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.master_coarse_tune_semitones(), 12);
+    }
+
+    #[test]
+    fn universal_gm_on_sysex_resets_state() {
+        // First push master state away from defaults, then send GM
+        // System On — state should be reset.
+        let mut ev = Vec::new();
+        // Master Volume = 0x1000 (len=7).
+        ev.extend_from_slice(&[0x00, 0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x01, 0x00, 0x20, 0xF7]);
+        // GM1 System On: F0 [len=5] 7E 7F 09 01 F7.
+        ev.extend_from_slice(&[0x10, 0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        // Master volume back to full per GM-on reset.
+        assert_eq!(mixer.master_volume_14(), 0x3FFF);
+        assert_eq!(mixer.master_fine_tune_cents(), 0);
+        assert_eq!(mixer.master_coarse_tune_semitones(), 0);
+    }
+
+    #[test]
+    fn mcm_via_smf_data_entry_assigns_mpe_zone() {
+        // Lower MCM: B0 65 00 B0 64 06 B0 06 04  (n=0 mm=4).
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[0x00, 0xB0, 0x65, 0x00]);
+        ev.extend_from_slice(&[0x00, 0xB0, 0x64, 0x06]);
+        ev.extend_from_slice(&[0x00, 0xB0, 0x06, 0x04]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        let zone = mixer
+            .mpe_zone(crate::mixer::MpeZoneKind::Lower)
+            .expect("MCM must have created the lower zone");
+        assert_eq!(zone.members, 4);
+        assert!(mixer.channel_state(0).mpe_role.is_manager());
     }
 
     #[test]

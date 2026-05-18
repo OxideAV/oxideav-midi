@@ -53,13 +53,23 @@
 //!     * **[`instruments::tone`]** — sine/triangle/saw/square
 //!       fallback so the synth produces *something* even when no
 //!       on-disk bank is present.
-//! * **[`mixer`]** — round-3 polyphonic voice pool (32 voices) with
-//!   stereo mixdown, per-channel volume / pan / sustain pedal handling,
-//!   and oldest-voice preemption when the pool is full.
-//! * **[`scheduler`]** — round-3 SMF event scheduler. Merges every
-//!   track into a single time-ordered stream, converts ticks → samples
-//!   against the current tempo + division, and dispatches each event
-//!   into the mixer at the right audio sample.
+//! * **[`mixer`]** — polyphonic voice pool (32 voices) with stereo
+//!   mixdown, per-channel volume / pan / sustain pedal handling, and
+//!   oldest-voice preemption when the pool is full. Round 75 adds the
+//!   full RPN 1 / RPN 2 / RPN 5 control surface (channel fine + coarse
+//!   tune + modulation-depth range), CC 1 (mod wheel) → per-voice
+//!   depth, CC 74 (MPE "third dimension") → per-voice timbre, the
+//!   `MpeZone` / `MpeRole` topology built from MCM messages, and
+//!   universal-SysEx-driven master volume / master fine / master
+//!   coarse tuning that sum with per-channel tuning into the
+//!   effective pitch each voice receives.
+//! * **[`scheduler`]** — SMF event scheduler. Merges every track into a
+//!   single time-ordered stream, converts ticks → samples against the
+//!   current tempo + division, and dispatches each event into the
+//!   mixer at the right audio sample. Round 75 wires the Universal
+//!   Real-Time / Non-Real-Time SysEx routing: GM 1 / GM 2 / GM Off
+//!   reset, CA-25 Master Fine / Master Coarse Tuning, Master Volume,
+//!   plus the CC 1 / CC 74 / MPE-MCM channel-CC paths.
 //! * **[`downloader`]** — stub that names a planned default bank
 //!   (TimGM6mb) but currently returns [`Error::Unsupported`].
 //!
