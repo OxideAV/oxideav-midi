@@ -30,9 +30,17 @@
 //!   `wlnk` cue-table references, and `art1` / `art2` connection
 //!   blocks. `make_voice` picks the matching instrument by program,
 //!   picks a region by (key, velocity), resolves wlnk → ptbl →
-//!   wave-pool, decodes the PCM, and plays the sample through the
-//!   shared [`sample_voice::SamplePlayer`]. `art1`/`art2` connection-
-//!   block evaluation is deferred to round 2.
+//!   wave-pool, decodes the PCM, evaluates the region + instrument
+//!   articulation through [`articulation::Articulation`] (round 80),
+//!   and plays the sample through the shared
+//!   [`sample_voice::SamplePlayer`] with the resolved DAHDSR envelope
+//!   + vibrato LFO + tuning + gain applied.
+//! - [`articulation`] is the DLS Level 1/2 connection-block evaluator
+//!   used by [`dls`] at voice-build time. Honours the `SRC_NONE →
+//!   DST_x` default-override connections for the Vol EG, the
+//!   modulator + vibrato LFO, tuning, gain and pan, plus a handful of
+//!   `SRC_x → DST_y` modulator routings — see the module's doc for
+//!   the supported subset.
 //! - [`sample_voice`] is the shared sample-playback voice both `sfz`
 //!   and `dls` use. Mono in, mono out — the [`mixer`](crate::mixer)
 //!   handles stereo panning. Covers DAHDSR amplitude envelope, four
@@ -46,6 +54,7 @@
 
 use oxideav_core::Result;
 
+pub mod articulation;
 pub mod dls;
 pub mod sample_voice;
 pub mod sf2;

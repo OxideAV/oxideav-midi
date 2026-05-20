@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 80 — DLS `art1` / `art2` articulation interpretation
+
+- New module `instruments::articulation` interpreting DLS Level 1 and
+  Level 2 connection blocks at voice-build time. Backed by MMA DLS
+  Level 1 v1.1b (`docs/audio/midi/instrument-formats/dls1v11b.pdf`,
+  Table 1 + 2 of the Device Architecture section) and MMA DLS Level 2.2
+  v1.0 Amendment 2 (`docs/audio/midi/instrument-formats/dls2amd2(all)a(pub).pdf`,
+  Tables 5–10).
+- Named constants for every `CONN_SRC_*` / `CONN_DST_*` / `CONN_TRN_*`
+  enum from DLS2 Tables 8 + 9 + 10, plus `ABSOLUTE_ZERO` sentinel,
+  exported from `instruments::articulation` so callers can build
+  blocks programmatically (used by the new
+  `crates/oxideav-midi/tests/dls_articulation.rs` integration test).
+- New `Articulation::evaluate(region_blocks, instrument_blocks) ->
+  Articulation` walks the region-level then instrument-level
+  connection lists, overlaying every recognised connection on top of
+  the spec defaults (DLS2 Tables 5 + 6). Per the DLS spec, a region
+  block overrides the corresponding instrument-level block.
+- Supported `SRC_NONE → DST_x` connections (the "absolute default
+  override" branch): Vol EG (EG1) delay / attack / hold / decay /
+  sustain / release; Mod EG (EG2) delay / attack / hold / decay /
+  sustain / release (raw, surfaced for a later round); modulator LFO
+  frequency + start delay; vibrato LFO frequency + start delay;
+  filter cutoff (DST_FILTER_CUTOFF) and Q; tuning (DST_PITCH);
+  per-region gain (DST_GAIN); pan (DST_PAN).
+- Supported modulator routings: `SRC_LFO → DST_PITCH` (vibrato depth
+  on DLS1-style banks where LFO and vibrato share a source);
+  `SRC_LFO → DST_GAIN` (tremolo depth); `SRC_VIBRATO → DST_PITCH`
+  (dedicated DLS2 vibrato depth — wins over `SRC_LFO → DST_PITCH`
+  when both are present); `SRC_EG2 → DST_PITCH` and `SRC_EG2 →
+  DST_FILTER_CUTOFF` (mod-env routings, raw); `SRC_KEYONVELOCITY →
+  DST_EG1_ATTACKTIME` (velocity-dependent attack, raw).
+- `DlsInstrument::make_voice` now calls
+  `Articulation::evaluate(&region.articulation, &inst.articulation)`
+  and folds the resulting [`EnvelopeParams`] + [`VibratoParams`] +
+  tuning cents + gain multiplier into the `SamplePlayerConfig`. An
+  empty `lart` list still falls back to the SamplePlayer defaults so
+  banks with no articulation are bit-identical to round-75 output.
+- Unit conversions: time-cents → seconds (DLS §1.14.3, clamped at
+  60 s), absolute-pitch → cents (DLS §1.14.1, clamped at ±14 400),
+  absolute-pitch → Hz (LFO frequency, clamped at 50 Hz), gain → linear
+  amplitude (DLS §1.14.4, clamped at -96..+48 dB), sustain-percent
+  → 0..=1, pan-percent → ±50.
+- New integration test `tests/dls_articulation.rs` exercises the full
+  SMF → scheduler → DLS bank → articulation → SamplePlayer → PCM path:
+  a `SRC_NONE → DST_PITCH @ +1200 cents` block produces an audibly
+  different rendering than the same bank with no `lart` list (avg
+  pointwise PCM diff > 50 LSB); a `SRC_NONE → DST_EG1_RELEASETIME`
+  block at +2 s sustains a louder release tail than the default 100 ms.
+- 9 new unit tests in `instruments::articulation`: spec-default
+  fallback when both lists are empty; region overrides instrument;
+  instrument-level fallback when region is silent; tuning cents
+  conversion; LFO → pitch routes to the vibrato depth; DLS2 vibrato
+  source takes precedence over the mod LFO source; gain destination
+  attenuates correctly (-6 dB → 0.5012 linear); ABSOLUTE_ZERO sentinel
+  is skipped without overriding the default; unrecognised connections
+  are dropped silently.
+
+Total test count: 199 lib + 13 integration = 212 (up from 190 + 11 in
+round 75).
+
 ### Round 75 — MPE + RPN expansion + Master Tuning / Master Volume SysEx
 
 - **MIDI Polyphonic Expression (MPE) v1.1** end-to-end

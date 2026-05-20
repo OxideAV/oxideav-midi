@@ -60,20 +60,41 @@ framework but usable standalone.
   from `lfo01_freq` / `lfo01_pitch` / `lfo01_delay`. `#include` is
   rejected with `Error::Unsupported`; `#define` is preserved verbatim.
 - `instruments::dls` — DLS Level 1 + 2 RIFF reader **plus voice
-  generator**. Walks the `RIFF/DLS ` form (`colh` / `vers` / `ptbl` /
-  `lins-list` / `wvpl-list` / `INFO-list`), surfaces the parsed bank
-  with instrument → region → wave-pool topology, `wsmp` loop / pitch /
+  generator** with **articulation interpretation** (round 80). Walks
+  the `RIFF/DLS ` form (`colh` / `vers` / `ptbl` / `lins-list` /
+  `wvpl-list` / `INFO-list`), surfaces the parsed bank with
+  instrument → region → wave-pool topology, `wsmp` loop / pitch /
   gain headers, `wlnk` cue-table references, and `art1` / `art2`
-  articulation connection blocks (raw — connection enums not
-  interpreted). Voice generation picks the matching instrument by MIDI
-  program, picks a region by (key, velocity), resolves the `wlnk` →
-  `ptbl` → wave-pool entry, decodes the PCM (8/16-bit WAV-shaped) into
-  mono f32, shifts pitch off the `wsmp.unity_note`, and plays the
-  sample through the shared sample-playback voice. Loop modes: forward
-  loop (`WLOOP_TYPE_FORWARD`, DLS1) and release loop
-  (`WLOOP_TYPE_RELEASE`, DLS2). `art1`/`art2` connection-block
-  evaluation is deferred — the parsed blocks remain on the bank for
-  round-2 callers.
+  articulation connection blocks. Voice generation picks the matching
+  instrument by MIDI program, picks a region by (key, velocity),
+  resolves the `wlnk` → `ptbl` → wave-pool entry, decodes the PCM
+  (8/16-bit WAV-shaped) into mono f32, shifts pitch off the
+  `wsmp.unity_note`, evaluates the region + instrument articulation
+  through `instruments::articulation::Articulation::evaluate`, and
+  plays the sample through the shared sample-playback voice with the
+  resolved DAHDSR envelope + vibrato LFO + tuning + gain applied.
+  Loop modes: forward loop (`WLOOP_TYPE_FORWARD`, DLS1) and release
+  loop (`WLOOP_TYPE_RELEASE`, DLS2).
+- `instruments::articulation` — DLS Level 1/2 connection-block
+  evaluator backed by MMA DLS1 v1.1b Tables 1–2 + MMA DLS2.2 v1.0
+  Amendment 2 Tables 5–10. Named constants for every `CONN_SRC_*` /
+  `CONN_DST_*` / `CONN_TRN_*` enum + the `ABSOLUTE_ZERO` sentinel.
+  Supported `SRC_NONE → DST_x` defaults: Vol EG DAHDSR (delay /
+  attack / hold / decay / sustain / release), Mod EG DAHDSR (raw —
+  surfaced for a later round), modulator + vibrato LFO frequency +
+  start delay, filter cutoff + Q, tuning, gain, pan. Supported
+  modulator routings: `SRC_LFO → DST_PITCH` (vibrato on DLS1),
+  `SRC_LFO → DST_GAIN` (tremolo), `SRC_VIBRATO → DST_PITCH`
+  (dedicated DLS2 vibrato — wins over the LFO routing),
+  `SRC_EG2 → DST_PITCH` + `SRC_EG2 → DST_FILTER_CUTOFF` (mod-env,
+  raw), `SRC_KEYONVELOCITY → DST_EG1_ATTACKTIME` (raw). Unit
+  conversions: time-cents → seconds (clamped at 60 s), absolute-pitch
+  → cents (clamped at ±14 400), absolute-pitch → Hz for LFO frequency
+  (clamped at 50 Hz), gain → linear (clamped at -96..+48 dB),
+  sustain-percent → 0..=1, pan-percent → ±50. Region blocks override
+  instrument-level blocks per spec; an empty `lart` list falls back
+  to SamplePlayer defaults so banks with no articulation are
+  byte-identical to round-75 output.
 - `instruments::tone` — pure-tone fallback (sine / triangle / saw /
   square) so the synth produces *something* even with no on-disk
   bank.
@@ -131,7 +152,7 @@ and the voice pool have run dry. Without an on-disk bank the
 registry-built decoder uses the pure-tone fallback; for SoundFont 2
 playback build a `MidiDecoder` directly with an `Sf2Instrument`.
 
-Coverage today (round 75): full SF2 voice with sm24 24-bit samples,
+Coverage today (round 80): full SF2 voice with sm24 24-bit samples,
 stereo zones, DAHDSR volume + modulation envelopes, low-pass biquad
 filter (gens 8/9), modEnv→pitch / modEnv→filter routing (gens 7/11),
 exclusive-class drum cuts (gen 57); pitch bend with **RPN 0 / 1 / 2 /
@@ -139,11 +160,13 @@ exclusive-class drum cuts (gen 57); pitch bend with **RPN 0 / 1 / 2 /
 depth range, MPE configuration); channel/poly aftertouch; **SFZ voice
 generator** with DAHDSR amplitude envelope (`ampeg_*`) and vibrato
 LFO (`lfo01_freq` / `lfo01_pitch`); **DLS Level 1 + 2 voice
-generator** (parser-driven region selection, wsmp loop info,
-unmodulated sample playback — articulation `art1`/`art2` block
-interpretation deferred). All three instrument paths share one
-`SamplePlayer` voice for sample playback + DAHDSR + vibrato + pitch
-bend.
+generator** with `art1`/`art2` connection-block interpretation
+(round 80) — Vol EG DAHDSR, vibrato LFO, tuning, gain, pan, plus the
+well-known `SRC_LFO → DST_PITCH` / `SRC_VIBRATO → DST_PITCH` /
+`SRC_LFO → DST_GAIN` routings; mod-env (EG2) + filter cutoff
+interpretation surfaces raw values but isn't wired into the
+SamplePlayer yet. All three instrument paths share one `SamplePlayer`
+voice for sample playback + DAHDSR + vibrato + pitch bend.
 
 Round 75 also delivers the **MIDI Polyphonic Expression (MPE)** v1.1
 control surface (M1-100-UM): MCM-driven Lower / Upper zone

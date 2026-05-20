@@ -29,13 +29,18 @@
 //!   pointing into the wave-pool table, and an optional `lart` / `lar2`
 //!   articulation list.
 //! - **Articulation blocks**: `art1-ck` (DLS1) and `art2-ck` (DLS2)
-//!   are parsed into a flat `Vec<DlsConnectionBlock>` (5-field records
-//!   per the spec). The connection enums themselves are not interpreted
-//!   in round 1 — each block is stored with raw `usSource` /
-//!   `usControl` / `usDestination` / `usTransform` / `lScale` values
-//!   ready for the round-2 voice generator. We do remember whether the
-//!   block came from `art1` or `art2` so a round-2 caller can pick the
-//!   right connection table (table 8 vs tables 9 + 10 in DLS2.2).
+//!   are parsed into a flat `Vec<DlsArticulationBlock>` (5-field
+//!   records per the spec) and **interpreted** by
+//!   [`super::articulation::Articulation::evaluate`] at voice-build
+//!   time (round 80). The interpreter honours `SRC_NONE → DST_x`
+//!   "absolute default override" connections for the Vol EG DAHDSR
+//!   (delay / attack / hold / decay / sustain / release), the
+//!   modulator + vibrato LFO frequency + start delay, `DST_PITCH`
+//!   (tuning), `DST_GAIN` (attenuation), `DST_PAN`, plus the
+//!   well-known `SRC_LFO → DST_PITCH` / `SRC_LFO → DST_GAIN` /
+//!   `SRC_VIBRATO → DST_PITCH` / `SRC_EG2 → DST_PITCH` /
+//!   `SRC_EG2 → DST_FILTER_CUTOFF` modulator routings. Unrecognised
+//!   blocks remain on the bank for a future round.
 //! - **`vers-ck`**: surfaces both 32-bit halves; round-1 callers can
 //!   inspect `DlsBank::version` to tell DLS1 from DLS2, but we honour
 //!   `art1` / `art2` independently of the version number (some real
@@ -55,13 +60,20 @@
 //! `WLOOP_TYPE_RELEASE` (DLS2) maps to
 //! [`super::sample_voice::SampleLoopMode::LoopSustain`].
 //!
-//! What's deferred to round 2 (clear followups, no GitHub issues):
+//! What's deferred to a later round (clear followups, no GitHub issues):
 //!
-//! - `art1`/`art2` connection-block interpretation. Round-1 voice
-//!   generation uses the [`super::sample_voice::SamplePlayer`]
-//!   defaults (5 ms attack / 100 ms decay / full sustain / 100 ms
-//!   release, no vibrato); the parsed connection blocks remain on
-//!   the bank for a round-2 caller to walk and modulate from.
+//! - Mod-EG (EG2) routing into pitch + filter cutoff. The
+//!   [`super::articulation::Articulation`] evaluator extracts the EG2
+//!   parameters + the `SRC_EG2 → DST_PITCH` / `SRC_EG2 →
+//!   DST_FILTER_CUTOFF` scales but the SamplePlayer doesn't yet have a
+//!   mod-env or filter wired up, so those values are surfaced for
+//!   later consumption rather than rendered.
+//! - DLS2 filter cutoff/Q dynamic modulation (CC1, channel pressure,
+//!   key number → cutoff). The evaluator collects only the initial
+//!   `SRC_NONE → DST_FILTER_CUTOFF` value; the dynamic source
+//!   connections are left unhandled.
+//! - DLS2 surround channel-output destinations (CONN_DST_LEFT etc.) —
+//!   the mixer is stereo-only.
 //! - DLS2 `cdl-ck` conditional evaluation. Round 1 currently ignores
 //!   the conditional opcode stream and unconditionally parses every
 //!   surrounding chunk; this is the recommended fallback for "device
@@ -78,9 +90,8 @@ use std::sync::Arc;
 
 use oxideav_core::{Error, Result};
 
-use super::sample_voice::{
-    EnvelopeParams, SampleLoopMode, SamplePlayer, SamplePlayerConfig, VibratoParams,
-};
+use super::articulation::Articulation;
+use super::sample_voice::{SampleLoopMode, SamplePlayer, SamplePlayerConfig};
 use super::wav_pcm::decode_pcm_bytes;
 use super::{Instrument, Voice};
 
@@ -509,17 +520,29 @@ impl Instrument for DlsInstrument {
         })?;
 
         // 5. Build the SamplePlayer config. Region-level wsmp overrides
-        //    the wave-level default per the spec.
+        //    the wave-level default per the spec. The region's
+        //    articulation list overrides the instrument-level list (and
+        //    both feed into the [`Articulation`] evaluator).
         let wsmp = region.wsmp.as_ref().or(wave.wsmp.as_ref());
-        let cfg = build_dls_config(wsmp, &pcm.samples, pcm.sample_rate, key, velocity, region);
+        let art = Articulation::evaluate(&region.articulation, &inst.articulation);
+        let cfg = build_dls_config(
+            wsmp,
+            &pcm.samples,
+            pcm.sample_rate,
+            key,
+            velocity,
+            region,
+            &art,
+        );
         Ok(Box::new(SamplePlayer::new(cfg, sample_rate)))
     }
 }
 
 /// Build a [`SamplePlayerConfig`] from a DLS region + its resolved
-/// wave-sample header. Round-1 ignores `art1`/`art2` connection blocks
-/// and uses the SamplePlayer's default DAHDSR; the parsed articulation
-/// blocks remain on the bank for a round-2 caller.
+/// wave-sample header + an evaluated [`Articulation`] digest. Round-80
+/// folds the articulation envelope / vibrato LFO / tuning / gain into
+/// the player config so authored DLS banks shape the rendered audio
+/// rather than always falling back to SamplePlayer defaults.
 fn build_dls_config(
     wsmp: Option<&DlsWaveSample>,
     samples: &[f32],
@@ -527,22 +550,36 @@ fn build_dls_config(
     key: u8,
     velocity: u8,
     region: &DlsRegion,
+    art: &Articulation,
 ) -> SamplePlayerConfig {
-    // Pitch ratio: 2^((target - unity_note) / 12 + fine_tune/16384*100/100).
+    // Pitch ratio: 2^((target - unity_note) / 12 + fine_tune_cents/1200
+    // + articulation tuning cents).
+    //
     // DLS sFineTune is in units of 1/65536 of a semitone — treat as
     // signed 16-bit and divide by 65536 for the cents-per-semitone
     // conversion. Most banks use the simpler integer cents convention,
-    // so we treat fine_tune as raw "cents-ish" for round 1 and clamp
-    // its effect.
+    // so we treat fine_tune as raw cents and clamp via the cents path.
     let unity_note = wsmp.map(|w| w.unity_note as u8).unwrap_or(60);
     let fine_tune = wsmp.map(|w| w.fine_tune as i32).unwrap_or(0);
     let semitones = key as i32 - unity_note as i32;
-    let pitch_ratio = (2.0f64).powf(semitones as f64 / 12.0 + fine_tune as f64 / 1200.0);
+    let tuning_cents = fine_tune as f64 + art.tuning_cents as f64;
+    let pitch_ratio = (2.0f64).powf(semitones as f64 / 12.0 + tuning_cents / 1200.0);
 
     // Velocity curve: (vel/127)^2 with 50 % headroom so 8 voices fit
-    // under 0 dBFS.
+    // under 0 dBFS. Multiplied by the articulation gain (default 1.0)
+    // and the wsmp lAttenuation (in centibels: -1000 = -10 dB).
     let v = velocity as f32 / 127.0;
-    let amplitude = v * v * 0.5;
+    let mut amplitude = v * v * 0.5 * art.gain_linear;
+    if let Some(w) = wsmp {
+        // `gain` in DLS wsmp is centibels (1/10 dB); positive boosts,
+        // negative attenuates. Clamp at ±48 dB.
+        let cb = (w.gain as f32).clamp(-960.0, 480.0);
+        let db = cb / 10.0;
+        amplitude *= 10.0f32.powf(db / 20.0);
+    }
+    // Final amplitude must stay in 0..=1 so the mixer can sum many
+    // voices without clipping.
+    amplitude = amplitude.clamp(0.0, 1.0);
 
     // Loop info from wsmp. DLS1 stores `loop_type=0` (forward) and
     // `loop_type=1` (release loop, DLS2-only). A wsmp with no loops =
@@ -573,8 +610,8 @@ fn build_dls_config(
         loop_mode,
         pitch_ratio,
         amplitude,
-        envelope: EnvelopeParams::default(),
-        vibrato: VibratoParams::default(),
+        envelope: art.envelope(),
+        vibrato: art.vibrato(),
         // DLS key_group: drum-kit style "this group cuts every prior
         // voice in the same group". Maps onto the Voice trait's
         // `exclusive_class` directly. Round-1 doesn't filter by
