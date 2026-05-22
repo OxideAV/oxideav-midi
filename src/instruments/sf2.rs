@@ -1675,12 +1675,10 @@ impl Sf2Voice {
             if since >= self.release_samples {
                 return 0.0;
             }
-            // Exponential release from `release_start_level` to 0. We
-            // use the linear-interpolated -100 dB-floor approximation
-            // from FluidSynth: level *= 10^(-0.05 * t / release_seconds).
-            // Equivalently: end_level = start * 10^(-100/20) ≈ 1e-5 over
-            // the full release window. We use the simpler `start * (1 -
-            // x)^2` curve which sounds nearly identical and is cheaper.
+            // SF2 §8.1.2 "release VolEnv" specifies an exponential
+            // decay to silence; we use the simpler `start * (1 - x)^2`
+            // quadratic ease-out which sounds nearly identical at the
+            // SF2 -100 dB floor and is cheaper to compute per sample.
             let x = since as f32 / self.release_samples.max(1) as f32;
             let curve = (1.0 - x) * (1.0 - x);
             return self.release_start_level * curve;
