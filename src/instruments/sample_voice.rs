@@ -7,31 +7,45 @@
 //! coarse/fine tuning), pick a loop window (start/end frames + a
 //! [`SampleLoopMode`]), pick a DAHDSR amplitude envelope, and (for SFZ)
 //! a vibrato LFO. The SF2 path has its own [`Sf2Voice`](super::sf2::Sf2Voice)
-//! because it carries extra state (mod-env routings into pitch and
-//! filter cutoff, native stereo zones, sm24 24-bit samples) that the
-//! shared voice would have to optionalise; rather than bloat one struct
-//! with mostly-unused state, we keep two voice types side-by-side.
+//! because it carries extra state (native stereo zones, sm24 24-bit
+//! samples) that the shared voice would have to optionalise; rather
+//! than bloat one struct with mostly-unused state, we keep two voice
+//! types side-by-side.
 //!
 //! The voice runs on **mono** sample data — both SFZ and DLS samples
 //! that are conceptually mono are decoded to f32 mono before the voice
-//! sees them. Stereo SFZ/DLS samples are deferred (round 2 will fan the
-//! decoder out to two channels and mark the voice as stereo).
+//! sees them. Stereo SFZ/DLS samples are deferred (a later round will
+//! fan the decoder out to two channels and mark the voice as stereo).
 //!
-//! Round-1 articulation coverage:
-//! - **DAHDSR amplitude envelope** (always wired). Same shape as the
-//!   `Sf2Voice` / `ToneVoice`: linear attack from 0→1, hold at peak,
-//!   exponential-ish decay to sustain, exponential release on note-off.
+//! Articulation coverage:
+//! - **DAHDSR amplitude envelope (EG1)** (always wired). Same shape as
+//!   the `Sf2Voice` / `ToneVoice`: linear attack from 0→1, hold at peak,
+//!   `(1-x)^2`-shaped decay to sustain, `(1-x)^2`-shaped release on
+//!   note-off.
 //! - **Vibrato LFO** (SFZ `lfo01_freq` / `lfo01_pitch` opcodes). A
 //!   simple sine LFO routed into pitch as a cents offset; rate is in Hz
 //!   and depth is in cents. Defaults to 0/0 so DLS / unconfigured SFZ
 //!   regions emit no vibrato.
 //! - **Pitch bend** via [`Voice::set_pitch_bend_cents`]. Layered on top
 //!   of the LFO depth without modifying the base playback rate.
+//! - **Modulation envelope (EG2)** + **2-pole resonant low-pass
+//!   filter** (round 91). [`ModEnvParams`] carries the same DAHDSR
+//!   shape as [`EnvelopeParams`] but with a `0..=1` sustain level (per
+//!   SF2 §8.1.3 `sustainModEnv` — 0 = peak, 1 = silence). The mod-env
+//!   is routed into the filter cutoff (SF2 gen 11 `modEnvToFilterFc` /
+//!   DLS2 `SRC_EG2 → DST_FILTER_CUTOFF`) as a cents offset added to the
+//!   initial cutoff each output frame. The biquad coefficients are
+//!   computed via the RBJ low-pass cookbook with the SF2 v2.04 §8.1.3
+//!   cents-to-Hz conversion `fc_hz = 8.176 * 2^(cents/1200)`; Q (in
+//!   centibels) maps via `q_lin = sqrt(0.5) * 10^(cb/200)` so 0 cB ≈
+//!   Butterworth.
 //!
-//! Pitch envelopes (`pitcheg_*`) and full DLS art1/art2 connection
-//! evaluation are deferred to round 2 — see
-//! [`SampleLoopMode`] and [`SamplePlayerConfig`] doc-comments for the
-//! exact data the round-1 voice consumes.
+//! Both EG2 + filter are off by default — a [`ModEnvParams`] with
+//! `attack_s == 0 && sustain_level == 0 && to_filter_cents == 0` skips
+//! the per-sample mod-env compute, and a [`FilterParams`] left at its
+//! default (`cutoff_cents == 13500`, the SF2 "filter inert" sentinel)
+//! skips the biquad entirely so legacy SFZ / unconfigured DLS regions
+//! stay bit-identical to the round-80 output.
 
 use std::sync::Arc;
 
@@ -107,6 +121,100 @@ pub struct VibratoParams {
     pub delay_s: f32,
 }
 
+/// Modulation envelope (EG2) parameters + routing depths. Per SF2 v2.04
+/// §8.1.3 generators 25–30 and DLS Level 2.2 §1.5 EG2 destinations
+/// (`CONN_DST_EG2_*`).
+///
+/// Shape mirrors [`EnvelopeParams`] (linear attack 0→1, hold at peak,
+/// `(1-x)^2`-shaped decay toward `sustain_level`, `(1-x)^2`-shaped
+/// release-to-zero on note-off). The semantic difference from EG1: the
+/// SF2 spec defines `sustainModEnv` as a *decrease* from full scale in
+/// 0.1 % units, so `sustain_level` here is the post-decrease linear
+/// fraction (1.0 = stay at peak, 0.0 = decay all the way to zero).
+///
+/// Defaults match the SF2 "mod-env-inert" state: zero delay/attack/hold/
+/// decay/release with `sustain_level = 0.0` and `to_filter_cents = 0`.
+/// In that state [`SamplePlayer::render`] skips the per-sample mod-env
+/// compute entirely.
+#[derive(Clone, Copy, Debug)]
+pub struct ModEnvParams {
+    /// Pre-attack delay, seconds (SF2 gen 25 `delayModEnv` /
+    /// DLS `CONN_DST_EG2_DELAYTIME`).
+    pub delay_s: f32,
+    /// Linear attack from 0→1, seconds (gen 26 `attackModEnv`).
+    pub attack_s: f32,
+    /// Hold-at-peak, seconds (gen 27 `holdModEnv`).
+    pub hold_s: f32,
+    /// Decay-to-sustain, seconds (gen 28 `decayModEnv`).
+    pub decay_s: f32,
+    /// Linear sustain level, `0.0..=1.0` (gen 29 `sustainModEnv`,
+    /// converted from "0.1 % decrease from peak" → linear `1 - x/1000`).
+    pub sustain_level: f32,
+    /// Release-to-zero, seconds (gen 30 `releaseModEnv`).
+    pub release_s: f32,
+    /// Modulation-envelope → filter cutoff depth, in cents (SF2 gen 11
+    /// `modEnvToFilterFc` / DLS `SRC_EG2 → DST_FILTER_CUTOFF`). The
+    /// live cutoff is `filter.cutoff_cents + mod_env_level *
+    /// to_filter_cents`.
+    pub to_filter_cents: i32,
+}
+
+impl Default for ModEnvParams {
+    fn default() -> Self {
+        // SF2 "all generators at default" — mod-env is inert.
+        Self {
+            delay_s: 0.0,
+            attack_s: 0.0,
+            hold_s: 0.0,
+            decay_s: 0.0,
+            sustain_level: 0.0,
+            release_s: 0.0,
+            to_filter_cents: 0,
+        }
+    }
+}
+
+impl ModEnvParams {
+    /// `true` when the mod-env is effectively a constant 0 — no filter
+    /// routing, no per-sample state needed. Lets [`SamplePlayer::new`]
+    /// skip allocating the mod-env counters and the per-sample compute.
+    pub fn is_inert(&self) -> bool {
+        self.to_filter_cents == 0
+    }
+}
+
+/// 2-pole resonant low-pass filter parameters. Per SF2 v2.04 §8.1.3
+/// generators 8 + 9 ("second order resonant pole pair") and DLS Level
+/// 2.2 §1.5.2 `CONN_DST_FILTER_CUTOFF` / `CONN_DST_FILTER_Q`.
+///
+/// `cutoff_cents` is in **absolute cents** with the SF2 reference of
+/// 8.176 Hz: `fc_hz = 8.176 * 2^(cents/1200)`. Useful range per §8.1.3
+/// is `1500..=13500` (20 Hz → 20 kHz). The default `13500` is the SF2
+/// "filter open" sentinel — [`SamplePlayer::new`] detects this and
+/// skips the biquad entirely.
+///
+/// `q_centibels` is in centibels (0.1 dB units), useful range
+/// `0..=960` per §8.1.3 gen 9. `0` = Butterworth (`Q ≈ 0.707`).
+#[derive(Clone, Copy, Debug)]
+pub struct FilterParams {
+    /// Initial cutoff in absolute cents re. 8.176 Hz. Default 13500
+    /// (≈ 19914 Hz, effectively no filter).
+    pub cutoff_cents: i32,
+    /// Resonance in centibels (10 cB = 1 dB). Default 0 (Butterworth).
+    pub q_centibels: i32,
+}
+
+impl Default for FilterParams {
+    fn default() -> Self {
+        // SF2 §8.1.3 default: initialFilterFc = 13500 (filter open),
+        // initialFilterQ = 0 (no resonance).
+        Self {
+            cutoff_cents: 13_500,
+            q_centibels: 0,
+        }
+    }
+}
+
 /// Configuration for one [`SamplePlayer`] voice. Owns its sample data
 /// via an `Arc` so the bank can hand the same buffer to many concurrent
 /// voices without copying.
@@ -136,15 +244,22 @@ pub struct SamplePlayerConfig {
     pub amplitude: f32,
     pub envelope: EnvelopeParams,
     pub vibrato: VibratoParams,
+    /// Modulation envelope (EG2) + filter-routing depth. Defaults to
+    /// inert — `is_inert()` true → the player skips the per-sample
+    /// mod-env compute.
+    pub mod_env: ModEnvParams,
+    /// 2-pole resonant low-pass filter. Defaults to "open" — the
+    /// player skips the biquad entirely.
+    pub filter: FilterParams,
     /// Exclusive-class id (drum-kit style hi-hat open/closed cuts).
     /// Surfaced through [`Voice::exclusive_class`]; 0 = no class.
     pub exclusive_class: u16,
 }
 
 /// Sample-playback voice. Mono in, mono out — the mixer pans into
-/// stereo. Round-1 covers the basics: DAHDSR + vibrato LFO + pitch
-/// bend + four loop modes + exclusive-class. Filter/pitch envelopes
-/// are deferred.
+/// stereo. Covers: DAHDSR amplitude envelope + DAHDSR modulation
+/// envelope (EG2) → cutoff routing + 2-pole resonant low-pass filter +
+/// vibrato LFO + pitch bend + four loop modes + exclusive-class.
 pub struct SamplePlayer {
     samples: Arc<[f32]>,
     end: u32,
@@ -188,6 +303,85 @@ pub struct SamplePlayer {
     /// `true` once we've broken out of a `LoopSustain` loop on note-off
     /// — once set, the playback head no longer wraps at `loop_end`.
     loop_broken: bool,
+
+    // ---- Modulation envelope (EG2) ----
+    /// EG2 DAHDSR phase boundaries in output frames.
+    mod_env_delay: u32,
+    mod_env_attack: u32,
+    mod_env_hold: u32,
+    mod_env_decay: u32,
+    mod_env_release: u32,
+    mod_env_sustain_level: f32,
+    /// EG2 level at the moment of release — separately captured from
+    /// the amplitude envelope so the filter cutoff tails off from its
+    /// actual mid-flight value rather than re-starting from peak.
+    mod_env_release_start_level: f32,
+    /// EG2 → cutoff routing depth in cents.
+    mod_env_to_filter_cents: i32,
+
+    // ---- 2-pole resonant low-pass filter ----
+    /// Initial cutoff in absolute cents (SF2 reference 8.176 Hz). Live
+    /// cutoff = `initial_filter_fc_cents + mod_env * to_filter_cents`.
+    initial_filter_fc_cents: i32,
+    /// Resonance, centibels (0 = Butterworth).
+    initial_filter_q_cb: i32,
+    /// Per-voice biquad. `None` when the filter is "open" (cutoff at
+    /// the SF2 default 13500 cents *and* no mod-env routing pulls it
+    /// into the audible range) — skips the per-sample compute entirely.
+    filter: Option<BiquadState>,
+}
+
+/// Direct-form 1 biquad state for one channel. Coefficients are
+/// recomputed lazily when the cutoff drifts more than ~50 cents.
+/// Mirrors the [`super::sf2::Sf2Voice`]'s biquad math so a DLS bank
+/// that authors the same filter generators as an equivalent SF2 bank
+/// produces an identical sweep shape.
+struct BiquadState {
+    /// Most-recent live cutoff in cents — used as the gate for
+    /// coefficient recomputation.
+    last_cutoff_cents: i32,
+    /// Live coefficients (a1, a2, b0, b1, b2). a0 normalised to 1.
+    a1: f32,
+    a2: f32,
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    /// Delay line (x[n-1], x[n-2], y[n-1], y[n-2]).
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl BiquadState {
+    fn new() -> Self {
+        Self {
+            // Sentinel forces the first call to `update_filter_coeffs`
+            // to actually compute.
+            last_cutoff_cents: i32::MIN,
+            a1: 0.0,
+            a2: 0.0,
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    /// One sample through the direct-form-1 biquad.
+    fn tick(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+            - self.a1 * self.y1
+            - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
 }
 
 impl SamplePlayer {
@@ -202,6 +396,24 @@ impl SamplePlayer {
         let end = cfg.sample_end.min(buf_len);
         let loop_end = cfg.loop_end.min(end);
         let loop_start = cfg.loop_start.min(loop_end);
+
+        // Filter: only allocate the biquad when the bank actually wants
+        // a filter. SF2 §8.1.3 default `initialFilterFc = 13500` is the
+        // "filter open" sentinel; we also skip when the mod-env can't
+        // drag it below 13000 cents (≈18 kHz) because anything above
+        // that is well outside the audible band on a typical 44.1 kHz
+        // render.
+        let needs_filter =
+            cfg.filter.cutoff_cents < 13_000 || cfg.mod_env.to_filter_cents.abs() > 200;
+        let filter = if needs_filter {
+            Some(BiquadState::new())
+        } else {
+            None
+        };
+
+        // Mod-env sustain is "fraction of full-scale" — clamped at
+        // construction so the render loop doesn't have to.
+        let mod_env_sustain_level = cfg.mod_env.sustain_level.clamp(0.0, 1.0);
 
         Self {
             samples: cfg.samples,
@@ -231,6 +443,19 @@ impl SamplePlayer {
             output_rate: sr,
             exclusive_class: cfg.exclusive_class,
             loop_broken: false,
+
+            mod_env_delay: (sr * cfg.mod_env.delay_s.max(0.0)) as u32,
+            mod_env_attack: (sr * cfg.mod_env.attack_s.max(0.0)).max(1.0) as u32,
+            mod_env_hold: (sr * cfg.mod_env.hold_s.max(0.0)) as u32,
+            mod_env_decay: (sr * cfg.mod_env.decay_s.max(0.0)).max(1.0) as u32,
+            mod_env_release: (sr * cfg.mod_env.release_s.max(0.0)).max(1.0) as u32,
+            mod_env_sustain_level,
+            mod_env_release_start_level: 1.0,
+            mod_env_to_filter_cents: cfg.mod_env.to_filter_cents,
+
+            initial_filter_fc_cents: cfg.filter.cutoff_cents,
+            initial_filter_q_cb: cfg.filter.q_centibels,
+            filter,
         }
     }
 
@@ -282,6 +507,92 @@ impl SamplePlayer {
         phase.sin() * self.lfo_depth_cents
     }
 
+    /// Modulation-envelope (EG2) value at output frame `t`, `0..=1`.
+    /// Same DAHDSR shape as [`Self::envelope_at`] but with `0..=1`
+    /// sustain semantics (per SF2 §8.1.3 sustainModEnv). Release uses
+    /// the EG2's own captured start level so the filter sweep tails off
+    /// from wherever the cutoff was at note-off, not from peak.
+    fn mod_env_at(&self, t: u32) -> f32 {
+        if let Some(rel_at) = self.release_pos {
+            let since = t.saturating_sub(rel_at);
+            if since >= self.mod_env_release {
+                return 0.0;
+            }
+            let x = since as f32 / self.mod_env_release.max(1) as f32;
+            let curve = (1.0 - x) * (1.0 - x);
+            return self.mod_env_release_start_level * curve;
+        }
+        if t < self.mod_env_delay {
+            return 0.0;
+        }
+        let t = t - self.mod_env_delay;
+        if t < self.mod_env_attack {
+            return t as f32 / self.mod_env_attack.max(1) as f32;
+        }
+        let t = t - self.mod_env_attack;
+        if t < self.mod_env_hold {
+            return 1.0;
+        }
+        let t = t - self.mod_env_hold;
+        if t < self.mod_env_decay {
+            let x = t as f32 / self.mod_env_decay.max(1) as f32;
+            let drop = 1.0 - self.mod_env_sustain_level;
+            let curve = 1.0 - (1.0 - x) * (1.0 - x);
+            return 1.0 - drop * curve;
+        }
+        self.mod_env_sustain_level
+    }
+
+    /// Recompute biquad coefficients for a 2-pole resonant low-pass at
+    /// the given absolute-cents cutoff. Direct-form 1, RBJ cookbook
+    /// math (clean-room derivation; spec only specifies "second order
+    /// resonant pole pair" — §8.1.3 explicitly leaves filter
+    /// implementation to the renderer per §9.7).
+    ///
+    /// `cutoff_cents` is clamped to the SF2 useful range
+    /// `1500..=13500` (§8.1.3), then converted to Hz via
+    /// `fc_hz = 8.176 * 2^(cents/1200)` and further clipped at
+    /// `0.99 * Nyquist` so a hostile bank can't request a cutoff that
+    /// the bi-linear transform can't represent.
+    fn update_filter_coeffs(&mut self, cutoff_cents: i32) {
+        let Some(filter) = self.filter.as_mut() else {
+            return;
+        };
+        let cents = cutoff_cents.clamp(1_500, 13_500);
+        let cutoff_hz = 8.176_f32 * (2.0_f32).powf(cents as f32 / 1200.0);
+        let nyquist = self.output_rate * 0.5;
+        let cutoff_hz = cutoff_hz.min(nyquist * 0.99).max(20.0);
+        // Q (cB) → linear Q. 0 cB = Butterworth (≈ 0.707). Clamp at 16
+        // to bound resonance — a runaway Q produces NaN coefficients.
+        let q_lin = (10.0_f32).powf(self.initial_filter_q_cb as f32 / 200.0)
+            * std::f32::consts::FRAC_1_SQRT_2;
+        let q = q_lin.clamp(0.1, 16.0);
+        let omega = 2.0 * std::f32::consts::PI * cutoff_hz / self.output_rate;
+        let alpha = omega.sin() / (2.0 * q);
+        let cos_w = omega.cos();
+        // RBJ low-pass:
+        //   b0 = (1 - cos)/2, b1 = 1 - cos, b2 = (1 - cos)/2,
+        //   a0 = 1 + alpha,   a1 = -2 cos,  a2 = 1 - alpha.
+        let a0 = 1.0 + alpha;
+        let inv_a0 = 1.0 / a0;
+        filter.b0 = ((1.0 - cos_w) * 0.5) * inv_a0;
+        filter.b1 = (1.0 - cos_w) * inv_a0;
+        filter.b2 = ((1.0 - cos_w) * 0.5) * inv_a0;
+        filter.a1 = (-2.0 * cos_w) * inv_a0;
+        filter.a2 = (1.0 - alpha) * inv_a0;
+        filter.last_cutoff_cents = cutoff_cents;
+    }
+
+    /// Live filter cutoff at output frame `t`, in absolute cents.
+    /// Adds the mod-env contribution to the initial cutoff.
+    fn live_cutoff_cents(&self, t: u32) -> i32 {
+        if self.mod_env_to_filter_cents == 0 {
+            return self.initial_filter_fc_cents;
+        }
+        let lvl = self.mod_env_at(t);
+        self.initial_filter_fc_cents + (lvl * self.mod_env_to_filter_cents as f32) as i32
+    }
+
     /// Linear-interpolate one frame at fractional position `phase`.
     /// Out-of-bounds reads return 0.
     fn fetch(&self, phase: f64) -> f32 {
@@ -316,6 +627,23 @@ impl Voice for SamplePlayer {
                 return i;
             }
 
+            // Filter cutoff modulation. Only recompute coefficients
+            // when the cutoff drifts more than ~50 cents from the last
+            // computed value — a perceptually-imperceptible gate that
+            // keeps the inner loop multiplication-only on the common
+            // path (mod-env is constant in delay/hold/sustain phases).
+            if self.filter.is_some() {
+                let target = self.live_cutoff_cents(self.elapsed);
+                let last = self
+                    .filter
+                    .as_ref()
+                    .map(|f| f.last_cutoff_cents)
+                    .unwrap_or(i32::MIN);
+                if target.saturating_sub(last).saturating_abs() > 50 {
+                    self.update_filter_coeffs(target);
+                }
+            }
+
             // Loop / end handling.
             if self.phase >= self.end as f64 {
                 // Past the very end of the sample → no signal, voice done
@@ -347,7 +675,10 @@ impl Voice for SamplePlayer {
                 self.phase = self.loop_start as f64 + wrapped;
             }
 
-            let s = self.fetch(self.phase);
+            let mut s = self.fetch(self.phase);
+            if let Some(filter) = self.filter.as_mut() {
+                s = filter.tick(s);
+            }
             *slot = s * env * self.amplitude * self.pressure_gain;
             self.phase += self.phase_inc;
             self.elapsed = self.elapsed.wrapping_add(1);
@@ -363,6 +694,9 @@ impl Voice for SamplePlayer {
         }
         if self.release_pos.is_none() {
             self.release_start_level = self.envelope_at(self.elapsed).max(0.0);
+            // Capture the EG2 level too so the filter cutoff tails
+            // off from its mid-flight value, not from peak.
+            self.mod_env_release_start_level = self.mod_env_at(self.elapsed).max(0.0);
             self.release_pos = Some(self.elapsed);
             // LoopSustain breaks out of the loop on note-off.
             if matches!(self.loop_mode, SampleLoopMode::LoopSustain) {
@@ -416,6 +750,8 @@ mod tests {
             amplitude: 1.0,
             envelope: EnvelopeParams::default(),
             vibrato: VibratoParams::default(),
+            mod_env: ModEnvParams::default(),
+            filter: FilterParams::default(),
             exclusive_class: 0,
         };
         let mut v = SamplePlayer::new(cfg, 44_100);
@@ -442,6 +778,8 @@ mod tests {
             amplitude: 1.0,
             envelope: EnvelopeParams::default(),
             vibrato: VibratoParams::default(),
+            mod_env: ModEnvParams::default(),
+            filter: FilterParams::default(),
             exclusive_class: 0,
         };
         let mut v = SamplePlayer::new(cfg, 44_100);
@@ -479,6 +817,8 @@ mod tests {
             amplitude: 1.0,
             envelope: EnvelopeParams::default(),
             vibrato: VibratoParams::default(),
+            mod_env: ModEnvParams::default(),
+            filter: FilterParams::default(),
             exclusive_class: 0,
         };
         let mut v = SamplePlayer::new(cfg, 44_100);
@@ -506,6 +846,8 @@ mod tests {
             amplitude: 1.0,
             envelope: EnvelopeParams::default(),
             vibrato: VibratoParams::default(),
+            mod_env: ModEnvParams::default(),
+            filter: FilterParams::default(),
             exclusive_class: 0,
         };
         let mut a = SamplePlayer::new(cfg.clone(), 44_100);
@@ -543,6 +885,8 @@ mod tests {
             amplitude: 1.0,
             envelope: EnvelopeParams::default(),
             vibrato: VibratoParams::default(),
+            mod_env: ModEnvParams::default(),
+            filter: FilterParams::default(),
             exclusive_class: 0,
         };
         let mut cfg_lfo = cfg_no_lfo.clone();
@@ -563,5 +907,335 @@ mod tests {
             .map(|(x, y)| (x - y).abs())
             .sum();
         assert!(diff > 0.001, "LFO should perturb output, got diff {diff}");
+    }
+
+    // ---------------- Round 91 EG2 + filter tests ----------------
+
+    /// Square-wave-shaped buffer, useful for filter tests: a long input
+    /// with strong high-frequency content. Alternates +/-0.5 every
+    /// `period` samples so a low-pass filter has plenty of harmonics to
+    /// chew on.
+    fn square(period: usize, frames: usize) -> Arc<[f32]> {
+        (0..frames)
+            .map(|i| if (i / period) & 1 == 0 { 0.5 } else { -0.5 })
+            .collect::<Vec<f32>>()
+            .into()
+    }
+
+    /// Long sine at a known frequency. Used to validate that the
+    /// low-pass filter actually attenuates frequencies above its
+    /// cutoff. `freq_hz` × `frames / native_rate` should be a multiple
+    /// of 1 so the buffer is integer-periodic (avoids edge-frame
+    /// ringing).
+    fn sine(freq_hz: f32, native_rate: u32, frames: usize) -> Arc<[f32]> {
+        let step = std::f32::consts::TAU * freq_hz / native_rate as f32;
+        (0..frames)
+            .map(|i| (i as f32 * step).sin() * 0.5)
+            .collect::<Vec<f32>>()
+            .into()
+    }
+
+    fn rms(buf: &[f32]) -> f32 {
+        let n = buf.len().max(1) as f32;
+        let sum_sq: f32 = buf.iter().map(|x| x * x).sum();
+        (sum_sq / n).sqrt()
+    }
+
+    fn cfg_with(samples: Arc<[f32]>, native_rate: u32) -> SamplePlayerConfig {
+        let len = samples.len() as u32;
+        SamplePlayerConfig {
+            samples,
+            native_rate,
+            loop_start: 0,
+            loop_end: len,
+            sample_end: len,
+            loop_mode: SampleLoopMode::NoLoop,
+            pitch_ratio: 1.0,
+            amplitude: 1.0,
+            // Long attack so the amplitude envelope doesn't shape the
+            // output during the filter measurement window — keep the
+            // signal at near-peak the whole time.
+            envelope: EnvelopeParams {
+                attack_s: 0.001,
+                hold_s: 1.0,
+                decay_s: 0.001,
+                sustain_level: 1.0,
+                release_s: 0.1,
+                ..Default::default()
+            },
+            vibrato: VibratoParams::default(),
+            mod_env: ModEnvParams::default(),
+            filter: FilterParams::default(),
+            exclusive_class: 0,
+        }
+    }
+
+    #[test]
+    fn default_filter_is_inert_no_biquad_allocated() {
+        // SF2 §8.1.3 "filter open" defaults must skip the biquad
+        // entirely so legacy SFZ / unconfigured DLS banks render
+        // bit-identically to the round-80 pre-filter path.
+        let cfg = cfg_with(square(8, 4096), 44_100);
+        let v = SamplePlayer::new(cfg, 44_100);
+        assert!(
+            v.filter.is_none(),
+            "default FilterParams + inert ModEnvParams should not allocate biquad"
+        );
+    }
+
+    #[test]
+    fn low_cutoff_filter_attenuates_high_frequencies() {
+        // A 5 kHz sine through a low-pass at 500 Hz should be
+        // dramatically attenuated; through an open filter (default),
+        // it should pass essentially unchanged. We measure RMS on the
+        // tail of the buffer so the filter's transient response has
+        // had time to settle.
+        let buf = sine(5_000.0, 44_100, 8_192);
+        // Open-filter baseline.
+        let cfg_open = cfg_with(buf.clone(), 44_100);
+        let mut v_open = SamplePlayer::new(cfg_open, 44_100);
+        let mut out_open = vec![0.0f32; 8_192];
+        v_open.render(&mut out_open);
+
+        // 500 Hz cutoff: cents = 1200 * log2(500 / 8.176) ≈ 7138.
+        let mut cfg_lp = cfg_with(buf, 44_100);
+        cfg_lp.filter = FilterParams {
+            cutoff_cents: 7_138,
+            q_centibels: 0,
+        };
+        let mut v_lp = SamplePlayer::new(cfg_lp, 44_100);
+        assert!(
+            v_lp.filter.is_some(),
+            "low-cutoff config must allocate biquad"
+        );
+        let mut out_lp = vec![0.0f32; 8_192];
+        v_lp.render(&mut out_lp);
+
+        // Measure RMS over the latter half so the filter transient
+        // has settled. A 2-pole low-pass at 500 Hz against a 5 kHz
+        // sine should attenuate by roughly 40 dB (12 dB/oct over
+        // ~3.3 octaves), so RMS ratio < 0.05 is a safe assertion.
+        let rms_open = rms(&out_open[4_096..]);
+        let rms_lp = rms(&out_lp[4_096..]);
+        let ratio = rms_lp / rms_open.max(1e-6);
+        assert!(
+            ratio < 0.1,
+            "low-pass at 500 Hz should attenuate 5 kHz by >20 dB; got ratio {ratio} (open={rms_open}, lp={rms_lp})"
+        );
+    }
+
+    #[test]
+    fn mod_env_dahdsr_shape_matches_spec() {
+        // Build a voice with a known mod-env: 0 ms delay, 100 ms
+        // attack, 0 ms hold, 100 ms decay to sustain 0.5. Sample at
+        // a few known time points and assert the curve shape.
+        let buf = sine(440.0, 44_100, 44_100);
+        let mut cfg = cfg_with(buf, 44_100);
+        cfg.mod_env = ModEnvParams {
+            delay_s: 0.0,
+            attack_s: 0.100,
+            hold_s: 0.0,
+            decay_s: 0.100,
+            sustain_level: 0.5,
+            release_s: 0.100,
+            // Non-zero filter routing forces the SamplePlayer to
+            // actually compute mod_env_at every sample.
+            to_filter_cents: -3000,
+        };
+        // Low initial cutoff so the biquad is allocated.
+        cfg.filter = FilterParams {
+            cutoff_cents: 10_000,
+            q_centibels: 0,
+        };
+        let v = SamplePlayer::new(cfg, 44_100);
+
+        // At t=0: pre-attack, level = 0.
+        assert!(
+            v.mod_env_at(0).abs() < 1e-3,
+            "mod env at t=0 should be 0, got {}",
+            v.mod_env_at(0)
+        );
+        // Mid-attack (50 ms in, half-way through 100 ms attack): ~0.5.
+        let mid_attack = v.mod_env_at(44_100 / 20);
+        assert!(
+            (mid_attack - 0.5).abs() < 0.02,
+            "mod env mid-attack should be ~0.5, got {mid_attack}"
+        );
+        // End of attack (100 ms): peak = 1.0.
+        let peak = v.mod_env_at(44_100 / 10);
+        assert!(
+            (peak - 1.0).abs() < 0.02,
+            "mod env at attack peak should be ~1.0, got {peak}"
+        );
+        // Late in sustain (500 ms): held at sustain_level = 0.5.
+        let sus = v.mod_env_at(44_100 / 2);
+        assert!(
+            (sus - 0.5).abs() < 0.02,
+            "mod env in sustain should be ~0.5, got {sus}"
+        );
+    }
+
+    #[test]
+    fn eg2_filter_sweep_changes_spectrum_over_note() {
+        // Drive a 5 kHz sine through a voice with EG2 sweeping the
+        // filter cutoff from ~closed → ~open over the note. The early
+        // part of the rendered audio should be heavily attenuated;
+        // the late part should be near pass-through. A constant-cutoff
+        // baseline (no EG2 routing) should produce the same RMS over
+        // both windows.
+        //
+        // Sine is chosen well above the starting cutoff (~250 Hz) so
+        // the early window sits in the filter's stop-band; the EG2
+        // attack runs slowly enough that the early-window measurement
+        // catches the filter still nearly closed.
+        let buf = sine(5_000.0, 44_100, 44_100);
+
+        // Baseline: filter at 250 Hz, no EG2 routing.
+        // cents = 1200 * log2(250 / 8.176) ≈ 5938.
+        let base_cutoff = 5_938;
+        let mut cfg_base = cfg_with(buf.clone(), 44_100);
+        cfg_base.filter = FilterParams {
+            cutoff_cents: base_cutoff,
+            q_centibels: 0,
+        };
+        let mut v_base = SamplePlayer::new(cfg_base, 44_100);
+        let mut out_base = vec![0.0f32; 44_100];
+        v_base.render(&mut out_base);
+
+        // EG2 sweep: cutoff starts at 250 Hz, rises +6 octaves over a
+        // 500 ms attack (7200 cents → cutoff lands at ~16 kHz, opening
+        // the filter well above the 5 kHz probe). Sustain at peak
+        // (1.0) so the filter stays open after the attack.
+        let mut cfg_sweep = cfg_with(buf, 44_100);
+        cfg_sweep.filter = FilterParams {
+            cutoff_cents: base_cutoff,
+            q_centibels: 0,
+        };
+        cfg_sweep.mod_env = ModEnvParams {
+            delay_s: 0.0,
+            attack_s: 0.500,
+            hold_s: 1.0,
+            decay_s: 0.001,
+            sustain_level: 1.0,
+            release_s: 0.001,
+            to_filter_cents: 7_200,
+        };
+        let mut v_sweep = SamplePlayer::new(cfg_sweep, 44_100);
+        let mut out_sweep = vec![0.0f32; 44_100];
+        v_sweep.render(&mut out_sweep);
+
+        // Early window: 20–80 ms in. Mod-env is ~0.04..0.16 of attack
+        // (linear ramp over 500 ms), so cutoff sits ~290..380 Hz.
+        // 5 kHz through a 380 Hz lowpass is heavily attenuated.
+        //
+        // Late window: 850–950 ms in — well past the 500 ms attack,
+        // mod-env saturated at sustain=1.0, cutoff at the +7200 cent
+        // ceiling. 5 kHz now passes essentially unattenuated.
+        let early_sweep = rms(&out_sweep[880..3_528]);
+        let late_sweep = rms(&out_sweep[37_485..41_895]);
+        let early_base = rms(&out_base[880..3_528]);
+        let late_base = rms(&out_base[37_485..41_895]);
+
+        // Sanity: the baseline (static cutoff) RMS in the two windows
+        // should be roughly equal once the filter has settled.
+        let base_ratio = (late_base / early_base.max(1e-6) - 1.0).abs();
+        assert!(
+            base_ratio < 0.3,
+            "static-filter baseline should be roughly steady; got early={early_base}, late={late_base}"
+        );
+
+        // Filter-sweep test: late-window RMS must dominate early-
+        // window RMS by a wide margin (the EG2 has pulled the cutoff
+        // from below the probe frequency to above it).
+        let sweep_gain = late_sweep / early_sweep.max(1e-6);
+        assert!(
+            sweep_gain > 5.0,
+            "EG2 should sweep the cutoff open, raising late-window RMS over early-window RMS; got gain={sweep_gain} (early={early_sweep}, late={late_sweep})"
+        );
+
+        // Cross-check: the post-sweep filter must pass the 5 kHz
+        // probe more freely than the static-cutoff baseline.
+        assert!(
+            late_sweep > late_base * 2.0,
+            "post-sweep filter should be substantially wider than the static 250 Hz baseline; got sweep={late_sweep}, base={late_base}"
+        );
+    }
+
+    #[test]
+    fn high_q_filter_resonates_at_cutoff() {
+        // A high-Q low-pass should produce a measurable peak at the
+        // cutoff frequency. We probe with a sine sitting *at* the
+        // cutoff: high-Q should make the output louder than the input,
+        // low-Q (Butterworth) should attenuate it (-3 dB at fc).
+        let buf = sine(1_000.0, 44_100, 16_384);
+
+        // 1 kHz cutoff, Q = 0 (Butterworth).
+        let mut cfg_q0 = cfg_with(buf.clone(), 44_100);
+        cfg_q0.filter = FilterParams {
+            cutoff_cents: 8_338,
+            q_centibels: 0,
+        };
+        let mut v_q0 = SamplePlayer::new(cfg_q0, 44_100);
+        let mut out_q0 = vec![0.0f32; 16_384];
+        v_q0.render(&mut out_q0);
+
+        // 1 kHz cutoff, Q = 240 cB = 24 dB resonance peak.
+        let mut cfg_q24 = cfg_with(buf, 44_100);
+        cfg_q24.filter = FilterParams {
+            cutoff_cents: 8_338,
+            q_centibels: 240,
+        };
+        let mut v_q24 = SamplePlayer::new(cfg_q24, 44_100);
+        let mut out_q24 = vec![0.0f32; 16_384];
+        v_q24.render(&mut out_q24);
+
+        // Measure RMS on the tail so the resonant transient has
+        // settled into steady state.
+        let rms_q0 = rms(&out_q0[8_192..]);
+        let rms_q24 = rms(&out_q24[8_192..]);
+        assert!(
+            rms_q24 > rms_q0 * 2.0,
+            "Q=24 dB should boost the cutoff-frequency sine over Q=0; got q0={rms_q0}, q24={rms_q24}"
+        );
+    }
+
+    #[test]
+    fn release_captures_mod_env_level() {
+        // After release, the EG2 should tail off from its mid-flight
+        // value, not restart from peak. We test this by checking the
+        // captured `mod_env_release_start_level` after `release()`
+        // matches the pre-release `mod_env_at`.
+        let buf = sine(440.0, 44_100, 44_100);
+        let mut cfg = cfg_with(buf, 44_100);
+        cfg.mod_env = ModEnvParams {
+            attack_s: 0.100,
+            decay_s: 0.100,
+            sustain_level: 0.5,
+            release_s: 0.100,
+            to_filter_cents: -3000,
+            ..Default::default()
+        };
+        cfg.filter = FilterParams {
+            cutoff_cents: 10_000,
+            q_centibels: 0,
+        };
+        let mut v = SamplePlayer::new(cfg, 44_100);
+        // Render 50 ms — mid-attack on the mod-env.
+        let mut out = vec![0.0f32; 44_100 / 20];
+        v.render(&mut out);
+        let pre_release_level = v.mod_env_at(v.elapsed);
+        v.release();
+        // Captured level must match the pre-release reading.
+        assert!(
+            (v.mod_env_release_start_level - pre_release_level).abs() < 1e-4,
+            "release should capture mid-flight EG2 level; pre={pre_release_level}, captured={}",
+            v.mod_env_release_start_level
+        );
+        // And the captured level should be roughly 0.5 (mid-attack
+        // on a 100 ms linear ramp at 50 ms in).
+        assert!(
+            (pre_release_level - 0.5).abs() < 0.05,
+            "mid-attack EG2 should be ~0.5; got {pre_release_level}"
+        );
     }
 }

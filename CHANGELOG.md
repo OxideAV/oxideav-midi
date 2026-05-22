@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 91 — EG2 + 2-pole resonant low-pass filter on the shared `SamplePlayer`
+
+- New `ModEnvParams` + `FilterParams` structs on
+  `instruments::sample_voice`. `ModEnvParams` mirrors the existing
+  `EnvelopeParams` DAHDSR shape but treats `sustain_level` as the
+  *post-decrease linear fraction* per SF2 v2.04 §8.1.3 `sustainModEnv`
+  ("decrease in level expressed in 0.1 % units", with 0 = peak and 1000
+  = silence) and carries `to_filter_cents` — the per-mod-env-unit
+  contribution to the filter cutoff per SF2 gen 11 `modEnvToFilterFc`.
+  `FilterParams` carries `cutoff_cents` (SF2 absolute cents re. 8.176
+  Hz; default 13500 = "filter open" sentinel from §8.1.3 gen 8) and
+  `q_centibels` (0 = Butterworth, per §8.1.3 gen 9).
+- `SamplePlayer::new` allocates a per-voice 2-pole resonant low-pass
+  biquad only when the bank actually wants the filter (cutoff <
+  13000 cents *or* mod-env-to-filter routing depth > 200 cents).
+  Otherwise the per-sample biquad work is skipped entirely so
+  unconfigured SFZ / DLS regions render bit-identically to the
+  round-80 pre-filter path.
+- Biquad coefficients computed from the SF2 §8.1.3 cents reference
+  `fc_hz = 8.176 * 2^(cents/1200)` (clamped to the spec useful range
+  `1500..=13500`, then clipped at `0.99 * Nyquist`) and the RBJ
+  cookbook low-pass formulas: `a0 = 1 + α`, `a1 = -2·cos(ω)`,
+  `a2 = 1 - α`, `b0 = b2 = (1 - cos(ω))/2`, `b1 = 1 - cos(ω)`, where
+  `α = sin(ω)/(2Q)`. Q (centibels) → linear `q_lin = √(½) · 10^(cb/200)`
+  with a `0.1..=16.0` clamp so runaway resonance can't produce NaN
+  coefficients. The RBJ derivation is the project's own clean-room
+  math (bilinear transform of the analog 2-pole low-pass
+  `H(s) = ω₀² / (s² + (ω₀/Q)s + ω₀²)`) — SF2 §8.1.3 explicitly
+  leaves the filter implementation to the renderer per §9.7.
+- `SamplePlayer::render` evaluates the mod-env DAHDSR each sample,
+  adds `mod_env_level * mod_env_to_filter_cents` to the initial
+  cutoff, and lazily recomputes biquad coefficients only when the
+  live cutoff drifts > 50 cents from the last computed value (cheap
+  perceptual gate that keeps the inner loop multiplication-only
+  during the delay / hold / sustain phases when the mod-env is
+  constant). The filter sits between sample fetch and amplitude
+  envelope, so EG1 amplitude shaping is post-filter as expected.
+- `SamplePlayer::release` now captures the EG2 release-start level
+  separately from the EG1 release-start level so the filter cutoff
+  tails off from wherever the mod-env was at note-off, not from
+  peak — a discontinuity-free release for both amplitude and filter.
+- New `Articulation::mod_env() -> ModEnvParams` +
+  `Articulation::filter() -> FilterParams` helpers on
+  `instruments::articulation`. `mod_env()` converts the DLS EG2
+  destinations (`CONN_DST_EG2_DELAYTIME` / `_ATTACKTIME` /
+  `_HOLDTIME` / `_DECAYTIME` / `_SUSTAINLEVEL` / `_RELEASETIME`
+  plus the `SRC_EG2 → DST_FILTER_CUTOFF` routing depth) into the
+  SamplePlayer-side `ModEnvParams`; `filter()` maps
+  `CONN_DST_FILTER_CUTOFF` / `CONN_DST_FILTER_Q` into `FilterParams`,
+  falling back to the SF2 "filter open" sentinel (13500 cents) when
+  the region carries no filter blocks.
+- `instruments::dls::build_dls_config` plumbs `art.mod_env()` +
+  `art.filter()` into the `SamplePlayerConfig`. A DLS bank with no
+  `art2` filter blocks produces the same audio it did pre-round-91;
+  a bank with an `art2` `SRC_EG2 → DST_FILTER_CUTOFF` block sweeps
+  the cutoff exactly as the spec describes.
+- `instruments::sfz::build_config_for_region` populates the new
+  fields with `Default::default()` — SFZ `fileg_*` / `fil_type` /
+  `cutoff` opcodes are not yet plumbed; SFZ banks render
+  bit-identically to the round-80 path until a future round wires
+  the SFZ filter opcodes.
+- 12 new tests across the crate:
+  - `instruments::sample_voice::tests::default_filter_is_inert_no_biquad_allocated`
+  - `instruments::sample_voice::tests::low_cutoff_filter_attenuates_high_frequencies`
+  - `instruments::sample_voice::tests::mod_env_dahdsr_shape_matches_spec`
+  - `instruments::sample_voice::tests::eg2_filter_sweep_changes_spectrum_over_note`
+  - `instruments::sample_voice::tests::high_q_filter_resonates_at_cutoff`
+  - `instruments::sample_voice::tests::release_captures_mod_env_level`
+  - `instruments::articulation::tests::default_mod_env_is_inert`
+  - `instruments::articulation::tests::default_filter_is_open_sentinel`
+  - `instruments::articulation::tests::eg2_to_filter_routing_lands_on_mod_env`
+  - `instruments::articulation::tests::filter_cutoff_override_lands_on_filter`
+  - `instruments::articulation::tests::eg2_attack_time_lands_on_mod_env_attack`
+  - `tests::dls_articulation::dls_articulation_eg2_sweeps_filter_cutoff_open`
+    (integration: builds a DLS bank with `SRC_EG2 → DST_FILTER_CUTOFF`
+    + slow EG2 attack, renders through the full `MidiDecoder`, asserts
+    the late-window RMS is > 1.6× the early-window RMS).
+- Test count moves from 212 → 224.
+- Spec backing: SF2 v2.04 §8.1.3 generators 8 + 9 + 11 + 25–30
+  (`docs/audio/midi/instrument-formats/sf2-spec-2.04.pdf`); DLS Level
+  2.2 v1.0 Amendment 2 §1.5.2 + Tables 5–6 + 8–10 + 1.13 + 1.14
+  (`docs/audio/midi/instrument-formats/dls2amd2(all)a(pub).pdf`); DLS
+  Level 1 v1.1b "Device Architecture" + "Articulation"
+  (`docs/audio/midi/instrument-formats/dls1v11b.pdf`).
+
 ### Round 80 — DLS `art1` / `art2` articulation interpretation
 
 - New module `instruments::articulation` interpreting DLS Level 1 and

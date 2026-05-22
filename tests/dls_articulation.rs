@@ -118,6 +118,117 @@ fn dls_articulation_tuning_shifts_pitch_through_voice() {
     );
 }
 
+/// Round-91 end-to-end check that the DLS `SRC_EG2 → DST_FILTER_CUTOFF`
+/// routing actually reaches the SamplePlayer's biquad. We compare:
+///   A) bank with `SRC_NONE → DST_FILTER_CUTOFF` set to a low cutoff
+///      (~250 Hz) and no EG2 routing → the rendered signal should be
+///      heavily attenuated throughout.
+///   B) same bank with an additional `SRC_EG2 → DST_FILTER_CUTOFF`
+///      routing of +6000 cents and an EG2 attack of 500 ms → the
+///      filter sweeps open across the note; the late portion of the
+///      rendered audio should be markedly louder than bank A's late
+///      portion.
+///
+/// This is the same logical assertion as the unit test
+/// `eg2_filter_sweep_changes_spectrum_over_note` but it travels the
+/// full DLS articulation pipeline (`art2` parsing → `Articulation`
+/// evaluator → `Articulation::mod_env()` + `Articulation::filter()` →
+/// `SamplePlayerConfig` → biquad coefficients), so it fails as a tight
+/// integration test if any layer drops the EG2 / filter values on the
+/// floor.
+#[test]
+fn dls_articulation_eg2_sweeps_filter_cutoff_open() {
+    // Time-cents = log2(0.5) * 1200 * 65536 ≈ -78_643_200 (500 ms).
+    let tc_500ms: i32 = (0.5f64.log2() * 1200.0 * 65536.0) as i32;
+    // EG2 → cutoff depth in DLS abs-pitch-cents units (1/65536 per cent):
+    // +6000 cents at full EG2 scale = +6000 * 65536.
+    let cutoff_sweep_cents: i32 = 6_000 * 65_536;
+    // Initial cutoff at ~250 Hz: cents = 1200 * log2(250/8.176) ≈ 5938.
+    let initial_cutoff_cents: i32 = 5_938 * 65_536;
+
+    // Bank A: low static cutoff, no EG2 routing.
+    let bank_a = build_dls_with_articulation(&[ArtBlock {
+        source: 0x0000,
+        control: 0x0000,
+        destination: 0x0500, // CONN_DST_FILTER_CUTOFF
+        transform: 0x0000,
+        scale: initial_cutoff_cents,
+    }]);
+    // Bank B: low static cutoff + EG2 → cutoff routing + slow EG2.
+    let bank_b = build_dls_with_articulation(&[
+        ArtBlock {
+            source: 0x0000,
+            control: 0x0000,
+            destination: 0x0500, // CONN_DST_FILTER_CUTOFF
+            transform: 0x0000,
+            scale: initial_cutoff_cents,
+        },
+        ArtBlock {
+            source: 0x0000,
+            control: 0x0000,
+            destination: 0x030A, // CONN_DST_EG2_ATTACKTIME
+            transform: 0x0000,
+            scale: tc_500ms,
+        },
+        ArtBlock {
+            source: 0x0000,
+            control: 0x0000,
+            destination: 0x030E, // CONN_DST_EG2_SUSTAINLEVEL
+            transform: 0x0000,
+            scale: 1_000, // 100 % sustain (kept at peak)
+        },
+        ArtBlock {
+            source: 0x0005, // CONN_SRC_EG2
+            control: 0x0000,
+            destination: 0x0500, // CONN_DST_FILTER_CUTOFF
+            transform: 0x0000,
+            scale: cutoff_sweep_cents,
+        },
+    ]);
+
+    let pcm_a = render_bank(&bank_a);
+    let pcm_b = render_bank(&bank_b);
+
+    // The SMF holds the note for 0.5 s @ 44.1 kHz output ≈ 22050
+    // samples. We split the rendered audio into "early" (~ first
+    // 100 ms) and "late" (≥ 300 ms in) windows.
+    let n = pcm_a.len().min(pcm_b.len());
+    assert!(n > 16_000, "expected >= 16 000 PCM samples, got {n}");
+    let early_a = rms(&pcm_a[1_000..4_410]);
+    let late_a = rms(&pcm_a[13_230..n.min(20_000)]);
+    let early_b = rms(&pcm_b[1_000..4_410]);
+    let late_b = rms(&pcm_b[13_230..n.min(20_000)]);
+
+    // Bank A (static low-pass) should be roughly steady across the
+    // two windows. We don't need bit-exactness — the volume envelope
+    // can still nudge the level — but the late window shouldn't be
+    // multiple-x louder than the early one.
+    let a_ratio = late_a / early_a.max(1e-6);
+    assert!(
+        a_ratio < 2.0,
+        "static-cutoff bank A should be steady; got early={early_a}, late={late_a} (ratio={a_ratio})"
+    );
+
+    // Bank B (EG2 sweep) must open the filter so the late window
+    // grows substantially louder than the early window. The integer
+    // 65536-unit DLS encoding plus the SamplePlayer's 50-cent biquad
+    // re-coef gate introduces some slack; we require >= 1.6x
+    // late/early gain.
+    let b_ratio = late_b / early_b.max(1e-6);
+    assert!(
+        b_ratio > 1.6,
+        "EG2 sweep bank B should open the filter; got early={early_b}, late={late_b} (ratio={b_ratio})"
+    );
+
+    // And bank B's late window must dominate bank A's late window —
+    // a static-cutoff bank can't open up like a swept-cutoff one
+    // does.
+    assert!(
+        late_b > late_a * 1.4,
+        "swept-cutoff late RMS {late_b} should dominate static-cutoff late RMS {late_a}"
+    );
+}
+
 #[test]
 fn dls_articulation_long_release_extends_voice_tail() {
     // Bank A: default 100 ms release. Bank B: 2 s release (DLS

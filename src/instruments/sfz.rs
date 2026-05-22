@@ -379,6 +379,12 @@ fn build_config_for_region(
         amplitude,
         envelope,
         vibrato,
+        // SFZ `fileg_*` / `fil_type` / `cutoff` opcodes are deferred —
+        // SFZ regions without those opcodes get the SF2-style inert
+        // defaults so the round-91 filter is invisible to legacy SFZ
+        // banks.
+        mod_env: Default::default(),
+        filter: Default::default(),
         exclusive_class: 0,
     }
 }

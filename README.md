@@ -60,7 +60,8 @@ framework but usable standalone.
   from `lfo01_freq` / `lfo01_pitch` / `lfo01_delay`. `#include` is
   rejected with `Error::Unsupported`; `#define` is preserved verbatim.
 - `instruments::dls` — DLS Level 1 + 2 RIFF reader **plus voice
-  generator** with **articulation interpretation** (round 80). Walks
+  generator** with **articulation interpretation** (round 80) and
+  **EG2 + 2-pole resonant low-pass filter** wiring (round 91). Walks
   the `RIFF/DLS ` form (`colh` / `vers` / `ptbl` / `lins-list` /
   `wvpl-list` / `INFO-list`), surfaces the parsed bank with
   instrument → region → wave-pool topology, `wsmp` loop / pitch /
@@ -72,9 +73,11 @@ framework but usable standalone.
   `wsmp.unity_note`, evaluates the region + instrument articulation
   through `instruments::articulation::Articulation::evaluate`, and
   plays the sample through the shared sample-playback voice with the
-  resolved DAHDSR envelope + vibrato LFO + tuning + gain applied.
-  Loop modes: forward loop (`WLOOP_TYPE_FORWARD`, DLS1) and release
-  loop (`WLOOP_TYPE_RELEASE`, DLS2).
+  resolved DAHDSR envelope + vibrato LFO + tuning + gain + the
+  modulation envelope (EG2) routed into a 2-pole resonant low-pass
+  filter cutoff (round 91). Loop modes: forward loop
+  (`WLOOP_TYPE_FORWARD`, DLS1) and release loop (`WLOOP_TYPE_RELEASE`,
+  DLS2).
 - `instruments::articulation` — DLS Level 1/2 connection-block
   evaluator backed by MMA DLS1 v1.1b Tables 1–2 + MMA DLS2.2 v1.0
   Amendment 2 Tables 5–10. Named constants for every `CONN_SRC_*` /
@@ -152,7 +155,7 @@ and the voice pool have run dry. Without an on-disk bank the
 registry-built decoder uses the pure-tone fallback; for SoundFont 2
 playback build a `MidiDecoder` directly with an `Sf2Instrument`.
 
-Coverage today (round 80): full SF2 voice with sm24 24-bit samples,
+Coverage today (round 91): full SF2 voice with sm24 24-bit samples,
 stereo zones, DAHDSR volume + modulation envelopes, low-pass biquad
 filter (gens 8/9), modEnv→pitch / modEnv→filter routing (gens 7/11),
 exclusive-class drum cuts (gen 57); pitch bend with **RPN 0 / 1 / 2 /
@@ -163,10 +166,19 @@ LFO (`lfo01_freq` / `lfo01_pitch`); **DLS Level 1 + 2 voice
 generator** with `art1`/`art2` connection-block interpretation
 (round 80) — Vol EG DAHDSR, vibrato LFO, tuning, gain, pan, plus the
 well-known `SRC_LFO → DST_PITCH` / `SRC_VIBRATO → DST_PITCH` /
-`SRC_LFO → DST_GAIN` routings; mod-env (EG2) + filter cutoff
-interpretation surfaces raw values but isn't wired into the
-SamplePlayer yet. All three instrument paths share one `SamplePlayer`
-voice for sample playback + DAHDSR + vibrato + pitch bend.
+`SRC_LFO → DST_GAIN` routings; **round 91** lands EG2 + filter
+rendering on the shared `SamplePlayer` — `SRC_NONE →
+DST_FILTER_CUTOFF` / `DST_FILTER_Q` initialise a per-voice 2-pole
+resonant low-pass biquad (RBJ low-pass against the SF2 v2.04 §8.1.3
+cents reference `fc_hz = 8.176 * 2^(cents/1200)`), and the
+`SRC_EG2 → DST_FILTER_CUTOFF` routing sweeps the cutoff each output
+frame from the EG2 DAHDSR envelope (every `CONN_DST_EG2_*`
+destination interpreted at voice-build time). All three instrument
+paths share one `SamplePlayer` voice for sample playback + DAHDSR
+amplitude envelope + vibrato + pitch bend + EG2 + filter (the SF2
+voice keeps its own parallel filter path for compatibility with
+stereo zones + 24-bit `sm24` samples; both biquads land the same
+RBJ cookbook math against the SF2 §8.1.3 reference).
 
 Round 75 also delivers the **MIDI Polyphonic Expression (MPE)** v1.1
 control surface (M1-100-UM): MCM-driven Lower / Upper zone

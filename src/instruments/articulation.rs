@@ -39,7 +39,7 @@
 //! evaluate here.
 
 use super::dls::DlsArticulationBlock;
-use super::sample_voice::{EnvelopeParams, VibratoParams};
+use super::sample_voice::{EnvelopeParams, FilterParams, ModEnvParams, VibratoParams};
 
 // ---------------------------------------------------------------------------
 // Numeric constants (Tables 8 + 9 + 10 of DLS Level 2.2).
@@ -600,6 +600,65 @@ impl Articulation {
             delay_s,
         }
     }
+
+    /// Effective [`ModEnvParams`] built from the EG2 destinations the
+    /// articulation evaluator collected. Round 91 wires the EG2 →
+    /// filter cutoff routing (`SRC_EG2 → DST_FILTER_CUTOFF`); EG2 →
+    /// pitch is still surfaced on `mod_to_pitch_cents` for a later
+    /// round to consume.
+    ///
+    /// Time-cents → seconds and sustain% → linear conversions match
+    /// DLS Level 2.2 §1.14.3 + Tables 5–6.
+    pub fn mod_env(&self) -> ModEnvParams {
+        ModEnvParams {
+            delay_s: time_cents_to_secs(self.mod_delay_tc),
+            attack_s: time_cents_to_secs(self.mod_attack_tc),
+            hold_s: time_cents_to_secs(self.mod_hold_tc),
+            decay_s: time_cents_to_secs(self.mod_decay_tc),
+            // DLS sustain is 0.1 % units of *percent-of-peak*
+            // (sustain_pct_to_linear handles ABSOLUTE_ZERO → 1.0). The
+            // SamplePlayer mod-env wants the linear sustain *level* so
+            // we pass that through directly.
+            sustain_level: sustain_pct_to_linear(self.mod_sustain_pct),
+            release_s: time_cents_to_secs(self.mod_release_tc),
+            // Round depth from f32 cents into i32 so the SamplePlayer's
+            // integer-cents path can do the arithmetic without
+            // recomputing the cast every sample.
+            to_filter_cents: self.mod_to_filter_cents.round() as i32,
+        }
+    }
+
+    /// Effective [`FilterParams`] built from the DLS2 filter
+    /// destinations (`CONN_DST_FILTER_CUTOFF` / `CONN_DST_FILTER_Q`).
+    /// Returns the SF2 "filter open" default (`cutoff_cents = 13500`,
+    /// `q_centibels = 0`) when the bank did not author either
+    /// destination — that's the sentinel the SamplePlayer detects to
+    /// skip the biquad entirely.
+    ///
+    /// The bridge from DLS units to SF2 units: DLS `DST_FILTER_CUTOFF`
+    /// is in absolute-cents-re-8.176-Hz exactly like SF2 `initialFilterFc`
+    /// (DLS Level 2.2 §1.14.1 "Absolute Pitch Cents"), and DLS
+    /// `DST_FILTER_Q` is in centibels exactly like SF2 `initialFilterQ`
+    /// (DLS Level 2.2 §1.5.2). Both formats use the same units in the
+    /// underlying spec, so the round-91 SamplePlayer can consume DLS
+    /// articulation values directly without a unit translation.
+    pub fn filter(&self) -> FilterParams {
+        // A region with no FILTER_CUTOFF block keeps the spec default
+        // (13500 cents = "filter open" per SF2 §8.1.3 — DLS2 uses the
+        // same default per Table 6). The articulation evaluator stores
+        // 0.0 in `filter_cutoff_cents` until a block sets it; map that
+        // back to the spec default here.
+        let cutoff_cents = if self.filter_cutoff_cents == 0.0 {
+            13_500
+        } else {
+            self.filter_cutoff_cents.round() as i32
+        };
+        let q_centibels = self.filter_q_centibels.round() as i32;
+        FilterParams {
+            cutoff_cents,
+            q_centibels,
+        }
+    }
 }
 
 /// Tracks which destinations a region's articulation list has overridden
@@ -830,5 +889,85 @@ mod tests {
         let a = Articulation::evaluate(&blocks, &[]);
         // Filter cutoff stays at default (0.0 cents — no override).
         assert_eq!(a.filter_cutoff_cents, 0.0);
+    }
+
+    // ----- Round 91 helpers -----
+
+    #[test]
+    fn default_mod_env_is_inert() {
+        let a = Articulation::default();
+        let me = a.mod_env();
+        assert!(
+            me.is_inert(),
+            "default articulation must yield inert mod-env"
+        );
+        assert_eq!(me.to_filter_cents, 0);
+        // Sustain falls back to 1.0 (sustain_pct_to_linear maps
+        // ABSOLUTE_ZERO → 100 % per DLS2 Table 5 default).
+        assert!((me.sustain_level - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn default_filter_is_open_sentinel() {
+        let a = Articulation::default();
+        let f = a.filter();
+        // No CONN_DST_FILTER_CUTOFF block → SF2 "filter open" sentinel.
+        assert_eq!(f.cutoff_cents, 13_500);
+        assert_eq!(f.q_centibels, 0);
+    }
+
+    #[test]
+    fn eg2_to_filter_routing_lands_on_mod_env() {
+        // SRC_EG2 → DST_FILTER_CUTOFF at +6000 cents (×65536 unit).
+        let blocks = vec![block(
+            CONN_SRC_EG2,
+            CONN_SRC_NONE,
+            CONN_DST_FILTER_CUTOFF,
+            CONN_TRN_NONE,
+            6_000 * 65_536,
+        )];
+        let a = Articulation::evaluate(&blocks, &[]);
+        let me = a.mod_env();
+        assert!(
+            !me.is_inert(),
+            "EG2 → filter routing should activate mod-env"
+        );
+        assert_eq!(me.to_filter_cents, 6_000);
+    }
+
+    #[test]
+    fn filter_cutoff_override_lands_on_filter() {
+        // Initial cutoff at ~250 Hz: cents = 1200*log2(250/8.176) ≈ 5938.
+        let blocks = vec![block(
+            CONN_SRC_NONE,
+            CONN_SRC_NONE,
+            CONN_DST_FILTER_CUTOFF,
+            CONN_TRN_NONE,
+            5_938 * 65_536,
+        )];
+        let a = Articulation::evaluate(&blocks, &[]);
+        let f = a.filter();
+        assert_eq!(f.cutoff_cents, 5_938);
+        assert_eq!(f.q_centibels, 0);
+    }
+
+    #[test]
+    fn eg2_attack_time_lands_on_mod_env_attack() {
+        // 200 ms attack: time_cents = log2(0.2) * 1200 * 65536.
+        let tc: i32 = (0.2f64.log2() * 1200.0 * 65536.0) as i32;
+        let blocks = vec![block(
+            CONN_SRC_NONE,
+            CONN_SRC_NONE,
+            CONN_DST_EG2_ATTACKTIME,
+            CONN_TRN_NONE,
+            tc,
+        )];
+        let a = Articulation::evaluate(&blocks, &[]);
+        let me = a.mod_env();
+        assert!(
+            (me.attack_s - 0.200).abs() < 0.005,
+            "EG2 attack should resolve to ~200 ms; got {} s",
+            me.attack_s
+        );
     }
 }

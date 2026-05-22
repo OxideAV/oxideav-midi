@@ -612,6 +612,15 @@ fn build_dls_config(
         amplitude,
         envelope: art.envelope(),
         vibrato: art.vibrato(),
+        // Round 91: EG2 + filter wiring. The Articulation evaluator
+        // collected the EG2 DAHDSR + the `SRC_EG2 → DST_FILTER_CUTOFF`
+        // depth + the initial cutoff/Q from `art2` blocks; bridging
+        // them into SamplePlayer is now a straight pass-through. Banks
+        // without `art2` filter destinations fall through to the
+        // SF2-style "filter open" default and the SamplePlayer skips
+        // the biquad.
+        mod_env: art.mod_env(),
+        filter: art.filter(),
         // DLS key_group: drum-kit style "this group cuts every prior
         // voice in the same group". Maps onto the Voice trait's
         // `exclusive_class` directly. Round-1 doesn't filter by
