@@ -56,7 +56,8 @@ use std::sync::Arc;
 use oxideav_core::{Error, Result};
 
 use super::sample_voice::{
-    EnvelopeParams, SampleLoopMode, SamplePlayer, SamplePlayerConfig, VibratoParams,
+    EnvelopeParams, FilterParams, FilterType, ModEnvParams, SampleLoopMode, SamplePlayer,
+    SamplePlayerConfig, VibratoParams,
 };
 use super::wav_pcm::decode_wav;
 use super::{Instrument, Voice};
@@ -367,6 +368,8 @@ fn build_config_for_region(
 
     let envelope = build_envelope_from_opcodes(&region.opcodes);
     let vibrato = build_vibrato_from_opcodes(&region.opcodes);
+    let filter = build_filter_from_opcodes(&region.opcodes);
+    let mod_env = build_mod_env_from_opcodes(&region.opcodes, filter.cutoff_cents);
 
     SamplePlayerConfig {
         samples: Arc::from(samples.to_vec().into_boxed_slice()),
@@ -379,12 +382,14 @@ fn build_config_for_region(
         amplitude,
         envelope,
         vibrato,
-        // SFZ `fileg_*` / `fil_type` / `cutoff` opcodes are deferred —
-        // SFZ regions without those opcodes get the SF2-style inert
-        // defaults so the round-91 filter is invisible to legacy SFZ
-        // banks.
-        mod_env: Default::default(),
-        filter: Default::default(),
+        // Round 95: SFZ `cutoff` / `resonance` / `fil_type` map straight
+        // into `FilterParams`; `fileg_*` (attack/decay/sustain/release/
+        // delay/hold + `fileg_depth` for the routing depth) maps into
+        // `ModEnvParams`. Regions without those opcodes still get the
+        // SF2-style "filter open" defaults so legacy SFZ banks remain
+        // bit-identical to the round-91 path.
+        mod_env,
+        filter,
         exclusive_class: 0,
     }
 }
@@ -436,6 +441,140 @@ fn build_vibrato_from_opcodes(opcodes: &BTreeMap<String, String>) -> VibratoPara
         freq_hz: pf(opcodes, &["lfo01_freq", "vibrato_freq"], 0.0).max(0.0),
         depth_cents: pf(opcodes, &["lfo01_pitch", "vibrato_depth"], 0.0),
         delay_s: pf(opcodes, &["lfo01_delay", "vibrato_delay"], 0.0).max(0.0),
+    }
+}
+
+/// Convert an SFZ `cutoff=` value (Hz) into SF2-style absolute cents
+/// re. 8.176 Hz: `cents = 1200 * log2(fc_hz / 8.176)`. Used to bridge
+/// SFZ's Hz-denominated filter opcodes into the shared `SamplePlayer`'s
+/// cents-based plumbing.
+///
+/// Out-of-range / non-positive inputs return the SF2 "filter open"
+/// sentinel (13500 cents ≈ 19914 Hz) so a bad opcode value leaves the
+/// filter inert rather than producing NaN coefficients downstream.
+fn hz_to_filter_cents(hz: f32) -> i32 {
+    if !(hz.is_finite() && hz > 0.0) {
+        return 13_500;
+    }
+    let cents = 1200.0 * (hz / 8.176_f32).log2();
+    // Clamp into the SF2 useful range. SF2 §8.1.3 gen 8 lists
+    // `1500..=13500`; lower than 1500 is sub-20-Hz and physically
+    // meaningless for an audio-band filter.
+    cents.round().clamp(1_500.0, 13_500.0) as i32
+}
+
+/// Build `FilterParams` from a region's flattened opcode map. Honours
+/// the SFZ v1 opcodes documented at `docs/audio/midi/instrument-formats/
+/// sfz-legacy.html` (Filter category): `cutoff=` (Hz, default = filter
+/// disabled), `resonance=` (dB, default 0, range 0..40), and
+/// `fil_type=` (string, default `lpf_2p`; values `lpf_1p`, `hpf_1p`,
+/// `lpf_2p`, `hpf_2p`, `bpf_2p`, `brf_2p`).
+///
+/// When `cutoff` is absent the region keeps the SF2 default of 13500
+/// cents (filter open). `resonance` dB → centibels is `cb = dB * 10`
+/// (the centibel is the SF2 unit, defined as 0.1 dB in §8.1.3 gen 9 —
+/// SFZ's dB-denominated `resonance` opcode maps directly). The SFZ
+/// `resonance` default of 0 dB matches the SF2 Butterworth Q.
+fn build_filter_from_opcodes(opcodes: &BTreeMap<String, String>) -> FilterParams {
+    // `cutoff` / `cutoff2` are aliases per the opcode index — same for
+    // `resonance` / `resonance2`, and `fil_type` / `filtype`.
+    let cutoff_hz = opcodes
+        .get("cutoff")
+        .or_else(|| opcodes.get("cutoff2"))
+        .and_then(|s| s.trim().parse::<f32>().ok());
+
+    let resonance_db = opcodes
+        .get("resonance")
+        .or_else(|| opcodes.get("resonance2"))
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .unwrap_or(0.0)
+        .clamp(0.0, 40.0);
+
+    let kind = opcodes
+        .get("fil_type")
+        .or_else(|| opcodes.get("filtype"))
+        .map(|s| FilterType::parse_sfz(s))
+        .unwrap_or_default();
+
+    let cutoff_cents = match cutoff_hz {
+        Some(hz) => hz_to_filter_cents(hz),
+        // No `cutoff` opcode → SFZ semantics say "filter disabled". The
+        // shared `SamplePlayer` reads cutoff_cents >= 13000 as the
+        // filter-bypass sentinel for low-pass shapes; for HP/BP/BRF
+        // the explicit non-low-pass `fil_type` keeps the biquad active
+        // even at the sentinel cutoff (see `SamplePlayer::new`'s
+        // `non_lowpass` branch), so we still emit the sentinel and let
+        // the player decide.
+        None => 13_500,
+    };
+
+    FilterParams {
+        cutoff_cents,
+        q_centibels: (resonance_db * 10.0).round() as i32,
+        kind,
+    }
+}
+
+/// Build `ModEnvParams` from a region's flattened opcode map. Honours
+/// the SFZ v1 `fileg_*` Envelope-Generator opcodes documented at
+/// `docs/audio/midi/instrument-formats/sfz-opcodes-index.html` (EG
+/// category):
+///
+/// - `fileg_delay`, `fileg_attack`, `fileg_hold`, `fileg_decay`,
+///   `fileg_release` — seconds (range `0..100`, default 0). SFZ v2
+///   aliases `fil_delay` etc. are honoured.
+/// - `fileg_sustain` — percentage (range `0..100`, default 0). The
+///   shared `SamplePlayer` consumes the value as a 0..=1 fraction.
+/// - `fileg_depth` — cents (range `-12000..12000`, default 0). This
+///   is the mod-env → filter-cutoff routing depth; with `0` the
+///   per-sample mod-env compute is skipped entirely.
+///
+/// `current_cutoff_cents` is the region's initial cutoff (already
+/// derived by [`build_filter_from_opcodes`]). When the routing depth
+/// is non-zero this is used as a sanity check: if the initial cutoff
+/// is at the "filter open" sentinel *and* the depth would drag the
+/// live cutoff into the audible band, the depth alone is enough for
+/// `SamplePlayer::new` to allocate the biquad — see the `needs_filter`
+/// gate. We just compute the routing depth here and let the player
+/// decide.
+fn build_mod_env_from_opcodes(
+    opcodes: &BTreeMap<String, String>,
+    _current_cutoff_cents: i32,
+) -> ModEnvParams {
+    fn pf(map: &BTreeMap<String, String>, keys: &[&str], default: f32) -> f32 {
+        for k in keys {
+            if let Some(s) = map.get(*k) {
+                if let Ok(v) = s.trim().parse::<f32>() {
+                    return v;
+                }
+            }
+        }
+        default
+    }
+    fn pi(map: &BTreeMap<String, String>, keys: &[&str], default: i32) -> i32 {
+        for k in keys {
+            if let Some(s) = map.get(*k) {
+                if let Ok(v) = s.trim().parse::<i32>() {
+                    return v;
+                }
+            }
+        }
+        default
+    }
+
+    // SFZ `fileg_sustain` is in percent (0..=100); the `SamplePlayer`
+    // expects `0..=1`.
+    let sustain_pct = pf(opcodes, &["fileg_sustain", "fil_sustain"], 0.0).clamp(0.0, 100.0);
+    let depth_cents = pi(opcodes, &["fileg_depth", "fil_depth"], 0).clamp(-12_000, 12_000);
+
+    ModEnvParams {
+        delay_s: pf(opcodes, &["fileg_delay", "fil_delay"], 0.0).max(0.0),
+        attack_s: pf(opcodes, &["fileg_attack", "fil_attack"], 0.0).max(0.0),
+        hold_s: pf(opcodes, &["fileg_hold", "fil_hold"], 0.0).max(0.0),
+        decay_s: pf(opcodes, &["fileg_decay", "fil_decay"], 0.0).max(0.0),
+        sustain_level: sustain_pct / 100.0,
+        release_s: pf(opcodes, &["fileg_release", "fil_release"], 0.0).max(0.0),
+        to_filter_cents: depth_cents,
     }
 }
 
@@ -1386,5 +1525,355 @@ mod tests {
             Path::new("My Drum Kit/kick.wav"),
         );
         assert_eq!(patch.regions[0].lokey, 36);
+    }
+
+    // ---------------------------------------------------------------------
+    // Round 95: SFZ-side filter envelope + fil_type + cutoff wiring.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn hz_to_filter_cents_round_trips_known_values() {
+        // 8.176 Hz is the SF2 reference, so 8.176 Hz → 0 cents (clamped
+        // to the §8.1.3 useful range 1500..=13500, so we get 1500).
+        assert_eq!(hz_to_filter_cents(8.176), 1_500);
+        // 440 Hz → 1200 * log2(440/8.176) ≈ 6892 cents.
+        let cents_440 = hz_to_filter_cents(440.0);
+        assert!(
+            (6_880..=6_905).contains(&cents_440),
+            "440 Hz → ~6892 cents, got {cents_440}",
+        );
+        // 20 kHz → 13500 cents (clamped at the upper end).
+        assert_eq!(hz_to_filter_cents(20_000.0), 13_500);
+        // Non-positive / NaN → SF2 "filter open" sentinel.
+        assert_eq!(hz_to_filter_cents(0.0), 13_500);
+        assert_eq!(hz_to_filter_cents(-1.0), 13_500);
+        assert_eq!(hz_to_filter_cents(f32::NAN), 13_500);
+    }
+
+    #[test]
+    fn build_filter_from_opcodes_honours_cutoff_resonance_filtype() {
+        let mut map = BTreeMap::new();
+        map.insert("cutoff".to_string(), "440".to_string());
+        map.insert("resonance".to_string(), "6".to_string());
+        map.insert("fil_type".to_string(), "hpf_2p".to_string());
+        let f = build_filter_from_opcodes(&map);
+        // 440 Hz cutoff → ~6892 cents.
+        assert!(
+            (6_880..=6_905).contains(&f.cutoff_cents),
+            "expected ~6892 cents, got {}",
+            f.cutoff_cents,
+        );
+        // 6 dB resonance → 60 centibels.
+        assert_eq!(f.q_centibels, 60);
+        assert_eq!(f.kind, FilterType::TwoPoleHighPass);
+    }
+
+    #[test]
+    fn build_filter_from_opcodes_defaults_to_open_lpf_2p() {
+        // No filter opcodes → cutoff at SF2 "open" sentinel, no
+        // resonance, default lpf_2p kind.
+        let map = BTreeMap::new();
+        let f = build_filter_from_opcodes(&map);
+        assert_eq!(f.cutoff_cents, 13_500);
+        assert_eq!(f.q_centibels, 0);
+        assert_eq!(f.kind, FilterType::TwoPoleLowPass);
+    }
+
+    #[test]
+    fn build_filter_from_opcodes_clamps_resonance_into_range() {
+        // SFZ resonance range is 0..=40 dB per the legacy spec.
+        let mut map = BTreeMap::new();
+        map.insert("cutoff".to_string(), "1000".to_string());
+        map.insert("resonance".to_string(), "100".to_string());
+        let f = build_filter_from_opcodes(&map);
+        // Clamped to 40 dB → 400 cB.
+        assert_eq!(f.q_centibels, 400);
+        // Negative resonance also clamps to 0.
+        let mut neg = BTreeMap::new();
+        neg.insert("cutoff".to_string(), "1000".to_string());
+        neg.insert("resonance".to_string(), "-5".to_string());
+        let fn_ = build_filter_from_opcodes(&neg);
+        assert_eq!(fn_.q_centibels, 0);
+    }
+
+    #[test]
+    fn filter_type_parse_covers_all_sfz_v1_values() {
+        // Every value listed in `docs/audio/midi/instrument-formats/
+        // sfz-legacy.html` "Filter type" table.
+        assert_eq!(FilterType::parse_sfz("lpf_1p"), FilterType::OnePoleLowPass);
+        assert_eq!(FilterType::parse_sfz("hpf_1p"), FilterType::OnePoleHighPass,);
+        assert_eq!(FilterType::parse_sfz("lpf_2p"), FilterType::TwoPoleLowPass);
+        assert_eq!(FilterType::parse_sfz("hpf_2p"), FilterType::TwoPoleHighPass,);
+        assert_eq!(FilterType::parse_sfz("bpf_2p"), FilterType::TwoPoleBandPass);
+        assert_eq!(
+            FilterType::parse_sfz("brf_2p"),
+            FilterType::TwoPoleBandReject,
+        );
+        // Case-insensitive.
+        assert_eq!(FilterType::parse_sfz("LPF_2P"), FilterType::TwoPoleLowPass);
+        // Unknown → default.
+        assert_eq!(
+            FilterType::parse_sfz("nonsense"),
+            FilterType::TwoPoleLowPass
+        );
+    }
+
+    #[test]
+    fn build_mod_env_from_opcodes_honours_fileg_set() {
+        let mut map = BTreeMap::new();
+        map.insert("fileg_delay".to_string(), "0.01".to_string());
+        map.insert("fileg_attack".to_string(), "0.05".to_string());
+        map.insert("fileg_hold".to_string(), "0.02".to_string());
+        map.insert("fileg_decay".to_string(), "0.10".to_string());
+        map.insert("fileg_sustain".to_string(), "40".to_string());
+        map.insert("fileg_release".to_string(), "0.20".to_string());
+        map.insert("fileg_depth".to_string(), "1200".to_string());
+        let m = build_mod_env_from_opcodes(&map, 13_500);
+        assert!((m.delay_s - 0.01).abs() < 1e-6);
+        assert!((m.attack_s - 0.05).abs() < 1e-6);
+        assert!((m.hold_s - 0.02).abs() < 1e-6);
+        assert!((m.decay_s - 0.10).abs() < 1e-6);
+        // 40 % → 0.4 fraction.
+        assert!((m.sustain_level - 0.40).abs() < 1e-6);
+        assert!((m.release_s - 0.20).abs() < 1e-6);
+        assert_eq!(m.to_filter_cents, 1_200);
+        assert!(!m.is_inert());
+    }
+
+    #[test]
+    fn build_mod_env_from_opcodes_aliases_v2_names() {
+        // SFZ v2 uses `fil_*` aliases for the `fileg_*` opcodes; the
+        // alias table is in `sfz-opcodes-index.html`.
+        let mut map = BTreeMap::new();
+        map.insert("fil_attack".to_string(), "0.07".to_string());
+        map.insert("fil_release".to_string(), "0.30".to_string());
+        map.insert("fil_depth".to_string(), "-2400".to_string());
+        let m = build_mod_env_from_opcodes(&map, 13_500);
+        assert!((m.attack_s - 0.07).abs() < 1e-6);
+        assert!((m.release_s - 0.30).abs() < 1e-6);
+        assert_eq!(m.to_filter_cents, -2_400);
+    }
+
+    #[test]
+    fn build_mod_env_default_is_inert() {
+        let map = BTreeMap::new();
+        let m = build_mod_env_from_opcodes(&map, 13_500);
+        assert_eq!(m.to_filter_cents, 0);
+        assert!(m.is_inert());
+    }
+
+    #[test]
+    fn build_mod_env_clamps_depth() {
+        // `fileg_depth` documented range is -12000..=12000 cents.
+        let mut hi = BTreeMap::new();
+        hi.insert("fileg_depth".to_string(), "30000".to_string());
+        assert_eq!(
+            build_mod_env_from_opcodes(&hi, 13_500).to_filter_cents,
+            12_000,
+        );
+        let mut lo = BTreeMap::new();
+        lo.insert("fileg_depth".to_string(), "-30000".to_string());
+        assert_eq!(
+            build_mod_env_from_opcodes(&lo, 13_500).to_filter_cents,
+            -12_000,
+        );
+    }
+
+    #[test]
+    fn full_template_smoke_drops_cutoff_into_sample_player() {
+        // The tutorial template carries fil_type=lpf_2p, cutoff=440,
+        // resonance=2 — those should land on the region's resolved
+        // FilterParams.
+        let text = "
+            <group>
+              fil_type=lpf_2p
+              cutoff=440
+              resonance=2
+            <region> sample=a.wav key=60
+        ";
+        let patch = parse_str(text).unwrap();
+        let r = &patch.regions[0];
+        let f = build_filter_from_opcodes(&r.opcodes);
+        // 440 Hz → ~6892 cents.
+        assert!(
+            (6_880..=6_905).contains(&f.cutoff_cents),
+            "cutoff_cents = {}",
+            f.cutoff_cents,
+        );
+        // 2 dB → 20 cB.
+        assert_eq!(f.q_centibels, 20);
+        assert_eq!(f.kind, FilterType::TwoPoleLowPass);
+    }
+
+    #[test]
+    fn sfz_with_low_cutoff_attenuates_high_frequencies() {
+        // End-to-end: build a one-region patch with a 5 kHz sine sample
+        // and a 440 Hz cutoff. The voice render should be considerably
+        // quieter than the same patch with no filter (the round-91
+        // SamplePlayer biquad is doing its job under SFZ control).
+        let tmp = std::env::temp_dir().join("oxideav-midi-sfz-r95-lp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // 5 kHz sine, 1 second, 44.1 kHz.
+        let sr = 44_100u32;
+        let samples: Vec<i16> = (0..sr as usize)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let v = (2.0 * std::f32::consts::PI * 5_000.0 * t).sin();
+                (v * 16_384.0) as i16
+            })
+            .collect();
+        let wav = build_test_wav(&samples, sr);
+        std::fs::write(tmp.join("sine.wav"), &wav).unwrap();
+
+        // No filter (baseline).
+        let baseline_path = tmp.join("baseline.sfz");
+        std::fs::write(
+            &baseline_path,
+            b"<region> sample=sine.wav key=60 pitch_keycenter=60\n",
+        )
+        .unwrap();
+        // 440 Hz low-pass — should knock out the 5 kHz sine.
+        let lp_path = tmp.join("lp.sfz");
+        std::fs::write(
+            &lp_path,
+            b"<region> sample=sine.wav key=60 pitch_keycenter=60 cutoff=440 fil_type=lpf_2p\n",
+        )
+        .unwrap();
+
+        let baseline_inst = SfzInstrument::open(&baseline_path).unwrap();
+        let lp_inst = SfzInstrument::open(&lp_path).unwrap();
+        let mut baseline = baseline_inst.make_voice(0, 60, 100, sr).unwrap();
+        let mut lp = lp_inst.make_voice(0, 60, 100, sr).unwrap();
+        let mut buf_base = vec![0.0f32; 16_384];
+        let mut buf_lp = vec![0.0f32; 16_384];
+        baseline.render(&mut buf_base);
+        lp.render(&mut buf_lp);
+        // RMS on the tail so the filter transient has settled.
+        fn rms(s: &[f32]) -> f32 {
+            (s.iter().map(|v| v * v).sum::<f32>() / s.len().max(1) as f32).sqrt()
+        }
+        let r_base = rms(&buf_base[8_192..]);
+        let r_lp = rms(&buf_lp[8_192..]);
+        assert!(
+            r_lp < r_base * 0.3,
+            "440 Hz lpf_2p should attenuate 5 kHz sine; got baseline={r_base}, lp={r_lp}",
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sfz_high_pass_inverts_attenuation() {
+        // Same fixture as the low-pass test, but with `fil_type=hpf_2p`
+        // and a high cutoff (10 kHz). The 5 kHz sine sits *below* the
+        // cutoff so a high-pass should attenuate it.
+        let tmp = std::env::temp_dir().join("oxideav-midi-sfz-r95-hp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sr = 44_100u32;
+        let samples: Vec<i16> = (0..sr as usize)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let v = (2.0 * std::f32::consts::PI * 5_000.0 * t).sin();
+                (v * 16_384.0) as i16
+            })
+            .collect();
+        let wav = build_test_wav(&samples, sr);
+        std::fs::write(tmp.join("sine.wav"), &wav).unwrap();
+        let baseline = tmp.join("baseline.sfz");
+        std::fs::write(
+            &baseline,
+            b"<region> sample=sine.wav key=60 pitch_keycenter=60\n",
+        )
+        .unwrap();
+        let hp = tmp.join("hp.sfz");
+        std::fs::write(
+            &hp,
+            b"<region> sample=sine.wav key=60 pitch_keycenter=60 cutoff=10000 fil_type=hpf_2p\n",
+        )
+        .unwrap();
+        let baseline_inst = SfzInstrument::open(&baseline).unwrap();
+        let hp_inst = SfzInstrument::open(&hp).unwrap();
+        let mut base = baseline_inst.make_voice(0, 60, 100, sr).unwrap();
+        let mut hpv = hp_inst.make_voice(0, 60, 100, sr).unwrap();
+        let mut buf_base = vec![0.0f32; 16_384];
+        let mut buf_hp = vec![0.0f32; 16_384];
+        base.render(&mut buf_base);
+        hpv.render(&mut buf_hp);
+        fn rms(s: &[f32]) -> f32 {
+            (s.iter().map(|v| v * v).sum::<f32>() / s.len().max(1) as f32).sqrt()
+        }
+        let r_base = rms(&buf_base[8_192..]);
+        let r_hp = rms(&buf_hp[8_192..]);
+        assert!(
+            r_hp < r_base * 0.5,
+            "10 kHz hpf_2p should attenuate the 5 kHz sine; got baseline={r_base}, hp={r_hp}",
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sfz_fileg_sweeps_cutoff_open_during_attack() {
+        // Build a patch with a low initial cutoff (250 Hz) and a
+        // mod-env that sweeps +7200 cents (6 octaves) over a 500 ms
+        // attack. The early window should be heavily attenuated; the
+        // late window (post-attack) should pass through almost
+        // unchanged. Same shape as the SamplePlayer-side sweep test
+        // but driven entirely from SFZ opcodes.
+        let tmp = std::env::temp_dir().join("oxideav-midi-sfz-r95-eg");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sr = 44_100u32;
+        let samples: Vec<i16> = (0..sr as usize)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                let v = (2.0 * std::f32::consts::PI * 5_000.0 * t).sin();
+                (v * 16_384.0) as i16
+            })
+            .collect();
+        let wav = build_test_wav(&samples, sr);
+        std::fs::write(tmp.join("sine.wav"), &wav).unwrap();
+        let path = tmp.join("eg.sfz");
+        std::fs::write(
+            &path,
+            b"<region> sample=sine.wav key=60 pitch_keycenter=60 \
+              cutoff=250 fil_type=lpf_2p \
+              fileg_attack=0.500 fileg_hold=1.0 fileg_decay=0.001 \
+              fileg_sustain=100 fileg_release=0.001 fileg_depth=7200\n",
+        )
+        .unwrap();
+        let inst = SfzInstrument::open(&path).unwrap();
+        let mut v = inst.make_voice(0, 60, 100, sr).unwrap();
+        let mut buf = vec![0.0f32; sr as usize];
+        v.render(&mut buf);
+        fn rms(s: &[f32]) -> f32 {
+            (s.iter().map(|v| v * v).sum::<f32>() / s.len().max(1) as f32).sqrt()
+        }
+        // Early window (20–80 ms): cutoff still near 250 Hz, 5 kHz
+        // heavily attenuated.
+        let early = rms(&buf[880..3_528]);
+        // Late window (850–950 ms): mod-env saturated, cutoff at
+        // 250 Hz + 7200 cents ≈ 16 kHz, 5 kHz passes freely.
+        let late = rms(&buf[37_485..41_895]);
+        let gain = late / early.max(1e-6);
+        assert!(
+            gain > 5.0,
+            "fileg_depth=7200 should sweep the cutoff open; got gain={gain} (early={early}, late={late})",
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn build_config_for_region_default_filter_open() {
+        // A region with no filter opcodes → SamplePlayerConfig filter
+        // at the SF2 "open" sentinel (legacy SFZ → bit-identical to
+        // round-91 output).
+        let patch = parse_str("<region> sample=a.wav key=60 pitch_keycenter=60").unwrap();
+        let region = &patch.regions[0];
+        let cfg = build_config_for_region(region, &[0.0; 64], 44_100, 60, 100);
+        assert_eq!(cfg.filter.cutoff_cents, 13_500);
+        assert_eq!(cfg.filter.q_centibels, 0);
+        assert_eq!(cfg.filter.kind, FilterType::TwoPoleLowPass);
+        assert_eq!(cfg.mod_env.to_filter_cents, 0);
     }
 }

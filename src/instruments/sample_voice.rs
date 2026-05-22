@@ -43,9 +43,16 @@
 //! Both EG2 + filter are off by default — a [`ModEnvParams`] with
 //! `attack_s == 0 && sustain_level == 0 && to_filter_cents == 0` skips
 //! the per-sample mod-env compute, and a [`FilterParams`] left at its
-//! default (`cutoff_cents == 13500`, the SF2 "filter inert" sentinel)
-//! skips the biquad entirely so legacy SFZ / unconfigured DLS regions
-//! stay bit-identical to the round-80 output.
+//! default (`cutoff_cents == 13500`, the SF2 "filter inert" sentinel,
+//! plus `kind == TwoPoleLowPass`) skips the biquad entirely so legacy
+//! SFZ / unconfigured DLS regions stay bit-identical to the round-80
+//! output.
+//!
+//! Round 95 generalises the biquad to all six SFZ v1 `fil_type` shapes
+//! via [`FilterType`]: one-pole / two-pole low-pass / high-pass /
+//! band-pass / band-reject. SF2 + DLS keep the round-91 two-pole
+//! low-pass shape; SFZ patches with explicit `fil_type=` opcodes
+//! select the matching variant.
 
 use std::sync::Arc;
 
@@ -183,6 +190,62 @@ impl ModEnvParams {
     }
 }
 
+/// Filter response shape. The SF2 / DLS path uses [`FilterType::LowPass2P`]
+/// exclusively (both formats hard-code a 2-pole resonant low-pass); SFZ
+/// patches can request any of the six SFZ v1 `fil_type` values via
+/// [`FilterParams::kind`].
+///
+/// Round 95 adds the SFZ shapes: one-pole and two-pole low-pass /
+/// high-pass / band-pass / band-reject. Coefficient derivation is the
+/// project's own clean-room RBJ-cookbook math (bilinear transform of the
+/// canonical analog prototypes); the SFZ "Aria reference" pages
+/// (`sfz-legacy.html` "Filter type" table and `sfz-opcodes-index.html`
+/// `fil_type` entry) only document the response *shape* and slope
+/// (6 dB/oct one-pole, 12 dB/oct two-pole), not the discretisation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FilterType {
+    /// `lpf_1p` — one-pole low-pass, 6 dB/octave. Resonance opcodes are
+    /// ignored (one-pole sections have no resonant peak).
+    OnePoleLowPass,
+    /// `hpf_1p` — one-pole high-pass, 6 dB/octave. Resonance ignored.
+    OnePoleHighPass,
+    /// `lpf_2p` — two-pole resonant low-pass, 12 dB/octave (SFZ default,
+    /// and the only response the SF2 / DLS biquad uses).
+    #[default]
+    TwoPoleLowPass,
+    /// `hpf_2p` — two-pole resonant high-pass, 12 dB/octave.
+    TwoPoleHighPass,
+    /// `bpf_2p` — two-pole resonant band-pass, 12 dB/octave.
+    TwoPoleBandPass,
+    /// `brf_2p` — two-pole resonant band-reject (notch), 12 dB/octave.
+    TwoPoleBandReject,
+}
+
+impl FilterType {
+    /// Parse a SFZ `fil_type` value. Unknown strings fall back to
+    /// `TwoPoleLowPass` per the SFZ-legacy default (`fil_type=lpf_2p`).
+    pub fn parse_sfz(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "lpf_1p" => FilterType::OnePoleLowPass,
+            "hpf_1p" => FilterType::OnePoleHighPass,
+            "lpf_2p" => FilterType::TwoPoleLowPass,
+            "hpf_2p" => FilterType::TwoPoleHighPass,
+            "bpf_2p" => FilterType::TwoPoleBandPass,
+            "brf_2p" => FilterType::TwoPoleBandReject,
+            _ => FilterType::TwoPoleLowPass,
+        }
+    }
+
+    /// `true` for the two single-pole responses (which ignore `q_centibels`
+    /// and use a simpler one-pole IIR rather than a biquad).
+    pub fn is_one_pole(self) -> bool {
+        matches!(
+            self,
+            FilterType::OnePoleLowPass | FilterType::OnePoleHighPass
+        )
+    }
+}
+
 /// 2-pole resonant low-pass filter parameters. Per SF2 v2.04 §8.1.3
 /// generators 8 + 9 ("second order resonant pole pair") and DLS Level
 /// 2.2 §1.5.2 `CONN_DST_FILTER_CUTOFF` / `CONN_DST_FILTER_Q`.
@@ -195,22 +258,35 @@ impl ModEnvParams {
 ///
 /// `q_centibels` is in centibels (0.1 dB units), useful range
 /// `0..=960` per §8.1.3 gen 9. `0` = Butterworth (`Q ≈ 0.707`).
+///
+/// `kind` selects the response shape (round 95). SF2 / DLS construct
+/// `FilterParams` without touching this field and therefore inherit the
+/// default `TwoPoleLowPass`, which preserves round-91 behaviour exactly.
+/// SFZ patches that author `fil_type=` get the matching variant.
 #[derive(Clone, Copy, Debug)]
 pub struct FilterParams {
     /// Initial cutoff in absolute cents re. 8.176 Hz. Default 13500
     /// (≈ 19914 Hz, effectively no filter).
     pub cutoff_cents: i32,
     /// Resonance in centibels (10 cB = 1 dB). Default 0 (Butterworth).
+    /// Ignored for the two one-pole filter kinds.
     pub q_centibels: i32,
+    /// Response shape. Defaults to two-pole low-pass — the SF2 / DLS
+    /// behaviour from round 91. SFZ regions with `fil_type=` opcodes
+    /// override this.
+    pub kind: FilterType,
 }
 
 impl Default for FilterParams {
     fn default() -> Self {
         // SF2 §8.1.3 default: initialFilterFc = 13500 (filter open),
-        // initialFilterQ = 0 (no resonance).
+        // initialFilterQ = 0 (no resonance). SFZ default fil_type=lpf_2p
+        // matches the SF2 hard-coded shape, so the default `kind` is the
+        // two-pole low-pass for both formats.
         Self {
             cutoff_cents: 13_500,
             q_centibels: 0,
+            kind: FilterType::TwoPoleLowPass,
         }
     }
 }
@@ -325,6 +401,10 @@ pub struct SamplePlayer {
     initial_filter_fc_cents: i32,
     /// Resonance, centibels (0 = Butterworth).
     initial_filter_q_cb: i32,
+    /// Filter response shape (round 95). SF2 / DLS keep
+    /// [`FilterType::TwoPoleLowPass`]; SFZ patches with `fil_type=`
+    /// opcodes select one of the six SFZ v1 shapes.
+    filter_kind: FilterType,
     /// Per-voice biquad. `None` when the filter is "open" (cutoff at
     /// the SF2 default 13500 cents *and* no mod-env routing pulls it
     /// into the audible range) — skips the per-sample compute entirely.
@@ -402,9 +482,17 @@ impl SamplePlayer {
         // "filter open" sentinel; we also skip when the mod-env can't
         // drag it below 13000 cents (≈18 kHz) because anything above
         // that is well outside the audible band on a typical 44.1 kHz
-        // render.
-        let needs_filter =
-            cfg.filter.cutoff_cents < 13_000 || cfg.mod_env.to_filter_cents.abs() > 200;
+        // render. The "open" shortcut only applies to low-pass shapes —
+        // a high-pass / band-pass / band-reject filter is *not* inert at
+        // 13500 cents, so any explicit non-low-pass `fil_type` selection
+        // forces the biquad on.
+        let non_lowpass = !matches!(
+            cfg.filter.kind,
+            FilterType::TwoPoleLowPass | FilterType::OnePoleLowPass
+        );
+        let needs_filter = cfg.filter.cutoff_cents < 13_000
+            || cfg.mod_env.to_filter_cents.abs() > 200
+            || non_lowpass;
         let filter = if needs_filter {
             Some(BiquadState::new())
         } else {
@@ -455,6 +543,7 @@ impl SamplePlayer {
 
             initial_filter_fc_cents: cfg.filter.cutoff_cents,
             initial_filter_q_cb: cfg.filter.q_centibels,
+            filter_kind: cfg.filter.kind,
             filter,
         }
     }
@@ -543,17 +632,24 @@ impl SamplePlayer {
         self.mod_env_sustain_level
     }
 
-    /// Recompute biquad coefficients for a 2-pole resonant low-pass at
-    /// the given absolute-cents cutoff. Direct-form 1, RBJ cookbook
-    /// math (clean-room derivation; spec only specifies "second order
-    /// resonant pole pair" — §8.1.3 explicitly leaves filter
-    /// implementation to the renderer per §9.7).
+    /// Recompute biquad coefficients for the configured
+    /// [`FilterType`] at the given absolute-cents cutoff. Direct-form 1,
+    /// RBJ-cookbook math (clean-room derivation; the SF2 spec only
+    /// specifies "second order resonant pole pair" per §8.1.3 + §9.7,
+    /// and the SFZ-legacy reference's `fil_type` table likewise only
+    /// names the response shape + 6/12 dB-per-octave slope without
+    /// specifying the discrete realisation).
     ///
     /// `cutoff_cents` is clamped to the SF2 useful range
     /// `1500..=13500` (§8.1.3), then converted to Hz via
     /// `fc_hz = 8.176 * 2^(cents/1200)` and further clipped at
     /// `0.99 * Nyquist` so a hostile bank can't request a cutoff that
     /// the bi-linear transform can't represent.
+    ///
+    /// One-pole shapes (`OnePoleLowPass`, `OnePoleHighPass`) bypass the
+    /// resonance term entirely (a one-pole section has no resonant
+    /// peak) and write `b2 = a2 = 0` so the same `tick()` math still
+    /// applies — keeping the per-sample inner loop branch-free.
     fn update_filter_coeffs(&mut self, cutoff_cents: i32) {
         let Some(filter) = self.filter.as_mut() else {
             return;
@@ -562,24 +658,79 @@ impl SamplePlayer {
         let cutoff_hz = 8.176_f32 * (2.0_f32).powf(cents as f32 / 1200.0);
         let nyquist = self.output_rate * 0.5;
         let cutoff_hz = cutoff_hz.min(nyquist * 0.99).max(20.0);
-        // Q (cB) → linear Q. 0 cB = Butterworth (≈ 0.707). Clamp at 16
-        // to bound resonance — a runaway Q produces NaN coefficients.
-        let q_lin = (10.0_f32).powf(self.initial_filter_q_cb as f32 / 200.0)
-            * std::f32::consts::FRAC_1_SQRT_2;
-        let q = q_lin.clamp(0.1, 16.0);
-        let omega = 2.0 * std::f32::consts::PI * cutoff_hz / self.output_rate;
-        let alpha = omega.sin() / (2.0 * q);
-        let cos_w = omega.cos();
-        // RBJ low-pass:
-        //   b0 = (1 - cos)/2, b1 = 1 - cos, b2 = (1 - cos)/2,
-        //   a0 = 1 + alpha,   a1 = -2 cos,  a2 = 1 - alpha.
-        let a0 = 1.0 + alpha;
-        let inv_a0 = 1.0 / a0;
-        filter.b0 = ((1.0 - cos_w) * 0.5) * inv_a0;
-        filter.b1 = (1.0 - cos_w) * inv_a0;
-        filter.b2 = ((1.0 - cos_w) * 0.5) * inv_a0;
-        filter.a1 = (-2.0 * cos_w) * inv_a0;
-        filter.a2 = (1.0 - alpha) * inv_a0;
+
+        match self.filter_kind {
+            FilterType::OnePoleLowPass => {
+                // RBJ-style one-pole low-pass via bilinear of `1/(s+ω₀)`:
+                //   y[n] = b0·x[n] + b1·x[n-1] - a1·y[n-1]
+                // Normalised so DC gain = 1. `a2 = b2 = 0` so the
+                // direct-form-1 biquad math reduces to the one-pole
+                // recurrence on its own.
+                let omega = 2.0 * std::f32::consts::PI * cutoff_hz / self.output_rate;
+                // tan(ω/2) prewarp gives the canonical bilinear
+                // low-pass coefficients.
+                let k = (omega * 0.5).tan();
+                let norm = 1.0 / (1.0 + k);
+                filter.b0 = k * norm;
+                filter.b1 = k * norm;
+                filter.b2 = 0.0;
+                filter.a1 = (k - 1.0) * norm;
+                filter.a2 = 0.0;
+            }
+            FilterType::OnePoleHighPass => {
+                // Bilinear of `s/(s+ω₀)` — DC gain = 0, Nyquist gain = 1.
+                let omega = 2.0 * std::f32::consts::PI * cutoff_hz / self.output_rate;
+                let k = (omega * 0.5).tan();
+                let norm = 1.0 / (1.0 + k);
+                filter.b0 = norm;
+                filter.b1 = -norm;
+                filter.b2 = 0.0;
+                filter.a1 = (k - 1.0) * norm;
+                filter.a2 = 0.0;
+            }
+            FilterType::TwoPoleLowPass
+            | FilterType::TwoPoleHighPass
+            | FilterType::TwoPoleBandPass
+            | FilterType::TwoPoleBandReject => {
+                // Q (cB) → linear Q. 0 cB = Butterworth (≈ 0.707). Clamp
+                // at 16 to bound resonance — a runaway Q produces NaN
+                // coefficients.
+                let q_lin = (10.0_f32).powf(self.initial_filter_q_cb as f32 / 200.0)
+                    * std::f32::consts::FRAC_1_SQRT_2;
+                let q = q_lin.clamp(0.1, 16.0);
+                let omega = 2.0 * std::f32::consts::PI * cutoff_hz / self.output_rate;
+                let sin_w = omega.sin();
+                let cos_w = omega.cos();
+                let alpha = sin_w / (2.0 * q);
+                let a0 = 1.0 + alpha;
+                let inv_a0 = 1.0 / a0;
+                // Numerators differ per response (RBJ cookbook); the
+                // denominators are shared across all four 2-pole shapes.
+                let (b0, b1, b2) = match self.filter_kind {
+                    FilterType::TwoPoleLowPass => {
+                        let v = (1.0 - cos_w) * 0.5;
+                        (v, 1.0 - cos_w, v)
+                    }
+                    FilterType::TwoPoleHighPass => {
+                        let v = (1.0 + cos_w) * 0.5;
+                        (v, -(1.0 + cos_w), v)
+                    }
+                    FilterType::TwoPoleBandPass => {
+                        // "Constant skirt gain, peak gain = Q" form.
+                        (sin_w * 0.5, 0.0, -sin_w * 0.5)
+                    }
+                    FilterType::TwoPoleBandReject => (1.0, -2.0 * cos_w, 1.0),
+                    // Unreachable — outer match already covered the
+                    // one-pole arms.
+                    FilterType::OnePoleLowPass | FilterType::OnePoleHighPass => (1.0, 0.0, 0.0),
+                };
+                filter.b0 = b0 * inv_a0;
+                filter.b1 = b1 * inv_a0;
+                filter.b2 = b2 * inv_a0;
+                filter.a1 = (-2.0 * cos_w) * inv_a0;
+                filter.a2 = (1.0 - alpha) * inv_a0;
+            }
+        }
         filter.last_cutoff_cents = cutoff_cents;
     }
 
@@ -1002,6 +1153,7 @@ mod tests {
         cfg_lp.filter = FilterParams {
             cutoff_cents: 7_138,
             q_centibels: 0,
+            ..Default::default()
         };
         let mut v_lp = SamplePlayer::new(cfg_lp, 44_100);
         assert!(
@@ -1046,6 +1198,7 @@ mod tests {
         cfg.filter = FilterParams {
             cutoff_cents: 10_000,
             q_centibels: 0,
+            ..Default::default()
         };
         let v = SamplePlayer::new(cfg, 44_100);
 
@@ -1097,6 +1250,7 @@ mod tests {
         cfg_base.filter = FilterParams {
             cutoff_cents: base_cutoff,
             q_centibels: 0,
+            ..Default::default()
         };
         let mut v_base = SamplePlayer::new(cfg_base, 44_100);
         let mut out_base = vec![0.0f32; 44_100];
@@ -1110,6 +1264,7 @@ mod tests {
         cfg_sweep.filter = FilterParams {
             cutoff_cents: base_cutoff,
             q_centibels: 0,
+            ..Default::default()
         };
         cfg_sweep.mod_env = ModEnvParams {
             delay_s: 0.0,
@@ -1174,6 +1329,7 @@ mod tests {
         cfg_q0.filter = FilterParams {
             cutoff_cents: 8_338,
             q_centibels: 0,
+            ..Default::default()
         };
         let mut v_q0 = SamplePlayer::new(cfg_q0, 44_100);
         let mut out_q0 = vec![0.0f32; 16_384];
@@ -1184,6 +1340,7 @@ mod tests {
         cfg_q24.filter = FilterParams {
             cutoff_cents: 8_338,
             q_centibels: 240,
+            ..Default::default()
         };
         let mut v_q24 = SamplePlayer::new(cfg_q24, 44_100);
         let mut out_q24 = vec![0.0f32; 16_384];
@@ -1218,6 +1375,7 @@ mod tests {
         cfg.filter = FilterParams {
             cutoff_cents: 10_000,
             q_centibels: 0,
+            ..Default::default()
         };
         let mut v = SamplePlayer::new(cfg, 44_100);
         // Render 50 ms — mid-attack on the mod-env.
@@ -1236,6 +1394,153 @@ mod tests {
         assert!(
             (pre_release_level - 0.5).abs() < 0.05,
             "mid-attack EG2 should be ~0.5; got {pre_release_level}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Round 95: filter-kind coverage on the SamplePlayer biquad.
+    // ---------------------------------------------------------------------
+
+    /// Build a sine at `freq_hz`, sampled at `sr`, as an `Arc<[f32]>`
+    /// ready for [`SamplePlayerConfig`].
+    fn sine_buf(freq_hz: f32, sr: u32, len: usize) -> Arc<[f32]> {
+        let v: Vec<f32> = (0..len)
+            .map(|i| {
+                let t = i as f32 / sr as f32;
+                (2.0 * std::f32::consts::PI * freq_hz * t).sin()
+            })
+            .collect();
+        Arc::from(v.into_boxed_slice())
+    }
+
+    #[test]
+    fn high_pass_attenuates_below_cutoff() {
+        // 5 kHz sine through a 10 kHz two-pole high-pass: most of the
+        // signal sits in the stop-band.
+        let sr = 44_100;
+        let buf = sine_buf(5_000.0, sr, 16_384);
+        let mut cfg = cfg_with(buf, sr);
+        // 10 kHz cutoff: cents = 1200 * log2(10000 / 8.176) ≈ 12331.
+        cfg.filter = FilterParams {
+            cutoff_cents: 12_331,
+            q_centibels: 0,
+            kind: FilterType::TwoPoleHighPass,
+        };
+        let mut v = SamplePlayer::new(cfg, sr);
+        assert!(
+            v.filter.is_some(),
+            "non-low-pass must always allocate biquad"
+        );
+        let mut out = vec![0.0f32; 16_384];
+        v.render(&mut out);
+        let r = rms(&out[8_192..]);
+        // Open-filter baseline (FilterType default = low-pass at the
+        // 13500 sentinel → no biquad → unfiltered output).
+        let buf2 = sine_buf(5_000.0, sr, 16_384);
+        let cfg_open = cfg_with(buf2, sr);
+        let mut v_open = SamplePlayer::new(cfg_open, sr);
+        let mut out_open = vec![0.0f32; 16_384];
+        v_open.render(&mut out_open);
+        let r_open = rms(&out_open[8_192..]);
+        assert!(
+            r < r_open * 0.5,
+            "10 kHz hpf_2p should attenuate 5 kHz; got r={r}, open={r_open}",
+        );
+    }
+
+    #[test]
+    fn band_pass_peaks_at_cutoff() {
+        // Two-pole band-pass: a sine at the cutoff frequency should
+        // pass with less loss than a sine an octave below.
+        let sr = 44_100;
+        let cutoff_cents = 8_338; // ≈ 1 kHz
+                                  // Sine at the cutoff.
+        let mut cfg_on = cfg_with(sine_buf(1_000.0, sr, 16_384), sr);
+        cfg_on.filter = FilterParams {
+            cutoff_cents,
+            q_centibels: 60,
+            kind: FilterType::TwoPoleBandPass,
+        };
+        let mut v_on = SamplePlayer::new(cfg_on, sr);
+        let mut out_on = vec![0.0f32; 16_384];
+        v_on.render(&mut out_on);
+        // Sine an octave below the cutoff.
+        let mut cfg_off = cfg_with(sine_buf(250.0, sr, 16_384), sr);
+        cfg_off.filter = FilterParams {
+            cutoff_cents,
+            q_centibels: 60,
+            kind: FilterType::TwoPoleBandPass,
+        };
+        let mut v_off = SamplePlayer::new(cfg_off, sr);
+        let mut out_off = vec![0.0f32; 16_384];
+        v_off.render(&mut out_off);
+        let r_on = rms(&out_on[8_192..]);
+        let r_off = rms(&out_off[8_192..]);
+        assert!(
+            r_on > r_off * 2.0,
+            "bpf_2p should peak at cutoff; got at_cutoff={r_on}, two_octaves_off={r_off}",
+        );
+    }
+
+    #[test]
+    fn band_reject_kills_signal_at_cutoff() {
+        // Two-pole band-reject (notch): a sine at the cutoff should be
+        // heavily attenuated; an out-of-band sine should pass.
+        let sr = 44_100;
+        let cutoff_cents = 8_338; // ≈ 1 kHz
+                                  // Sine at the cutoff (in the notch).
+        let mut cfg_in = cfg_with(sine_buf(1_000.0, sr, 16_384), sr);
+        cfg_in.filter = FilterParams {
+            cutoff_cents,
+            q_centibels: 240,
+            kind: FilterType::TwoPoleBandReject,
+        };
+        let mut v_in = SamplePlayer::new(cfg_in, sr);
+        let mut out_in = vec![0.0f32; 16_384];
+        v_in.render(&mut out_in);
+        // Sine well below the notch.
+        let mut cfg_lo = cfg_with(sine_buf(100.0, sr, 16_384), sr);
+        cfg_lo.filter = FilterParams {
+            cutoff_cents,
+            q_centibels: 240,
+            kind: FilterType::TwoPoleBandReject,
+        };
+        let mut v_lo = SamplePlayer::new(cfg_lo, sr);
+        let mut out_lo = vec![0.0f32; 16_384];
+        v_lo.render(&mut out_lo);
+        let r_in = rms(&out_in[8_192..]);
+        let r_lo = rms(&out_lo[8_192..]);
+        assert!(
+            r_in < r_lo * 0.3,
+            "brf_2p should null the cutoff sine; got at_cutoff={r_in}, off_band={r_lo}",
+        );
+    }
+
+    #[test]
+    fn one_pole_low_pass_attenuates_high_frequencies() {
+        // 5 kHz sine through a 1-pole 500 Hz low-pass. Slope is 6 dB/oct
+        // so over ~3.3 octaves we expect ~20 dB attenuation.
+        let sr = 44_100;
+        let buf = sine_buf(5_000.0, sr, 16_384);
+        let mut cfg = cfg_with(buf, sr);
+        cfg.filter = FilterParams {
+            cutoff_cents: 7_138,
+            q_centibels: 0,
+            kind: FilterType::OnePoleLowPass,
+        };
+        let mut v = SamplePlayer::new(cfg, sr);
+        let mut out = vec![0.0f32; 16_384];
+        v.render(&mut out);
+        let r = rms(&out[8_192..]);
+        // Baseline: same sine, no filter.
+        let buf2 = sine_buf(5_000.0, sr, 16_384);
+        let mut v_open = SamplePlayer::new(cfg_with(buf2, sr), sr);
+        let mut out_open = vec![0.0f32; 16_384];
+        v_open.render(&mut out_open);
+        let r_open = rms(&out_open[8_192..]);
+        assert!(
+            r < r_open * 0.3,
+            "lpf_1p at 500 Hz should attenuate 5 kHz; got r={r}, open={r_open}",
         );
     }
 }

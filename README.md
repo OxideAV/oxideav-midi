@@ -56,9 +56,15 @@ framework but usable standalone.
   decodes the WAV sample bytes (8/16/24/32-bit PCM and IEEE_FLOAT) into
   mono f32, picks the matching region by (key, velocity), shifts pitch
   off `pitch_keycenter` + `tune` + `transpose`, applies a DAHDSR
-  amplitude envelope from `ampeg_*` opcodes, and runs a vibrato LFO
-  from `lfo01_freq` / `lfo01_pitch` / `lfo01_delay`. `#include` is
-  rejected with `Error::Unsupported`; `#define` is preserved verbatim.
+  amplitude envelope from `ampeg_*` opcodes, runs a vibrato LFO from
+  `lfo01_freq` / `lfo01_pitch` / `lfo01_delay`, and (round 95) drives
+  a filter envelope from `fileg_*` opcodes through a `fil_type`-aware
+  biquad — `lpf_1p` / `hpf_1p` / `lpf_2p` (default) / `hpf_2p` /
+  `bpf_2p` / `brf_2p` per the SFZ-legacy `fil_type` table, with
+  `cutoff=` (Hz → SF2 absolute cents) and `resonance=` (dB → centibels)
+  feeding the round-91 RBJ biquad and `fileg_depth` driving the EG2 →
+  cutoff routing. `#include` is rejected with `Error::Unsupported`;
+  `#define` is preserved verbatim.
 - `instruments::dls` — DLS Level 1 + 2 RIFF reader **plus voice
   generator** with **articulation interpretation** (round 80) and
   **EG2 + 2-pole resonant low-pass filter** wiring (round 91). Walks

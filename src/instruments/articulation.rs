@@ -657,6 +657,14 @@ impl Articulation {
         FilterParams {
             cutoff_cents,
             q_centibels,
+            // DLS Level 2.2 §1.5.2 only defines the 2-pole resonant
+            // low-pass response (`CONN_DST_FILTER_CUTOFF` / `_FILTER_Q`
+            // have no "filter shape" companion destination), and SF2
+            // §8.1.3 likewise hard-codes the same shape. Keep the
+            // round-91 default explicit so a future bump that flips
+            // `FilterType::default()` doesn't silently change DLS/SF2
+            // behaviour.
+            kind: super::sample_voice::FilterType::TwoPoleLowPass,
         }
     }
 }

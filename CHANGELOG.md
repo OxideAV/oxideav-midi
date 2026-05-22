@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 95 — SFZ-side filter envelope + `fil_type` + `cutoff` wiring
+
+- New `FilterType` enum on `instruments::sample_voice` covers the six
+  SFZ v1 `fil_type` values documented in
+  `docs/audio/midi/instrument-formats/sfz-legacy.html` "Filter type"
+  table: `lpf_1p` / `hpf_1p` (one-pole, 6 dB/oct, resonance ignored)
+  and `lpf_2p` / `hpf_2p` / `bpf_2p` / `brf_2p` (two-pole, 12 dB/oct).
+  Default is `TwoPoleLowPass`, which preserves round-91 SF2 / DLS
+  behaviour exactly. `FilterType::parse_sfz()` honours the
+  case-insensitive opcode string + falls back to `lpf_2p` on unknown
+  values per the SFZ default convention.
+- `FilterParams` gains a `kind: FilterType` field. SF2 / DLS construct
+  the struct without overriding it (they inherit `TwoPoleLowPass`); the
+  `instruments::articulation::Articulation::filter()` helper also pins
+  the kind explicitly to make the SF2/DLS commitment to a single shape
+  permanent against any future `Default` flip.
+- `SamplePlayer::update_filter_coeffs` switches on `filter_kind`. The
+  one-pole arms compute `tan(ω/2)`-prewarped bilinear coefficients with
+  `b2 = a2 = 0` so the same direct-form-1 `tick()` math still applies
+  (no per-sample branch). The 2-pole arms keep the round-91 RBJ-cookbook
+  denominators (`a0 = 1 + α`, `a1 = -2·cos(ω)`, `a2 = 1 - α`) and switch
+  numerators per shape: low-pass `(1-cos)/2, 1-cos, (1-cos)/2`,
+  high-pass `(1+cos)/2, -(1+cos), (1+cos)/2`, band-pass
+  `sin/2, 0, -sin/2`, band-reject `1, -2cos, 1`. All derivations are
+  the project's own RBJ math (bilinear transform of the analog
+  prototypes) — SF2 §8.1.3 + §9.7 + SFZ-legacy `fil_type` row only
+  specify the response shape and slope, not the discrete realisation.
+- `SamplePlayer::new`'s `needs_filter` gate now respects non-low-pass
+  shapes: a `fil_type` of `hpf_*` / `bpf_2p` / `brf_2p` is not "open"
+  at the SF2 13500-cents sentinel (it would still attenuate the audible
+  band), so the biquad allocation also fires whenever
+  `cfg.filter.kind` is anything other than the two low-pass variants.
+- `instruments::sfz::build_filter_from_opcodes()` parses `cutoff=`
+  (Hz, with a `cents = 1200·log2(fc_hz / 8.176)` bridge into SF2
+  absolute cents — clamped into the §8.1.3 useful range `1500..=13500`),
+  `resonance=` (dB → centibels at `cb = dB · 10`, clamped to the
+  SFZ-spec range `0..=40 dB`), and `fil_type=` (via
+  `FilterType::parse_sfz`). Aliases (`cutoff2`, `resonance2`,
+  `filtype`) are honoured per the opcode index.
+- `instruments::sfz::build_mod_env_from_opcodes()` parses the SFZ v1
+  `fileg_*` Envelope-Generator opcodes (`fileg_delay` /
+  `fileg_attack` / `fileg_hold` / `fileg_decay` / `fileg_sustain` /
+  `fileg_release` + `fileg_depth` for the routing depth) and their
+  SFZ v2 `fil_*` aliases (`fil_delay` etc.). `fileg_sustain` is in
+  percent and maps to the SamplePlayer's `0..=1` fraction;
+  `fileg_depth` is clamped into the documented `-12000..=12000`
+  range and dropped into `ModEnvParams::to_filter_cents`.
+- `instruments::sfz::build_config_for_region` calls the two helpers
+  instead of plumbing `Default::default()` for `mod_env` / `filter`.
+  Regions without `fileg_*` / `fil_type` / `cutoff` / `resonance`
+  opcodes still render bit-identically to the round-91 path — the
+  SF2 "filter open" sentinel (13500 cents) + the inert `ModEnvParams`
+  default fall straight through `build_filter_from_opcodes()` /
+  `build_mod_env_from_opcodes()`.
+- 18 new tests in the crate:
+  - `instruments::sample_voice::tests::high_pass_attenuates_below_cutoff`
+  - `instruments::sample_voice::tests::band_pass_peaks_at_cutoff`
+  - `instruments::sample_voice::tests::band_reject_kills_signal_at_cutoff`
+  - `instruments::sample_voice::tests::one_pole_low_pass_attenuates_high_frequencies`
+  - `instruments::sfz::tests::hz_to_filter_cents_round_trips_known_values`
+  - `instruments::sfz::tests::build_filter_from_opcodes_honours_cutoff_resonance_filtype`
+  - `instruments::sfz::tests::build_filter_from_opcodes_defaults_to_open_lpf_2p`
+  - `instruments::sfz::tests::build_filter_from_opcodes_clamps_resonance_into_range`
+  - `instruments::sfz::tests::filter_type_parse_covers_all_sfz_v1_values`
+  - `instruments::sfz::tests::build_mod_env_from_opcodes_honours_fileg_set`
+  - `instruments::sfz::tests::build_mod_env_from_opcodes_aliases_v2_names`
+  - `instruments::sfz::tests::build_mod_env_default_is_inert`
+  - `instruments::sfz::tests::build_mod_env_clamps_depth`
+  - `instruments::sfz::tests::full_template_smoke_drops_cutoff_into_sample_player`
+  - `instruments::sfz::tests::sfz_with_low_cutoff_attenuates_high_frequencies`
+  - `instruments::sfz::tests::sfz_high_pass_inverts_attenuation`
+  - `instruments::sfz::tests::sfz_fileg_sweeps_cutoff_open_during_attack`
+  - `instruments::sfz::tests::build_config_for_region_default_filter_open`
+
+  All 228 lib tests + 14 integration tests pass (242 total, 0 ignored).
+- Sources: `docs/audio/midi/instrument-formats/sfz-opcodes-index.html`
+  (Aria opcode reference: `cutoff`, `resonance`, `fil_type`, `fileg_*`
+  + `fil_*` aliases with documented defaults / ranges / SFZ-version
+  tags), `docs/audio/midi/instrument-formats/sfz-legacy.html`
+  ("Filter type" table enumerating the six `fil_type` values + the
+  "filter disabled" semantics for an absent `cutoff` opcode),
+  `docs/audio/midi/instrument-formats/sf2-spec-2.04.pdf` §8.1.3
+  (`initialFilterFc` / `initialFilterQ` unit conventions reused
+  unchanged from round 91).
+
 ### Round 91 — EG2 + 2-pole resonant low-pass filter on the shared `SamplePlayer`
 
 - New `ModEnvParams` + `FilterParams` structs on
