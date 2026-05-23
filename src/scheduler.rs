@@ -276,6 +276,8 @@ impl Scheduler {
                 38 => mixer.set_data_entry(channel, value, false), // RPN data LSB
                 64 => mixer.set_sustain(channel, value),
                 74 => mixer.set_timbre(channel, value), // MPE "third dimension" (CC #74)
+                96 => mixer.data_inc_dec(channel, 1),   // Data Increment (RP-018; value ignored)
+                97 => mixer.data_inc_dec(channel, -1),  // Data Decrement (RP-018; value ignored)
                 100 => mixer.set_rpn_byte(channel, value, false), // RPN LSB
                 101 => mixer.set_rpn_byte(channel, value, true), // RPN MSB
                 120 | 123 => {
@@ -775,6 +777,28 @@ mod tests {
         let inst = ToneInstrument::new();
         s.step(4096, &mut mixer, &inst);
         assert_eq!(mixer.channel_state(0).pitch_bend_range_cents, 1200);
+    }
+
+    #[test]
+    fn data_increment_decrement_route_to_mixer() {
+        let mut ev = Vec::new();
+        // Select RPN 0 (Pitch Bend Sensitivity).
+        ev.extend_from_slice(&[0x00, 0xB0, 101, 0]);
+        ev.extend_from_slice(&[0x00, 0xB0, 100, 0]);
+        // RP-018: two Data Increment (CC 96) messages = +2 cents on the
+        // default 200-cent range. The data byte is ignored, so we pass a
+        // deliberately nonsense value (0x7F) to prove it doesn't matter.
+        ev.extend_from_slice(&[0x00, 0xB0, 96, 0x7F]);
+        ev.extend_from_slice(&[0x00, 0xB0, 96, 0x00]);
+        // One Data Decrement (CC 97) → back to +1 cent (= 201).
+        ev.extend_from_slice(&[0x00, 0xB0, 97, 0x55]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(4096, &mut mixer, &inst);
+        assert_eq!(mixer.channel_state(0).pitch_bend_range_cents, 201);
     }
 
     #[test]

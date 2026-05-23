@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 102 — Data Increment / Data Decrement (RP-018)
+
+- New `Mixer::data_inc_dec(channel, step)` implements the Data Increment
+  (CC 96) / Data Decrement (CC 97) response from the MMA *Response to
+  Data Inc/Dec Controllers* recommended practice
+  (`docs/audio/midi/recommended-practices/rp18.pdf`, RP-018). Per the
+  spec the controller's value byte is *don't care*; the scheduler passes
+  a fixed `+1` step for CC 96 and `-1` for CC 97. Each step adjusts the
+  sub-field RP-018 prescribes for the currently-selected RPN:
+  - **RPN 0** (Pitch Bend Sensitivity): step the LSB (cents). Because
+    the mixer stores the combined `pitch_bend_range_cents`
+    (= semitones·100 + cents), `±1` performs the spec's
+    "LSB-wraps-into-MSB at 100" carry automatically (RP-018 worked
+    example: two CC 96 = +2 cents; 200 → 199 borrows down into 1
+    semitone + 99 cents). Clamped to `>= 1` so the range never reaches
+    zero, and the live pitch bend is re-applied to held voices.
+  - **RPN 1** (Channel Fine Tuning): step the LSB of the 14-bit
+    fine-tune accumulator; the cents view is re-derived and routed to
+    held voices.
+  - **RPN 2** (Channel Coarse Tuning): step the MSB (= one semitone) per
+    the 4.2-Addendum rule RP-018 cites, clamped to the CA-25 signed
+    range −64..=+63.
+  - **RPN 5** (Modulation Depth Range, CA-26): step the cents field, the
+    RP-018 default for future Registered Parameters, clamped to the
+    existing 0..=2400 envelope.
+  - **RPN Null** (`0x3FFF`) and any unmodelled / NRPN selection are a
+    no-op, mirroring `set_data_entry`'s null guard. NRPNs (CC 98/99) are
+    not modelled, so a step issued under an NRPN selection does nothing.
+- `scheduler::dispatch` routes CC 96 → `data_inc_dec(ch, 1)` and CC 97 →
+  `data_inc_dec(ch, -1)`.
+- 11 new tests (10 `mixer`, 1 `scheduler`): RPN-0 cent-step +
+  LSB-wraps-into-MSB carry, RPN-0 decrement borrow, value-byte-ignored
+  contract, RPN-1 fine-tune LSB step, RPN-2 semitone step + signed-range
+  clamp, RPN-5 cent step, RPN-Null no-op, RPN-0 clamp-above-zero, held-
+  voice bend re-apply on range widen, and the scheduler CC 96/97 routing
+  (with a deliberately nonsense data byte to prove it is ignored).
+
 ### Round 98 — MIDI Tuning Standard (MTS) microtuning
 
 - New `tuning` module implements the retuning surface from the MMA

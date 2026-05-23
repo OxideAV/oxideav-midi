@@ -689,6 +689,80 @@ impl Mixer {
         }
     }
 
+    /// Apply a Data Increment (CC 96) or Data Decrement (CC 97) to the
+    /// currently-selected RPN, per RP-018 ("Response to Data Inc/Dec
+    /// Controllers"). `step` is `+1` for an increment, `-1` for a
+    /// decrement; per RP-018 the controller's *value byte is ignored*
+    /// ("the value byte for both messages is `don't care`").
+    ///
+    /// RP-018 specifies which sub-field of the parameter each step
+    /// touches:
+    ///   * **RPN 0** (Pitch Bend Sensitivity, MSB = semitones,
+    ///     LSB = cents): step the **LSB** (cents) by 1. When the LSB
+    ///     wraps at 100, reset it to 0 and step the MSB (semitones).
+    ///     Because we store the combined `pitch_bend_range_cents`
+    ///     (= semitones·100 + cents), a `±1` on that scalar performs the
+    ///     LSB-wraps-into-MSB carry automatically (e.g. 100 → 101 is one
+    ///     semitone + 1 cent; 200 → 199 borrows down into 1 semitone +
+    ///     99 cents). The result is clamped to `>= 1` so the range never
+    ///     reaches zero, matching [`Self::set_data_entry`].
+    ///   * **RPN 1** (Channel Fine Tuning): step the **LSB** of the
+    ///     14-bit fine-tune accumulator by 1 (RP-018: "Data Increment
+    ///     and Data Decrement messages will increase or decrease the
+    ///     LSB by 1" for RPN 0 and 1).
+    ///   * **RPN 2** (Channel Coarse Tuning): step the **MSB** by 1
+    ///     (RP-018, citing the 4.2 Addendum: for RPN 2, 3 and 4 the
+    ///     inc/dec affects the MSB). For coarse tuning the MSB is the
+    ///     semitone field, so the step is one semitone.
+    ///   * **RPN 5** (Modulation Depth Range, a future Registered
+    ///     Parameter per CA-26): step the **LSB** (cents) by 1, the
+    ///     RP-018 default for future Registered Parameters.
+    ///
+    /// RPN Null (`0x3FFF`) and any RPN not modelled above leave the
+    /// channel untouched, mirroring [`Self::set_data_entry`]'s
+    /// silent-ignore policy. NRPNs are not modelled, so a step issued
+    /// while an NRPN is selected (RPN field still null) is a no-op.
+    pub fn data_inc_dec(&mut self, channel: u8, step: i16) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let rpn = self.channels[ch].rpn;
+        match rpn {
+            0 => {
+                // Step the combined cents scalar; the LSB-wraps-into-MSB
+                // carry falls straight out of the base-100 layout.
+                let cur = self.channels[ch].pitch_bend_range_cents as i32;
+                let new = (cur + step as i32).max(1) as u16;
+                self.channels[ch].pitch_bend_range_cents = new;
+                let bend = self.channels[ch].pitch_bend;
+                self.set_pitch_bend(channel, bend);
+            }
+            1 => {
+                // Step the LSB (bottom 7 bits) of the fine-tune 14-bit
+                // accumulator, then re-derive the cents view.
+                let cur = self.channels[ch].channel_fine_tune_raw_14 as i32;
+                let new14 = (cur + step as i32).clamp(0, 0x3FFF) as u16;
+                self.channels[ch].channel_fine_tune_raw_14 = new14;
+                let cents = (new14 as i32 - 0x2000) * 100 / 0x2000;
+                self.channels[ch].channel_fine_tune_cents = cents as i16;
+                self.reapply_pitch_for_channel(channel);
+            }
+            2 => {
+                // Step the MSB (semitones) by 1, clamped to the
+                // CA-25 / coarse-tune signed range (-64..=+63).
+                let cur = self.channels[ch].channel_coarse_tune_semitones;
+                let new = (cur + step).clamp(-64, 63);
+                self.channels[ch].channel_coarse_tune_semitones = new;
+                self.reapply_pitch_for_channel(channel);
+            }
+            5 => {
+                let cur = self.channels[ch].mod_depth_range_cents as i32;
+                let new = (cur + step as i32).clamp(0, 2400) as u16;
+                self.channels[ch].mod_depth_range_cents = new;
+                self.reapply_mod_wheel_for_channel(channel);
+            }
+            _ => { /* RPN Null / NRPN / unmodelled — no-op per RP-018. */ }
+        }
+    }
+
     /// Re-evaluate the effective pitch offset on every voice held on
     /// `channel`. Combines RPN 1 (channel fine tune) + RPN 2 (channel
     /// coarse tune) + master fine + master coarse + the live pitch
@@ -1673,6 +1747,157 @@ mod tests {
         // CC 38 = 50 → adds 50 cents on top.
         m.set_data_entry(0, 50, false);
         assert_eq!(m.channel_state(0).mod_depth_range_cents, 150);
+    }
+
+    // ──────────────────── Round-102: Data Inc/Dec (RP-018) ────────────────────
+
+    #[test]
+    fn data_increment_rpn0_steps_cents_then_wraps_into_semitone() {
+        let mut m = Mixer::new();
+        select_rpn(&mut m, 0, 0, 0); // RPN 0 = Pitch Bend Sensitivity
+                                     // Start from the GM default (200 = 2 semitones, 0 cents).
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 200);
+        // RP-018 worked example: increment pitch-bend sensitivity by 2
+        // cents = two Data Increment messages (value byte ignored).
+        m.data_inc_dec(0, 1);
+        m.data_inc_dec(0, 1);
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 202);
+        // Walk the LSB up to the wrap point (99 → 100): from 202 we need
+        // 98 more increments to reach 300 = 3 semitones, 0 cents, proving
+        // the LSB wraps into the MSB (semitone) field at 100.
+        for _ in 0..98 {
+            m.data_inc_dec(0, 1);
+        }
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 300);
+    }
+
+    #[test]
+    fn data_decrement_rpn0_borrows_across_semitone_boundary() {
+        let mut m = Mixer::new();
+        select_rpn(&mut m, 0, 0, 0);
+        // 200 → 199 borrows the MSB down: 1 semitone + 99 cents.
+        m.data_inc_dec(0, -1);
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 199);
+    }
+
+    #[test]
+    fn data_inc_dec_value_byte_ignored() {
+        // The scheduler passes a fixed +1/-1 step; the controller's data
+        // byte never reaches data_inc_dec. This test documents that the
+        // method's contract is "step by 1" regardless of CC value, by
+        // showing two single steps equal one double step.
+        let mut a = Mixer::new();
+        select_rpn(&mut a, 0, 0, 0);
+        a.data_inc_dec(0, 1);
+        a.data_inc_dec(0, 1);
+
+        let mut b = Mixer::new();
+        select_rpn(&mut b, 0, 0, 0);
+        b.data_inc_dec(0, 1);
+        b.data_inc_dec(0, 1);
+        assert_eq!(
+            a.channel_state(0).pitch_bend_range_cents,
+            b.channel_state(0).pitch_bend_range_cents
+        );
+    }
+
+    #[test]
+    fn data_inc_dec_rpn1_steps_fine_tune_lsb() {
+        let mut m = Mixer::new();
+        select_rpn(&mut m, 0, 0, 1); // RPN 1 = Channel Fine Tuning
+                                     // Default raw is centre 0x2000 (= 0 cents).
+        assert_eq!(m.channel_state(0).channel_fine_tune_raw_14, 0x2000);
+        m.data_inc_dec(0, 1);
+        assert_eq!(m.channel_state(0).channel_fine_tune_raw_14, 0x2001);
+        m.data_inc_dec(0, -1);
+        m.data_inc_dec(0, -1);
+        assert_eq!(m.channel_state(0).channel_fine_tune_raw_14, 0x1FFF);
+    }
+
+    #[test]
+    fn data_inc_dec_rpn2_steps_coarse_tune_semitone() {
+        let mut m = Mixer::new();
+        select_rpn(&mut m, 0, 0, 2); // RPN 2 = Channel Coarse Tuning
+        assert_eq!(m.channel_state(0).channel_coarse_tune_semitones, 0);
+        // RP-018: RPN 2 inc/dec affects the MSB → one semitone per step.
+        m.data_inc_dec(0, 1);
+        assert_eq!(m.channel_state(0).channel_coarse_tune_semitones, 1);
+        m.data_inc_dec(0, -1);
+        m.data_inc_dec(0, -1);
+        assert_eq!(m.channel_state(0).channel_coarse_tune_semitones, -1);
+    }
+
+    #[test]
+    fn data_inc_dec_rpn2_clamps_to_signed_range() {
+        let mut m = Mixer::new();
+        select_rpn(&mut m, 0, 0, 2);
+        for _ in 0..200 {
+            m.data_inc_dec(0, 1);
+        }
+        assert_eq!(m.channel_state(0).channel_coarse_tune_semitones, 63);
+        for _ in 0..400 {
+            m.data_inc_dec(0, -1);
+        }
+        assert_eq!(m.channel_state(0).channel_coarse_tune_semitones, -64);
+    }
+
+    #[test]
+    fn data_inc_dec_rpn5_steps_mod_depth_cents() {
+        let mut m = Mixer::new();
+        select_rpn(&mut m, 0, 0, 5); // RPN 5 = Modulation Depth Range
+                                     // GM2 default is 50 cents.
+        assert_eq!(m.channel_state(0).mod_depth_range_cents, 50);
+        m.data_inc_dec(0, 1);
+        assert_eq!(m.channel_state(0).mod_depth_range_cents, 51);
+        m.data_inc_dec(0, -1);
+        m.data_inc_dec(0, -1);
+        assert_eq!(m.channel_state(0).mod_depth_range_cents, 49);
+    }
+
+    #[test]
+    fn data_inc_dec_with_rpn_null_is_noop() {
+        let mut m = Mixer::new();
+        // No RPN selected (default 0x3FFF) — a Data Inc must not touch
+        // any parameter, mirroring set_data_entry's null guard.
+        m.data_inc_dec(0, 1);
+        m.data_inc_dec(0, -1);
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 200);
+        assert_eq!(m.channel_state(0).channel_fine_tune_raw_14, 0x2000);
+        assert_eq!(m.channel_state(0).channel_coarse_tune_semitones, 0);
+        assert_eq!(m.channel_state(0).mod_depth_range_cents, 50);
+    }
+
+    #[test]
+    fn data_inc_dec_rpn0_clamps_above_zero() {
+        let mut m = Mixer::new();
+        select_rpn(&mut m, 0, 0, 0);
+        // Drive the range down hard; it must clamp at 1 (never zero).
+        for _ in 0..1000 {
+            m.data_inc_dec(0, -1);
+        }
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 1);
+    }
+
+    #[test]
+    fn data_increment_rpn0_reapplies_bend_to_held_voice() {
+        let mut m = Mixer::new();
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        select_rpn(&mut m, 0, 0, 0);
+        // Bend full up; with the default 200-cent range that's +200 c.
+        m.set_pitch_bend(0, 0x3FFF);
+        // Now grow the range one cent at a time; the held voice's routed
+        // bend must track the widened range without a fresh pitch-bend
+        // message (RP-018 changes are applied immediately).
+        let before = *bend_cell.lock().unwrap();
+        for _ in 0..100 {
+            m.data_inc_dec(0, 1); // 200 → 300 cents range
+        }
+        let after = *bend_cell.lock().unwrap();
+        assert!(
+            after > before,
+            "widening the bend range should increase the routed bend on a held voice: before={before} after={after}"
+        );
     }
 
     #[test]

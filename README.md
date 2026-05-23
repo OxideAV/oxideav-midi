@@ -116,7 +116,14 @@ framework but usable standalone.
   law. Round 75 adds: **RPN 1** (channel fine tune, ±100 c) /
   **RPN 2** (channel coarse tune, ±63 semis) / **RPN 5** (modulation
   depth range, CA-26) / **RPN 6** (MPE Configuration Message — see
-  below); CC 1 (mod wheel) routed to voices through the new
+  below). Round 102 adds **Data Increment (CC 96) / Data Decrement
+  (CC 97)** per RP-018: the value byte is ignored and each message
+  steps the RP-018-prescribed sub-field of the selected RPN by one —
+  the LSB (cents) for RPN 0 / 1 / 5 (with RPN 0's LSB wrapping into the
+  semitone MSB at 100, the borrow falling out of the combined
+  base-100 cents store) and the MSB (one semitone) for RPN 2; RPN Null
+  and unmodelled / NRPN selections are a no-op. CC 1 (mod wheel) routed
+  to voices through the new
   [`Voice::set_mod_depth_cents`] hook; CC 74 (MPE "third dimension" /
   brightness) routed through [`Voice::set_timbre`]. Master state on
   the mixer adds **Master Volume** (Universal Real-Time SysEx
@@ -154,7 +161,8 @@ framework but usable standalone.
   Single-Note Tuning Change (sub-ID#2 `02` + bank form `07`) and
   Scale/Octave Tuning 1-byte (`08`) / 2-byte (`09`) forms into the
   `tuning` table; GM System On/Off additionally reset MTS tuning to
-  equal temperament.
+  equal temperament. Round 102 routes CC 96 / CC 97 (Data Increment /
+  Decrement, RP-018) into `Mixer::data_inc_dec`.
 - `tuning` — MIDI Tuning Standard (MTS) microtuning state + Universal
   SysEx data-format decoders, per the MMA *MIDI Tuning Messages*
   specification (CA-020 / CA-021 / RP-020). A `TuningTable` holds a
