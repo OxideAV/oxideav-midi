@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 98 — MIDI Tuning Standard (MTS) microtuning
+
+- New `tuning` module implements the retuning surface from the MMA
+  *MIDI Tuning Messages* specification
+  (`docs/audio/midi/extensions/MIDI-Tuning-Updated-Specification.pdf`,
+  incorporating CA-020 / CA-021 / RP-020). `TuningTable` holds two
+  layers of microtuning state — a global 128-entry key-based table and
+  per-channel 12-entry scale/octave tables — both expressed as signed
+  cents added to a key's 12-tone-equal-temperament pitch. Defaults to
+  equal temperament everywhere, so a synth that never receives an MTS
+  message renders bit-identically to the pre-MTS path.
+- Data-format decoders, each with worked-example unit tests against the
+  spec's tables: `freq_word_to_cents_offset` (3-byte
+  `semitone + fraction14/16384` frequency word → cents offset from the
+  addressed key, with the reserved `7F 7F 7F` "no change" word
+  returning `None`); `scale_octave_1byte_to_cents` (`00 = -64 c`,
+  `40 = 0 c`, `7F = +63 c`); `scale_octave_2byte_to_cents` (14-bit,
+  `0x0000 = -100 c`, `0x2000 = 0 c`, `0x3FFF = +100 c`); and
+  `scale_octave_channel_mask` (the `ff gg hh` 3-byte channel bitmap,
+  with `ff` bits 2–6 reserved → must not light any channel).
+- `Mixer` carries a `TuningTable`; the per-key offset is folded into
+  every voice-pitch composition site (note-on + the two
+  `set_pitch_bend` re-apply paths). Drum channel (MIDI 10 = index 9) is
+  exempt from retuning, matching the existing CA-25 master-tuning
+  exemption. New public API: `set_key_tuning_word`,
+  `set_scale_octave_tuning`, `reset_tuning`, `tuning()`. The real-time
+  message forms re-apply pitch to sounding voices (`live = true`); the
+  non-real-time "setup" forms update only the stored table.
+- `scheduler::dispatch_universal_sysex` now routes sub-ID#1 `08` (MIDI
+  Tuning Standard) in both the Universal Real-Time (`7F`) and
+  Non-Real-Time (`7E`) areas: Single-Note Tuning Change (sub-ID#2
+  `02`) and its bank form (`07`), and Scale/Octave Tuning 1-byte
+  (`08`) and 2-byte (`09`) forms. Multi-change single-note messages
+  (`ll` entries) and truncated/over-promised buffers are bounds-checked
+  so malformed input cannot read past the payload. GM 1 / GM 2 System
+  On / GM System Off now also reset MTS tuning to equal temperament.
+- 25 new tests (12 `tuning` unit, 7 `mixer`, 6 `scheduler`) covering
+  the decoders, table summation, live vs. setup re-apply, drum-channel
+  exemption, pitch-bend summation, channel-mask selection, GM reset,
+  and truncated-message safety.
+
 ### Round 95 — SFZ-side filter envelope + `fil_type` + `cutoff` wiring
 
 - New `FilterType` enum on `instruments::sample_voice` covers the six

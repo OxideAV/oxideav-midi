@@ -94,6 +94,7 @@ pub mod mixer;
 pub mod paths;
 pub mod scheduler;
 pub mod smf;
+pub mod tuning;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -149,7 +149,29 @@ framework but usable standalone.
   Tuning (`04 04`) all route into the mixer's master-state setters.
   CC 1 / CC 74 are pumped into the new mixer hooks; the MPE
   Configuration Message (RPN 6 on the Lower / Upper Manager Channel)
-  reaches the mixer via the existing RPN data-entry pipeline.
+  reaches the mixer via the existing RPN data-entry pipeline. Round 98
+  routes sub-ID#1 `08` (MIDI Tuning Standard) in both Universal areas:
+  Single-Note Tuning Change (sub-ID#2 `02` + bank form `07`) and
+  Scale/Octave Tuning 1-byte (`08`) / 2-byte (`09`) forms into the
+  `tuning` table; GM System On/Off additionally reset MTS tuning to
+  equal temperament.
+- `tuning` — MIDI Tuning Standard (MTS) microtuning state + Universal
+  SysEx data-format decoders, per the MMA *MIDI Tuning Messages*
+  specification (CA-020 / CA-021 / RP-020). A `TuningTable` holds a
+  global 128-entry **key-based** table (the current tuning program) and
+  per-channel 12-entry **scale/octave** tables, both as signed cents
+  added to a key's equal-tempered pitch (default = equal temperament
+  everywhere, so untuned playback is byte-identical to the pre-MTS
+  path). Decoders cover the 3-byte frequency word
+  (`semitone + fraction14/16384`, with the reserved `7F 7F 7F` "no
+  change" sentinel), the scale/octave 1-byte (`00=-64c / 40=0c /
+  7F=+63c`) and 2-byte (14-bit, ±100 c) offsets, and the `ff gg hh`
+  channel bitmap (with the reserved `ff` bits 2–6 ignored). The mixer
+  folds the per-key offset into every voice-pitch composition; the
+  real-time message forms retune sounding notes immediately while the
+  non-real-time "setup" forms update only the stored table. Drum
+  channel (MIDI 10) is exempt from retuning per CA-25's
+  no-note-shifting rule.
 - `downloader` — stub that names a planned default bank (TimGM6mb) but
   currently returns `Error::Unsupported`.
 

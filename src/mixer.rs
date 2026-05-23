@@ -307,6 +307,12 @@ pub struct Mixer {
     /// Active MPE Upper Zone, if any. Created by an MCM with `n=15`
     /// (= 0xF) / `mm>=1`; cleared by an MCM with `mm=0`.
     mpe_upper: Option<MpeZone>,
+    /// MIDI Tuning Standard (MTS) microtuning state — a global
+    /// key-based table plus per-channel scale/octave tables. Both
+    /// default to equal temperament, so a synth that never sees an MTS
+    /// SysEx renders bit-identically to the pre-MTS path. The per-key
+    /// offset is folded into every voice's pitch composition.
+    tuning: crate::tuning::TuningTable,
 }
 
 impl Default for Mixer {
@@ -331,6 +337,7 @@ impl Mixer {
             master_coarse_tune_semitones: 0,
             mpe_lower: None,
             mpe_upper: None,
+            tuning: crate::tuning::TuningTable::new(),
         }
     }
 
@@ -389,7 +396,7 @@ impl Mixer {
                         || z.member_channels().contains(&slot.channel)
                     {
                         if let Some(voice) = slot.voice.as_mut() {
-                            let total = Self::compose_pitch_cents(
+                            let mut total = Self::compose_pitch_cents(
                                 &self.channels[slot_ch],
                                 self.channels[ch].pitch_bend,
                                 self.channels[ch].pitch_bend_range_cents,
@@ -397,6 +404,10 @@ impl Mixer {
                                 self.master_coarse_tune_semitones,
                                 slot_ch == 9,
                             );
+                            if slot_ch != 9 {
+                                total +=
+                                    self.tuning.offset_cents(slot.channel, slot.key).round() as i32;
+                            }
                             voice.set_pitch_bend_cents(total);
                         }
                     }
@@ -410,7 +421,7 @@ impl Mixer {
                     if let Some(voice) = slot.voice.as_mut() {
                         // For a Member channel, also fold in the
                         // Manager's currently-held bend.
-                        let total = if let MpeRole::Member(zone_kind) = role {
+                        let mut total = if let MpeRole::Member(zone_kind) = role {
                             let mgr_ch = match zone_kind {
                                 MpeZoneKind::Lower => 0u8,
                                 MpeZoneKind::Upper => 15u8,
@@ -441,6 +452,10 @@ impl Mixer {
                                 is_drum,
                             )
                         };
+                        if !is_drum {
+                            total +=
+                                self.tuning.offset_cents(slot.channel, slot.key).round() as i32;
+                        }
                         voice.set_pitch_bend_cents(total);
                     }
                 }
@@ -797,6 +812,59 @@ impl Mixer {
         self.master_coarse_tune_semitones
     }
 
+    // ─────────────────────────── MTS microtuning ───────────────────────────
+
+    /// Borrow the MIDI Tuning Standard (MTS) state — the global
+    /// key-based table + per-channel scale/octave tables. Exposed for
+    /// tests / introspection.
+    pub fn tuning(&self) -> &crate::tuning::TuningTable {
+        &self.tuning
+    }
+
+    /// Apply an MTS **Single-Note Tuning Change** entry: set MIDI `key`
+    /// from a 3-byte frequency-data word (`xx yy zz`). The reserved
+    /// `7F 7F 7F` "no change" word leaves the stored offset untouched.
+    ///
+    /// When `live` is true (the real-time message forms), the spec
+    /// requires the change to "instantly re-tune" any sounding note on
+    /// the affected key without retriggering, so we re-apply pitch to
+    /// every held voice afterwards. The non-real-time forms are "setup
+    /// messages" that must not disturb sounding notes, so `live` is
+    /// false and only the stored table is updated.
+    pub fn set_key_tuning_word(&mut self, key: u8, word: [u8; 3], live: bool) {
+        self.tuning.set_key_freq_word(key, word);
+        if live {
+            // Re-apply on every channel — the key-based table is global,
+            // so a held note on any channel matching `key` must update.
+            // Drum channels are skipped inside the pitch composition.
+            for ch in 0..NUM_CHANNELS {
+                self.reapply_pitch_for_channel(ch as u8);
+            }
+        }
+    }
+
+    /// Apply an MTS **Scale/Octave Tuning** message to one channel: 12
+    /// pitch-class offsets in cents (C, C#, … B). Updates the channel's
+    /// scale/octave row; when `live` is true (the real-time forms) it
+    /// also re-applies pitch to that channel's sounding voices.
+    pub fn set_scale_octave_tuning(&mut self, channel: u8, offsets_cents: [f32; 12], live: bool) {
+        for (pc, &c) in offsets_cents.iter().enumerate() {
+            self.tuning.set_scale_octave(channel, pc, c);
+        }
+        if live {
+            self.reapply_pitch_for_channel(channel);
+        }
+    }
+
+    /// Reset all MTS microtuning to equal temperament. Wired to GM
+    /// System On/Off (which resets every controller to its default).
+    pub fn reset_tuning(&mut self) {
+        self.tuning.reset();
+        for ch in 0..NUM_CHANNELS {
+            self.reapply_pitch_for_channel(ch as u8);
+        }
+    }
+
     // ─────────────────────────── MPE plumbing ───────────────────────────
 
     /// Activate / deactivate one MPE zone. `members = 0` deactivates
@@ -1014,6 +1082,14 @@ impl Mixer {
             };
             let mgr_state = self.channels[mgr];
             cents += pitch_bend_to_cents(mgr_state.pitch_bend, mgr_state.pitch_bend_range_cents);
+        }
+        // Fold in the MTS per-key tuning offset (key-based table +
+        // channel scale/octave). Drum channels are exempt from
+        // note-shifting per CA-25's principle (a different pitch on a
+        // drum kit is a different sound), matching the master-tuning
+        // exemption above.
+        if !is_drum {
+            cents += self.tuning.offset_cents(channel, key).round() as i32;
         }
         if cents != 0 {
             voice.set_pitch_bend_cents(cents);
@@ -1933,5 +2009,123 @@ mod tests {
         m.set_data_entry(5, 4, true);
         assert!(m.mpe_zone(MpeZoneKind::Lower).is_none());
         assert!(m.mpe_zone(MpeZoneKind::Upper).is_none());
+    }
+
+    // ───────────────────────── MTS microtuning ─────────────────────────
+
+    #[test]
+    fn key_tuning_folds_into_note_on_pitch() {
+        // Retune key 60 up one semitone (`3D 00 00` addressed to key
+        // 60 = +100 cents) before the note starts. The note-on pitch
+        // composition must carry the +100 cents.
+        let mut m = Mixer::new();
+        m.set_key_tuning_word(60, [0x3D, 0x00, 0x00], true);
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        let cents = *bend_cell.lock().unwrap();
+        assert_eq!(
+            cents, 100,
+            "expected +100 cents from key tuning, got {cents}"
+        );
+    }
+
+    #[test]
+    fn key_tuning_retunes_sounding_note_live() {
+        // A real-time Single-Note Tuning Change must re-tune a note
+        // that is already sounding.
+        let mut m = Mixer::new();
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 64, 100, v);
+        assert_eq!(*bend_cell.lock().unwrap(), 0);
+        m.set_key_tuning_word(64, [0x40, 0x40, 0x00], true); // +50 cents
+        let cents = *bend_cell.lock().unwrap();
+        assert_eq!(
+            cents, 50,
+            "live retune should reach the held voice, got {cents}"
+        );
+    }
+
+    #[test]
+    fn key_tuning_non_live_does_not_retune_sounding_note() {
+        // Non-real-time (setup) form must NOT disturb a sounding note.
+        let mut m = Mixer::new();
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 64, 100, v);
+        m.set_key_tuning_word(64, [0x40, 0x40, 0x00], false); // +50 cents, setup
+        assert_eq!(
+            *bend_cell.lock().unwrap(),
+            0,
+            "setup form must not touch sounding note"
+        );
+        // But the next note picks up the stored offset.
+        let (v2, bend2, _) = instrumented_voice(0.5, 1024);
+        m.note_on(1, 64, 100, v2);
+        assert_eq!(*bend2.lock().unwrap(), 50);
+    }
+
+    #[test]
+    fn scale_octave_tuning_per_pitch_class() {
+        // Put +20 cents on pitch class C (= key 60, 72, …) on channel 2.
+        let mut m = Mixer::new();
+        let mut offsets = [0.0f32; 12];
+        offsets[0] = 20.0; // C
+        m.set_scale_octave_tuning(2, offsets, true);
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(2, 72, 100, v); // C5, pitch class C
+        assert_eq!(*bend_cell.lock().unwrap(), 20);
+        // A D5 (pitch class D, offset 0) on the same channel is untouched.
+        let (v2, bend2, _) = instrumented_voice(0.5, 1024);
+        m.note_on(2, 74, 100, v2);
+        assert_eq!(*bend2.lock().unwrap(), 0);
+        // Channel 0 is unaffected by channel 2's scale/octave row.
+        let (v3, bend3, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 72, 100, v3);
+        assert_eq!(*bend3.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn drum_channel_exempt_from_key_tuning() {
+        // The drum bus (ch 10 = index 9) must not pitch-shift — a
+        // different pitch is a different drum sound.
+        let mut m = Mixer::new();
+        m.set_key_tuning_word(36, [0x25, 0x00, 0x00], true); // +1 semitone
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(9, 36, 100, v);
+        assert_eq!(
+            *bend_cell.lock().unwrap(),
+            0,
+            "drum channel must not retune"
+        );
+    }
+
+    #[test]
+    fn key_tuning_sums_with_pitch_bend() {
+        // +50 cents key tuning on key 60, then a +1 semitone bend
+        // (half of the default ±2-semitone range). The voice should see
+        // the tuning summed with the bend.
+        let mut m = Mixer::new();
+        m.set_key_tuning_word(60, [0x3C, 0x40, 0x00], false); // +50 cents
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        // 0x3000 is +0x1000 = +half-range = +100 cents.
+        m.set_pitch_bend(0, 0x3000);
+        let cents = *bend_cell.lock().unwrap();
+        assert_eq!(cents, 150, "expected 50 + 100, got {cents}");
+    }
+
+    #[test]
+    fn reset_tuning_restores_equal_temperament() {
+        let mut m = Mixer::new();
+        m.set_key_tuning_word(60, [0x3D, 0x00, 0x00], true);
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        assert_eq!(*bend_cell.lock().unwrap(), 100);
+        m.reset_tuning();
+        // Held voice goes back to centre.
+        assert_eq!(*bend_cell.lock().unwrap(), 0);
+        // New note also reads equal temperament.
+        let (v2, bend2, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v2);
+        assert_eq!(*bend2.lock().unwrap(), 0);
     }
 }

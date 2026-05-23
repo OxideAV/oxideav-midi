@@ -394,6 +394,14 @@ fn dispatch_universal_non_real_time(payload: &[u8], mixer: &mut crate::mixer::Mi
         mixer.set_master_volume_14(0x3FFF);
         mixer.set_master_fine_tuning(0, 0x40); // centre
         mixer.set_master_coarse_tuning(0, 0x40); // centre
+        mixer.reset_tuning(); // back to equal temperament
+    } else if sub_id1 == 0x08 {
+        // MIDI Tuning Standard. The non-real-time area carries the
+        // single-note tuning bank form (07) and the non-real-time
+        // scale/octave forms (08 / 09). Per the spec the non-real-time
+        // forms are "setup messages" that should not retune sounding
+        // notes; we update the table but skip the live re-apply.
+        dispatch_mts(payload, mixer, false);
     }
 }
 
@@ -404,6 +412,12 @@ fn dispatch_universal_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer)
         return;
     }
     let sub_id1 = payload[2];
+    if sub_id1 == 0x08 {
+        // MIDI Tuning Standard, real-time forms (single-note 02 / 07,
+        // scale/octave 08 / 09). These MUST update sounding notes.
+        dispatch_mts(payload, mixer, true);
+        return;
+    }
     let sub_id2 = payload[3];
     if sub_id1 != 0x04 || payload.len() < 6 {
         return;
@@ -426,6 +440,117 @@ fn dispatch_universal_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer)
             mixer.set_master_coarse_tuning(payload[4], payload[5]);
         }
         _ => {}
+    }
+}
+
+/// Parse a MIDI Tuning Standard (MTS) Universal SysEx body and route it
+/// into the mixer's microtuning state. `payload` is `7E/7F <dev> 08
+/// <sub2> ...` (trailing F7 already stripped); `live` is true for the
+/// real-time message forms (which must retune sounding notes) and false
+/// for the non-real-time "setup" forms.
+///
+/// Recognised sub-ID#2 values (per
+/// `docs/audio/midi/extensions/MIDI-Tuning-Updated-Specification.pdf`,
+/// incorporating CA-020 / CA-021):
+///
+/// * `02` Single-Note Tuning Change: `08 02 tt ll [kk xx yy zz]…`.
+/// * `07` Single-Note Tuning Change (bank): `08 07 bb tt ll
+///   [kk xx yy zz]…` (the extra `bb` bank byte is parsed but not
+///   used — we model one current tuning program).
+/// * `08` Scale/Octave Tuning 1-byte: `08 08 ff gg hh [ss×12]`.
+/// * `09` Scale/Octave Tuning 2-byte: `08 09 ff gg hh [ss tt ×12]`.
+///
+/// The `04`/`05`/`06` *dump* replies (key-based / scale-octave dumps an
+/// instrument transmits) are not consumed by the renderer — they carry
+/// a 16-byte tuning name + a checksum and are inbound-to-an-instrument
+/// in intent, so we ignore them here.
+fn dispatch_mts(payload: &[u8], mixer: &mut crate::mixer::Mixer, live: bool) {
+    // payload[0] = 7E/7F, payload[1] = device id, payload[2] = 08.
+    if payload.len() < 4 {
+        return;
+    }
+    let sub2 = payload[3];
+    match sub2 {
+        // Single-Note Tuning Change: `08 02 tt ll [kk xx yy zz]…`.
+        0x02 => {
+            // tt @4, ll @5, then ll × 4 bytes.
+            if payload.len() < 6 {
+                return;
+            }
+            let count = payload[5] as usize;
+            let mut p = 6;
+            for _ in 0..count {
+                if p + 4 > payload.len() {
+                    break;
+                }
+                let key = payload[p] & 0x7F;
+                let word = [payload[p + 1], payload[p + 2], payload[p + 3]];
+                mixer.set_key_tuning_word(key, word, live);
+                p += 4;
+            }
+        }
+        // Single-Note Tuning Change (bank): `08 07 bb tt ll [kk…]…`.
+        0x07 => {
+            // bb @4, tt @5, ll @6, then ll × 4 bytes.
+            if payload.len() < 7 {
+                return;
+            }
+            let count = payload[6] as usize;
+            let mut p = 7;
+            for _ in 0..count {
+                if p + 4 > payload.len() {
+                    break;
+                }
+                let key = payload[p] & 0x7F;
+                let word = [payload[p + 1], payload[p + 2], payload[p + 3]];
+                mixer.set_key_tuning_word(key, word, live);
+                p += 4;
+            }
+        }
+        // Scale/Octave Tuning, 1-byte form: `08 08 ff gg hh [ss×12]`.
+        0x08 => {
+            if payload.len() < 7 + 12 {
+                return;
+            }
+            let mask = crate::tuning::scale_octave_channel_mask(payload[4], payload[5], payload[6]);
+            let mut offsets = [0.0f32; 12];
+            for (pc, off) in offsets.iter_mut().enumerate() {
+                *off = crate::tuning::scale_octave_1byte_to_cents(payload[7 + pc]);
+            }
+            apply_scale_octave_to_mask(mixer, mask, offsets, live);
+        }
+        // Scale/Octave Tuning, 2-byte form: `08 09 ff gg hh [ss tt ×12]`.
+        0x09 => {
+            if payload.len() < 7 + 24 {
+                return;
+            }
+            let mask = crate::tuning::scale_octave_channel_mask(payload[4], payload[5], payload[6]);
+            let mut offsets = [0.0f32; 12];
+            for (pc, off) in offsets.iter_mut().enumerate() {
+                let msb = payload[7 + pc * 2];
+                let lsb = payload[7 + pc * 2 + 1];
+                *off = crate::tuning::scale_octave_2byte_to_cents(msb, lsb);
+            }
+            apply_scale_octave_to_mask(mixer, mask, offsets, live);
+        }
+        // Dump replies (04/05/06) + dump requests (00/01/03) carry no
+        // semantics for the renderer.
+        _ => {}
+    }
+}
+
+/// Apply a 12-pitch-class scale/octave offset table to every MIDI
+/// channel selected in `mask` (bit `c` set ⇒ channel index `c`).
+fn apply_scale_octave_to_mask(
+    mixer: &mut crate::mixer::Mixer,
+    mask: u16,
+    offsets: [f32; 12],
+    live: bool,
+) {
+    for ch in 0..16u8 {
+        if mask & (1 << ch) != 0 {
+            mixer.set_scale_octave_tuning(ch, offsets, live);
+        }
     }
 }
 
@@ -783,6 +908,126 @@ mod tests {
             .expect("MCM must have created the lower zone");
         assert_eq!(zone.members, 4);
         assert!(mixer.channel_state(0).mpe_role.is_manager());
+    }
+
+    // ───────────────────────── MTS via SysEx ─────────────────────────
+
+    #[test]
+    fn mts_single_note_real_time_routes_to_mixer() {
+        // F0 7F <dev=7F> 08 02 tt=00 ll=01 kk=60 xx=3D yy=00 zz=00 F7.
+        // `3D 00 00` addressed to key 60 = +100 cents. The slice passed
+        // to dispatch_universal_sysex omits the leading F0.
+        let data = [
+            0x7F, 0x7F, 0x08, 0x02, 0x00, 0x01, 0x3C, 0x3D, 0x00, 0x00, 0xF7,
+        ];
+        // (kk = 0x3C = key 60.)
+        let mut mixer = Mixer::new();
+        dispatch_universal_sysex(&data, &mut mixer);
+        let off = mixer.tuning().offset_cents(0, 60);
+        assert!((off - 100.0).abs() < 1e-3, "off {off}");
+    }
+
+    #[test]
+    fn mts_single_note_bank_form_routes() {
+        // F0 7F <dev> 08 07 bb=00 tt=00 ll=01 kk=64 word=41 00 00 F7.
+        // `41 00 00` on key 64 = +1 semitone = +100 cents.
+        let data = [
+            0x7F, 0x7F, 0x08, 0x07, 0x00, 0x00, 0x01, 0x40, 0x41, 0x00, 0x00, 0xF7,
+        ];
+        let mut mixer = Mixer::new();
+        dispatch_universal_sysex(&data, &mut mixer);
+        let off = mixer.tuning().offset_cents(0, 64);
+        assert!((off - 100.0).abs() < 1e-3, "off {off}");
+    }
+
+    #[test]
+    fn mts_scale_octave_1byte_routes_to_selected_channel() {
+        // F0 7F <dev> 08 08 ff gg hh [12 × ss] F7.
+        // hh bit0 ⇒ channel 1 (index 0). 12 offsets: C = 7F (+63 c),
+        // rest = 40 (0 c).
+        let mut data = vec![0x7F, 0x7F, 0x08, 0x08, 0x00, 0x00, 0x01];
+        data.push(0x7F); // C = +63 cents
+        data.resize(data.len() + 11, 0x40); // C#..B = 0 cents
+        data.push(0xF7);
+        let mut mixer = Mixer::new();
+        dispatch_universal_sysex(&data, &mut mixer);
+        assert!((mixer.tuning().offset_cents(0, 60) - 63.0).abs() < 1e-3);
+        // C# (key 61) on channel 0 is the 0-cent class.
+        assert!(mixer.tuning().offset_cents(0, 61).abs() < 1e-3);
+        // Channel 1 was not selected by the mask.
+        assert!(mixer.tuning().offset_cents(1, 60).abs() < 1e-3);
+    }
+
+    #[test]
+    fn mts_scale_octave_2byte_routes() {
+        // F0 7F <dev> 08 09 ff gg hh [12 × ss tt] F7. Select channel 1
+        // (hh bit0). C = 0x7F 0x7F (≈ +100 c), rest = 0x40 0x00 (0 c).
+        let mut data = vec![0x7F, 0x7F, 0x08, 0x09, 0x00, 0x00, 0x01];
+        data.extend_from_slice(&[0x7F, 0x7F]); // C ≈ +100 cents
+        for _ in 0..11 {
+            data.extend_from_slice(&[0x40, 0x00]); // 0 cents
+        }
+        data.push(0xF7);
+        let mut mixer = Mixer::new();
+        dispatch_universal_sysex(&data, &mut mixer);
+        let c = mixer.tuning().offset_cents(0, 60);
+        assert!((c - 99.988).abs() < 0.05, "C offset {c}");
+    }
+
+    #[test]
+    fn mts_non_real_time_single_note_does_not_retune_sounding_note() {
+        // The non-real-time (7E) single-note bank form is a setup
+        // message: it updates the table but must not disturb a held
+        // note. We can only observe the table here (no live voice),
+        // so assert the offset landed in the table.
+        let data = [
+            0x7E, 0x7F, 0x08, 0x07, 0x00, 0x00, 0x01, 0x40, 0x41, 0x00, 0x00, 0xF7,
+        ];
+        let mut mixer = Mixer::new();
+        dispatch_universal_sysex(&data, &mut mixer);
+        let off = mixer.tuning().offset_cents(0, 64);
+        assert!((off - 100.0).abs() < 1e-3, "off {off}");
+    }
+
+    #[test]
+    fn mts_multi_change_message_sets_several_keys() {
+        // ll = 2: two [kk xx yy zz] entries in one message.
+        let data = [
+            0x7F, 0x7F, 0x08, 0x02, 0x00, 0x02, // header + count
+            0x3C, 0x3D, 0x00, 0x00, // key 60 → +100 c
+            0x40, 0x40, 0x40, 0x00, // key 64 → +50 c
+            0xF7,
+        ];
+        let mut mixer = Mixer::new();
+        dispatch_universal_sysex(&data, &mut mixer);
+        assert!((mixer.tuning().offset_cents(0, 60) - 100.0).abs() < 1e-3);
+        assert!((mixer.tuning().offset_cents(0, 64) - 50.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn gm_system_on_resets_mts_tuning() {
+        let mut mixer = Mixer::new();
+        // First retune key 60.
+        dispatch_universal_sysex(
+            &[
+                0x7F, 0x7F, 0x08, 0x02, 0x00, 0x01, 0x3C, 0x3D, 0x00, 0x00, 0xF7,
+            ],
+            &mut mixer,
+        );
+        assert!(mixer.tuning().offset_cents(0, 60) > 50.0);
+        // GM1 System On: F0 7E 7F 09 01 F7.
+        dispatch_universal_sysex(&[0x7E, 0x7F, 0x09, 0x01, 0xF7], &mut mixer);
+        assert!(mixer.tuning().offset_cents(0, 60).abs() < 1e-3);
+    }
+
+    #[test]
+    fn mts_truncated_message_does_not_panic() {
+        // A single-note message that promises ll=4 entries but only
+        // carries one must not read past the buffer.
+        let data = [0x7F, 0x7F, 0x08, 0x02, 0x00, 0x04, 0x3C, 0x3D, 0x00, 0x00];
+        let mut mixer = Mixer::new();
+        dispatch_universal_sysex(&data, &mut mixer);
+        assert!((mixer.tuning().offset_cents(0, 60) - 100.0).abs() < 1e-3);
     }
 
     #[test]
