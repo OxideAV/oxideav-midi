@@ -131,7 +131,19 @@ framework but usable standalone.
   **Master Fine / Master Coarse Tuning** (CA-25, sub-IDs `04 03` /
   `04 04`) summed with the per-channel fine + coarse tune to derive
   the effective pitch each voice receives. Drum channel (MIDI 10 =
-  index 9) is exempt from tuning per CA-25.
+  index 9) is exempt from tuning per CA-25. Round 105 adds **Master
+  Balance** (Universal Real-Time SysEx `7F 7F 04 02 lsb msb`) per the
+  M1 v4.2.1 *Detailed Specification* §"DEVICE CONTROL — MASTER
+  VOLUME AND MASTER BALANCE" (p.57): 14-bit value with
+  `00 00 = hard left`, `7F 7F = hard right`, centre = `0x2000`.
+  Stored verbatim and folded into the mix-time per-side gains via
+  [`Mixer::master_balance_gains`] using the textbook balance law
+  (the *far* side attenuates while the *near* side stays at unity, so
+  a stereo source panned hard one way mutes the opposite bus without
+  boosting the near bus). Default `0x2000` produces the identity
+  gains `(1.0, 1.0)`, keeping the mix bit-identical to the
+  pre-round-105 output until a SysEx moves balance off centre. GM 1 /
+  GM 2 System On / GM System Off also reset Master Balance to centre.
 - `mixer::MpeZone` / `mixer::MpeRole` — MIDI Polyphonic Expression
   (M1-100-UM v1.1) support. The MCM (RPN 0x0006 on channel 0 for
   Lower, channel 15 for Upper) configures one or two zones; each
@@ -154,6 +166,8 @@ framework but usable standalone.
   + master volume; GM System Off (`09 02`) does the same; Master
   Volume (`04 01`), Master Fine Tuning (`04 03`) + Master Coarse
   Tuning (`04 04`) all route into the mixer's master-state setters.
+  Round 105 routes Master Balance (`04 02`) into
+  `Mixer::set_master_balance_14`.
   CC 1 / CC 74 are pumped into the new mixer hooks; the MPE
   Configuration Message (RPN 6 on the Lower / Upper Manager Channel)
   reaches the mixer via the existing RPN data-entry pipeline. Round 98

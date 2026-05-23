@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 105 — Master Balance (Universal Real-Time SysEx `04 02`)
+
+- New `Mixer::set_master_balance_14(value)` /
+  `Mixer::master_balance_14()` carry the device-level Master Balance
+  scalar from the MIDI 1.0 *Detailed Specification* v4.2.1 §"DEVICE
+  CONTROL — MASTER VOLUME AND MASTER BALANCE" (p.57). The 14-bit
+  value is stored verbatim with `0x0000` = hard left,
+  `0x2000` = centre, `0x3FFF` = hard right; the setter clamps inputs
+  above `0x3FFF` to the spec maximum.
+- New `Mixer::master_balance_gains()` returns the per-side
+  multipliers `(left, right)` that the mix loop folds into every
+  voice's gain — `(1.0, 1.0)` at centre, `(1.0, 0.0)` at hard left,
+  `(0.0, 1.0)` at hard right, and a linear ramp on the *far* side
+  between centre and each extreme (the *near* side stays at unity).
+  This is the textbook "balance between two sound sources" law M1
+  v4.2.1 §"BALANCE" describes for CC 8, applied here as the
+  device-level analog.
+- The stereo + mono branches of `Mixer::mix_stereo` now multiply
+  every voice by these master-balance gains. The values are hoisted
+  out of the per-slot loop, alongside the existing master-volume
+  scalar, so the per-voice arithmetic gains a single extra `f32`
+  multiply per side and the default `0x2000` setting produces an
+  output buffer byte-identical to the pre-round-105 mix (asserted by
+  the new `master_balance_centre_matches_pre_balance_output` test).
+- `scheduler::dispatch_universal_sysex` recognises `04 02 lsb msb`
+  in the Universal Real-Time area and forwards the combined 14-bit
+  value via `set_master_balance_14`. GM 1 / GM 2 System On / GM
+  System Off resets now also restore Master Balance to centre
+  (`0x2000`), matching the rest of the master-state reset surface.
+- 12 new tests (9 `mixer`, 3 `scheduler`): default-centre +
+  unity-gains, hard-left mutes right, hard-right mutes left,
+  half-left/half-right ramp arithmetic, the clamp-above-14-bit
+  guard, the per-side zeroing of the mix output at each extreme, the
+  centre-equals-default-output regression, and the three scheduler
+  SysEx routings (centre / hard left / hard right). The existing
+  `universal_gm_on_sysex_resets_state` test gained an additional
+  Master-Balance-set-then-reset assertion.
+
 ### Round 102 — Data Increment / Data Decrement (RP-018)
 
 - New `Mixer::data_inc_dec(channel, step)` implements the Data Increment

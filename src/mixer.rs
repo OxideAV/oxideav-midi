@@ -295,6 +295,14 @@ pub struct Mixer {
     /// 0..=0x3FFF). Default = 0x3FFF (= unity). Applied at mix time as
     /// an additional global gain factor on every voice.
     master_volume_14: u16,
+    /// Master Balance (Universal Real Time SysEx `7F 7F 04 02`, 14-bit
+    /// 0..=0x3FFF). Per the MIDI 1.0 Detailed Specification §"DEVICE
+    /// CONTROL — MASTER VOLUME AND MASTER BALANCE" (M1 v4.2.1 p.57):
+    /// `00 00 = hard left`, `7F 7F = hard right`, centre = `0x2000`.
+    /// Applied at mix time as a per-side attenuation derived from
+    /// [`Self::master_balance_gains`]. Default = `0x2000` (= centre,
+    /// both sides full).
+    master_balance_14: u16,
     /// Master Fine Tuning (CA-25), in signed cents within ±100.
     /// Default 0. Summed with per-channel fine tune + pitch bend.
     master_fine_tune_cents: i16,
@@ -333,6 +341,7 @@ impl Mixer {
             next_age: 1,
             mix_gain: 0.5,
             master_volume_14: 0x3FFF,
+            master_balance_14: 0x2000,
             master_fine_tune_cents: 0,
             master_coarse_tune_semitones: 0,
             mpe_lower: None,
@@ -851,6 +860,58 @@ impl Mixer {
         self.master_volume_14
     }
 
+    /// Master Balance (Universal Real Time SysEx `7F 7F 04 02`). The
+    /// argument is the raw 14-bit MIDI scalar (`0..=0x3FFF`) per the
+    /// MIDI 1.0 Detailed Specification §"DEVICE CONTROL — MASTER
+    /// VOLUME AND MASTER BALANCE" (M1 v4.2.1 p.57):
+    ///
+    ///   * `0x0000` = hard left (right side muted),
+    ///   * `0x2000` = centre (both sides at full),
+    ///   * `0x3FFF` = hard right (left side muted).
+    ///
+    /// Stored verbatim; [`Self::master_balance_gains`] computes the
+    /// per-side multipliers applied at mix time. The CC 8 BALANCE
+    /// description in M1 §"BALANCE" frames the control as the volume
+    /// balance between two sound sources, so this mixer realises it as
+    /// the classic triangular law: the opposite side starts to
+    /// attenuate as the scalar moves away from centre, while the
+    /// near side stays at unity until the centre is crossed. That
+    /// keeps the mix pass byte-identical at the default `0x2000` and
+    /// fades exactly one side to zero at each extreme.
+    pub fn set_master_balance_14(&mut self, value: u16) {
+        self.master_balance_14 = value.min(0x3FFF);
+    }
+
+    /// Current Master Balance scalar (14-bit, 0..=0x3FFF).
+    pub fn master_balance_14(&self) -> u16 {
+        self.master_balance_14
+    }
+
+    /// Per-side multipliers derived from [`Self::master_balance_14`].
+    /// Returns `(left, right)` in `[0.0, 1.0]`:
+    ///
+    ///   * `0x0000` → `(1.0, 0.0)` — hard left, right muted.
+    ///   * `0x2000` → `(1.0, 1.0)` — centre, both sides at full.
+    ///   * `0x3FFF` → `(0.0, 1.0)` — hard right, left muted.
+    ///
+    /// Below centre: `right = value / 0x2000`, `left = 1.0`. Above
+    /// centre: `left = (0x3FFF - value) / (0x3FFF - 0x2000)`,
+    /// `right = 1.0`. This is the textbook "balance-between-two-
+    /// sources" law called out by CC 8 in M1 v4.2.1 §"BALANCE": the
+    /// control attenuates the *far* side and leaves the *near* side
+    /// untouched, so panning a stereo source hard one way mutes the
+    /// opposite channel without boosting the near channel.
+    pub fn master_balance_gains(&self) -> (f32, f32) {
+        let v = self.master_balance_14 as i32;
+        if v <= 0x2000 {
+            let right = v as f32 / 0x2000 as f32;
+            (1.0, right.clamp(0.0, 1.0))
+        } else {
+            let left = (0x3FFF - v) as f32 / (0x3FFF - 0x2000) as f32;
+            (left.clamp(0.0, 1.0), 1.0)
+        }
+    }
+
     /// Master Fine Tuning (CA-25). The two arguments are the raw
     /// LSB/MSB bytes from the SysEx payload; we combine them into a
     /// 14-bit value centred on 0x2000 and map it linearly to
@@ -1254,6 +1315,11 @@ impl Mixer {
         let mut mono = vec![0.0f32; left.len()];
         let mut lscratch = vec![0.0f32; left.len()];
         let mut rscratch = vec![0.0f32; left.len()];
+        // Master state is mix-wide; compute once per chunk and reuse
+        // — also avoids re-borrowing `self` immutably inside the
+        // `iter_mut()` loop.
+        let master = self.master_volume_14 as f32 / 0x3FFF as f32;
+        let (master_bal_l, master_bal_r) = self.master_balance_gains();
         for slot in self.slots.iter_mut() {
             let stereo = slot.voice.as_ref().map(|v| v.is_stereo()).unwrap_or(false);
             let n = if let Some(v) = slot.voice.as_mut() {
@@ -1271,11 +1337,10 @@ impl Mixer {
                 continue;
             };
 
-            // Per-channel volume / pan + universal master volume.
-            // Folded once per chunk.
+            // Per-channel volume / pan + universal master volume +
+            // master balance (master state hoisted out of the loop).
             let st = self.channels[slot.channel as usize % NUM_CHANNELS];
             let vol = st.volume as f32 / 127.0;
-            let master = self.master_volume_14 as f32 / 0x3FFF as f32;
             // Constant-power pan: θ in [0, π/2], left = cos(θ), right = sin(θ).
             let pan_norm = (st.pan as f32 / 127.0).clamp(0.0, 1.0);
             let theta = pan_norm * std::f32::consts::FRAC_PI_2;
@@ -1290,15 +1355,15 @@ impl Mixer {
                 // re-panning a mono signal.
                 let l_balance = (theta.cos() * std::f32::consts::SQRT_2).min(1.0);
                 let r_balance = (theta.sin() * std::f32::consts::SQRT_2).min(1.0);
-                let lg = vol * master * self.mix_gain * l_balance;
-                let rg = vol * master * self.mix_gain * r_balance;
+                let lg = vol * master * master_bal_l * self.mix_gain * l_balance;
+                let rg = vol * master * master_bal_r * self.mix_gain * r_balance;
                 for i in 0..n {
                     left[i] += lscratch[i] * lg;
                     right[i] += rscratch[i] * rg;
                 }
             } else {
-                let l_gain = theta.cos() * vol * master * self.mix_gain;
-                let r_gain = theta.sin() * vol * master * self.mix_gain;
+                let l_gain = theta.cos() * vol * master * master_bal_l * self.mix_gain;
+                let r_gain = theta.sin() * vol * master * master_bal_r * self.mix_gain;
                 for i in 0..n {
                     let s = mono[i];
                     left[i] += s * l_gain;
@@ -2009,6 +2074,126 @@ mod tests {
             (0.40..0.60).contains(&ratio),
             "master-volume ratio {ratio} not in 0.4..0.6",
         );
+    }
+
+    #[test]
+    fn master_balance_default_is_centre_with_unity_gains() {
+        let m = Mixer::new();
+        assert_eq!(m.master_balance_14(), 0x2000);
+        let (l, r) = m.master_balance_gains();
+        assert_eq!(l, 1.0);
+        assert_eq!(r, 1.0);
+    }
+
+    #[test]
+    fn master_balance_hard_left_mutes_right_side() {
+        let mut m = Mixer::new();
+        // Per M1 v4.2.1 §"DEVICE CONTROL — MASTER VOLUME AND MASTER
+        // BALANCE": 00 00 = hard left.
+        m.set_master_balance_14(0x0000);
+        let (l, r) = m.master_balance_gains();
+        assert_eq!(l, 1.0);
+        assert_eq!(r, 0.0);
+    }
+
+    #[test]
+    fn master_balance_hard_right_mutes_left_side() {
+        let mut m = Mixer::new();
+        // Per M1 v4.2.1 §"DEVICE CONTROL — MASTER VOLUME AND MASTER
+        // BALANCE": 7F 7F = hard right.
+        m.set_master_balance_14(0x3FFF);
+        let (l, r) = m.master_balance_gains();
+        assert_eq!(l, 0.0);
+        assert_eq!(r, 1.0);
+    }
+
+    #[test]
+    fn master_balance_half_left_keeps_left_full_attenuates_right_to_half() {
+        // Below centre: left = 1.0, right = v / 0x2000.
+        let mut m = Mixer::new();
+        m.set_master_balance_14(0x1000);
+        let (l, r) = m.master_balance_gains();
+        assert_eq!(l, 1.0);
+        // 0x1000 / 0x2000 = 0.5 exactly.
+        assert!((r - 0.5).abs() < 1e-6, "right = {r}, want ~0.5");
+    }
+
+    #[test]
+    fn master_balance_half_right_keeps_right_full_attenuates_left_to_half() {
+        // Above centre: right = 1.0, left = (0x3FFF - v) / 0x1FFF.
+        // Pick v such that left ≈ 0.5: v = 0x3FFF - 0x1FFF/2 ≈ 0x3000.
+        let mut m = Mixer::new();
+        m.set_master_balance_14(0x3000);
+        let (l, r) = m.master_balance_gains();
+        assert_eq!(r, 1.0);
+        // (0x3FFF - 0x3000) / 0x1FFF = 0x0FFF / 0x1FFF ≈ 0.5
+        assert!((l - 0.5).abs() < 1e-3, "left = {l}, want ~0.5");
+    }
+
+    #[test]
+    fn master_balance_setter_clamps_above_14bit_max() {
+        let mut m = Mixer::new();
+        m.set_master_balance_14(0xFFFF);
+        assert_eq!(m.master_balance_14(), 0x3FFF);
+    }
+
+    #[test]
+    fn master_balance_hard_left_zeros_right_in_mix_output() {
+        let mut m = Mixer::new();
+        // Pan centred so the per-channel pan doesn't mute one side
+        // ahead of the master balance.
+        m.channel_state_mut(0).pan = 64;
+        m.set_master_balance_14(0x0000); // hard left
+        m.note_on(0, 60, 100, voice(0.5, 16));
+        let mut l = vec![0.0; 16];
+        let mut r = vec![0.0; 16];
+        m.mix_stereo(&mut l, &mut r);
+        // Right side must be silent.
+        for s in &r {
+            assert_eq!(*s, 0.0);
+        }
+        // Left side carries audio.
+        assert!(l[0].abs() > 0.0);
+    }
+
+    #[test]
+    fn master_balance_hard_right_zeros_left_in_mix_output() {
+        let mut m = Mixer::new();
+        m.channel_state_mut(0).pan = 64;
+        m.set_master_balance_14(0x3FFF); // hard right
+        m.note_on(0, 60, 100, voice(0.5, 16));
+        let mut l = vec![0.0; 16];
+        let mut r = vec![0.0; 16];
+        m.mix_stereo(&mut l, &mut r);
+        for s in &l {
+            assert_eq!(*s, 0.0);
+        }
+        assert!(r[0].abs() > 0.0);
+    }
+
+    #[test]
+    fn master_balance_centre_matches_pre_balance_output() {
+        // 0x2000 (the default) yields gains (1.0, 1.0), so the mix
+        // output must be byte-identical to a mixer whose balance was
+        // never touched — proving the round 105 wiring is a pure
+        // addition at the default.
+        let mut a = Mixer::new();
+        a.channel_state_mut(0).pan = 64;
+        a.note_on(0, 60, 100, voice(0.5, 16));
+        let mut la = vec![0.0; 16];
+        let mut ra = vec![0.0; 16];
+        a.mix_stereo(&mut la, &mut ra);
+
+        let mut b = Mixer::new();
+        b.channel_state_mut(0).pan = 64;
+        b.set_master_balance_14(0x2000); // explicit centre
+        b.note_on(0, 60, 100, voice(0.5, 16));
+        let mut lb = vec![0.0; 16];
+        let mut rb = vec![0.0; 16];
+        b.mix_stereo(&mut lb, &mut rb);
+
+        assert_eq!(la, lb);
+        assert_eq!(ra, rb);
     }
 
     #[test]

@@ -351,6 +351,10 @@ impl Scheduler {
 /// * **Real-Time `7F`** — sub-ID #1 `04` (Device Control):
 ///   * `01` Master Volume (`F0 7F <dev> 04 01 lsb msb F7`). 14-bit
 ///     value applied via [`Mixer::set_master_volume_14`].
+///   * `02` Master Balance (`F0 7F <dev> 04 02 lsb msb F7`).
+///     14-bit value (`00 00` = hard left, `7F 7F` = hard right,
+///     centre = `0x2000`) applied via
+///     [`Mixer::set_master_balance_14`].
 ///   * `03` Master Fine Tuning (CA-25) — applied via
 ///     [`Mixer::set_master_fine_tuning`].
 ///   * `04` Master Coarse Tuning (CA-25) — applied via
@@ -394,6 +398,7 @@ fn dispatch_universal_non_real_time(payload: &[u8], mixer: &mut crate::mixer::Mi
         // and turns off all notes" on GM-on.
         mixer.all_notes_off();
         mixer.set_master_volume_14(0x3FFF);
+        mixer.set_master_balance_14(0x2000); // centre
         mixer.set_master_fine_tuning(0, 0x40); // centre
         mixer.set_master_coarse_tuning(0, 0x40); // centre
         mixer.reset_tuning(); // back to equal temperament
@@ -432,6 +437,16 @@ fn dispatch_universal_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer)
             let msb = payload[5] & 0x7F;
             let combined = ((msb as u16) << 7) | (lsb as u16);
             mixer.set_master_volume_14(combined);
+        }
+        0x02 => {
+            // Master Balance (M1 v4.2.1 §"DEVICE CONTROL — MASTER
+            // VOLUME AND MASTER BALANCE", p.57): `04 02 lsb msb`.
+            // `00 00 = hard left`, `7F 7F = hard right`, centre =
+            // `0x2000`. Identical 14-bit layout to Master Volume.
+            let lsb = payload[4] & 0x7F;
+            let msb = payload[5] & 0x7F;
+            let combined = ((msb as u16) << 7) | (lsb as u16);
+            mixer.set_master_balance_14(combined);
         }
         0x03 => {
             // Master Fine Tuning (CA-25): `04 03 lsb msb`.
@@ -865,6 +880,54 @@ mod tests {
     }
 
     #[test]
+    fn universal_master_balance_sysex_routes_centre() {
+        // F0 [len=7] 7F 7F 04 02 lsb=0x00 msb=0x40 F7  → 14-bit = 0x2000 (centre).
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[0x00, 0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x02, 0x00, 0x40, 0xF7]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.master_balance_14(), 0x2000);
+    }
+
+    #[test]
+    fn universal_master_balance_sysex_routes_hard_left() {
+        // F0 [len=7] 7F 7F 04 02 00 00 F7  → hard left per M1 v4.2.1 §57.
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[0x00, 0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x02, 0x00, 0x00, 0xF7]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.master_balance_14(), 0x0000);
+        let (l, r) = mixer.master_balance_gains();
+        assert_eq!(l, 1.0);
+        assert_eq!(r, 0.0);
+    }
+
+    #[test]
+    fn universal_master_balance_sysex_routes_hard_right() {
+        // F0 [len=7] 7F 7F 04 02 7F 7F F7  → hard right per M1 v4.2.1 §57.
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[0x00, 0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x02, 0x7F, 0x7F, 0xF7]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.master_balance_14(), 0x3FFF);
+        let (l, r) = mixer.master_balance_gains();
+        assert_eq!(l, 0.0);
+        assert_eq!(r, 1.0);
+    }
+
+    #[test]
     fn universal_master_fine_tuning_sysex_routes() {
         // F0 [len=7] 7F 7F 04 03 lsb=0x00 msb=0x60 F7  → +50 cents.
         let mut ev = Vec::new();
@@ -900,6 +963,9 @@ mod tests {
         let mut ev = Vec::new();
         // Master Volume = 0x1000 (len=7).
         ev.extend_from_slice(&[0x00, 0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x01, 0x00, 0x20, 0xF7]);
+        // Master Balance = hard left (len=7) — to prove the GM-on
+        // reset also returns balance to centre.
+        ev.extend_from_slice(&[0x00, 0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x02, 0x00, 0x00, 0xF7]);
         // GM1 System On: F0 [len=5] 7E 7F 09 01 F7.
         ev.extend_from_slice(&[0x10, 0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7]);
         ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
@@ -910,6 +976,7 @@ mod tests {
         s.step(8192, &mut mixer, &inst);
         // Master volume back to full per GM-on reset.
         assert_eq!(mixer.master_volume_14(), 0x3FFF);
+        assert_eq!(mixer.master_balance_14(), 0x2000);
         assert_eq!(mixer.master_fine_tune_cents(), 0);
         assert_eq!(mixer.master_coarse_tune_semitones(), 0);
     }
