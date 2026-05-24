@@ -282,7 +282,94 @@ impl TimeSignatureChange {
     }
 }
 
+/// One tempo change pinned to the absolute tick (relative to the
+/// start of its parent track) at which the
+/// [`FF 51 03 tt tt tt`](MetaEvent::Tempo) Set Tempo meta event fires.
+///
+/// Returned by [`SmfFile::tempo_map`] — see that method for the merge
+/// semantics across multiple tracks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TempoChange {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). Format-1 files conventionally place every
+    /// tempo change on track 0; format-2 files keep them per-track.
+    pub track: usize,
+    /// `tt tt tt` decoded as a 24-bit big-endian unsigned integer —
+    /// microseconds per quarter note. The default (assumed before the
+    /// first explicit Set Tempo) is 500 000 µs/qn = 120 BPM.
+    pub microseconds_per_quarter_note: u32,
+    /// Cached `60_000_000 / microseconds_per_quarter_note` evaluated in
+    /// `f64`. Zero is mapped to `f64::INFINITY` so a malformed
+    /// `tt tt tt == 0` payload doesn't divide-by-zero — the spec
+    /// doesn't forbid it but no real file uses it.
+    pub bpm: f64,
+}
+
+impl TempoChange {
+    /// Build a `TempoChange` from its three fields. Pre-computes
+    /// [`bpm`](Self::bpm) so callers can read it cheaply.
+    ///
+    /// `microseconds_per_quarter_note == 0` maps to `bpm = f64::INFINITY`
+    /// rather than panicking on the division — see the type-level note.
+    pub fn new(tick: u64, track: usize, microseconds_per_quarter_note: u32) -> Self {
+        let bpm = if microseconds_per_quarter_note == 0 {
+            f64::INFINITY
+        } else {
+            60_000_000.0 / microseconds_per_quarter_note as f64
+        };
+        Self {
+            tick,
+            track,
+            microseconds_per_quarter_note,
+            bpm,
+        }
+    }
+}
+
 impl SmfFile {
+    /// Collect every [`MetaEvent::Tempo`] from every track, pinned to
+    /// the absolute tick at which it fires, in time order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two changes at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::time_signatures`] and the
+    /// scheduler use (`scheduler.rs` §"merged event list, sorted by
+    /// absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries a Set Tempo meta
+    /// event. Per the SMF convention, a player that needs an initial
+    /// tempo should assume **500 000 µs/qn = 120 BPM** until the first
+    /// change fires.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`] (the same cap the parser enforces).
+    pub fn tempo_map(&self) -> Vec<TempoChange> {
+        let mut out: Vec<TempoChange> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::Tempo(us_per_qn)) = &ev.kind {
+                    out.push(TempoChange::new(abs, track_idx, *us_per_qn));
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
     /// Collect every [`MetaEvent::TimeSignature`] from every track,
     /// pinned to the absolute tick at which it fires, in time order.
     ///
@@ -1242,5 +1329,188 @@ mod tests {
             notated_32nd_per_quarter: 8,
         };
         assert_eq!(ts.denominator(), u32::MAX);
+    }
+
+    // ───────── TempoChange / SmfFile::tempo_map ─────────
+
+    #[test]
+    fn tempo_map_empty_when_no_meta_event_present() {
+        // Track has just a note-on + note-off + EOT — no FF 51.
+        let events: &[u8] = &[
+            0x00, 0x90, 0x3C, 0x64, 0x40, 0x80, 0x3C, 0x40, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.tempo_map().is_empty());
+    }
+
+    #[test]
+    fn tempo_map_single_change_at_tick_zero() {
+        // delta=0 FF 51 03 07 A1 20   set tempo 500000us/qn (120 BPM)
+        // delta=0 FF 2F 00
+        let events: &[u8] = &[
+            0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(events));
+        let smf = parse(&blob).unwrap();
+        let map = smf.tempo_map();
+        assert_eq!(map.len(), 1);
+        let tc = map[0];
+        assert_eq!(tc.tick, 0);
+        assert_eq!(tc.track, 0);
+        assert_eq!(tc.microseconds_per_quarter_note, 500_000);
+        // 60_000_000 / 500_000 = 120.0 exactly.
+        assert!((tc.bpm - 120.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tempo_map_multiple_changes_within_one_track_are_in_order() {
+        // delta=0   FF 51 03 07 A1 20   500000 µs/qn   120 BPM
+        // delta=480 FF 51 03 03 D0 90   250000 µs/qn   240 BPM
+        // delta=480 FF 51 03 0F 42 40  1000000 µs/qn    60 BPM
+        // delta=0   FF 2F 00
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]);
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0xFF, 0x51, 0x03, 0x03, 0xD0, 0x90]);
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0xFF, 0x51, 0x03, 0x0F, 0x42, 0x40]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let map = smf.tempo_map();
+        assert_eq!(map.len(), 3);
+        assert_eq!(map[0].tick, 0);
+        assert_eq!(map[0].microseconds_per_quarter_note, 500_000);
+        assert!((map[0].bpm - 120.0).abs() < 1e-9);
+        assert_eq!(map[1].tick, 480);
+        assert_eq!(map[1].microseconds_per_quarter_note, 250_000);
+        assert!((map[1].bpm - 240.0).abs() < 1e-9);
+        assert_eq!(map[2].tick, 960);
+        assert_eq!(map[2].microseconds_per_quarter_note, 1_000_000);
+        assert!((map[2].bpm - 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tempo_map_merge_across_tracks_sorted_by_tick() {
+        // Track 0: tick 0 = 120 BPM, tick 1920 = 90 BPM, EOT at 1920.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]); // 500_000
+        t0.extend_from_slice(&encode_vlq(1920));
+        // 60_000_000 / 90 = 666_666.66.. → use 666_667 (0x0A 0x2C 0x2B)
+        t0.extend_from_slice(&[0xFF, 0x51, 0x03, 0x0A, 0x2C, 0x2B]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        // Track 1: tick 960 = 240 BPM, EOT at 1920.
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(960));
+        t1.extend_from_slice(&[0xFF, 0x51, 0x03, 0x03, 0xD0, 0x90]); // 250_000
+        t1.extend_from_slice(&encode_vlq(960));
+        t1.extend_from_slice(&[0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let map = smf.tempo_map();
+        assert_eq!(map.len(), 3);
+        assert_eq!(
+            (
+                map[0].tick,
+                map[0].track,
+                map[0].microseconds_per_quarter_note
+            ),
+            (0, 0, 500_000)
+        );
+        assert_eq!(
+            (
+                map[1].tick,
+                map[1].track,
+                map[1].microseconds_per_quarter_note
+            ),
+            (960, 1, 250_000)
+        );
+        assert_eq!(
+            (
+                map[2].tick,
+                map[2].track,
+                map[2].microseconds_per_quarter_note
+            ),
+            (1920, 0, 666_667)
+        );
+    }
+
+    #[test]
+    fn tempo_map_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        // Two tracks both place a tempo change at tick 240. Track 0
+        // must appear first in the merged result (stable sort by tick,
+        // insertion order otherwise — track 0 was walked first).
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]); // 500_000 = 120 BPM
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x51, 0x03, 0x03, 0xD0, 0x90]); // 250_000 = 240 BPM
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let map = smf.tempo_map();
+        assert_eq!(map.len(), 2);
+        // Both fire at tick 240; track 0 (500_000) precedes track 1 (250_000).
+        assert_eq!(map[0].tick, 240);
+        assert_eq!(map[0].track, 0);
+        assert_eq!(map[0].microseconds_per_quarter_note, 500_000);
+        assert_eq!(map[1].tick, 240);
+        assert_eq!(map[1].track, 1);
+        assert_eq!(map[1].microseconds_per_quarter_note, 250_000);
+    }
+
+    #[test]
+    fn tempo_after_channel_events_tracks_absolute_tick() {
+        // A channel event uses running status mid-track; the tempo
+        // change appears later. Make sure absolute-tick accounting
+        // doesn't lose the pre-event delta.
+        let mut events: Vec<u8> = Vec::new();
+        // tick 0 note-on key 60 vel 100
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        // delta=120 running-status note-on key 64 vel 80
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x40, 0x50]);
+        // delta=120 note-off (explicit status to clear running)
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x80, 0x3C, 0x40]);
+        // delta=240 set tempo 400_000 µs/qn (= 150 BPM): 06 1A 80
+        events.extend_from_slice(&encode_vlq(240));
+        events.extend_from_slice(&[0xFF, 0x51, 0x03, 0x06, 0x1A, 0x80]);
+        // delta=0 EOT
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let map = smf.tempo_map();
+        assert_eq!(map.len(), 1);
+        // 0 + 120 + 120 + 240 = 480 ticks.
+        assert_eq!(map[0].tick, 480);
+        assert_eq!(map[0].microseconds_per_quarter_note, 400_000);
+        assert!((map[0].bpm - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tempo_change_zero_us_maps_to_infinite_bpm_without_panic() {
+        // Construct a `TempoChange` directly with a degenerate
+        // microseconds-per-quarter of 0 — the helper must return
+        // `f64::INFINITY` for BPM rather than dividing by zero.
+        let tc = TempoChange::new(0, 0, 0);
+        assert_eq!(tc.microseconds_per_quarter_note, 0);
+        assert!(tc.bpm.is_infinite());
+        assert!(tc.bpm.is_sign_positive());
     }
 }

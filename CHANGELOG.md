@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 125 — `SmfFile::tempo_map()` iteration helper
+
+- New `smf::TempoChange { tick, track, microseconds_per_quarter_note,
+  bpm }` pins one decoded `FF 51 03 tt tt tt` Set Tempo meta event to
+  the absolute tick (cumulative delta-sum) at which it fires on its
+  parent track. `bpm` is pre-computed as
+  `60_000_000.0 / microseconds_per_quarter_note`;
+  `microseconds_per_quarter_note == 0` maps to `f64::INFINITY` so a
+  degenerate payload can't divide-by-zero. `TempoChange::new` is the
+  public constructor that does the pre-computation.
+- New `SmfFile::tempo_map()` walks every track, sums per-track deltas
+  into absolute ticks, collects every `MetaEvent::Tempo`, and returns
+  the merged stream sorted by tick. The sort is stable so two changes
+  at the same tick keep the per-track insertion order — track 0 wins
+  over track 1 at the same tick, matching the scheduler's merge
+  convention and the existing `SmfFile::time_signatures()` helper.
+- 7 new lib tests (`smf::tests`): empty-when-no-meta-event;
+  single-change-at-tick-zero (with the BPM cross-check); three
+  changes within one track; merge across two tracks sorted by tick;
+  stable sort keeps track 0 before track 1 at the same tick;
+  absolute-tick accounting after running-status channel events;
+  zero µs/qn maps to `+INF` BPM without panic.
+- 291 → 298 lib tests, 14 → 14 integration tests, 0 ignored.
+
 ### Round 122 — `SmfFile::time_signatures()` iteration helper
 
 - New `smf::TimeSignatureChange { tick, track, numerator,
