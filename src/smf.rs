@@ -235,6 +235,106 @@ pub struct SmfFile {
     pub tracks: Vec<Track>,
 }
 
+/// One time-signature change pinned to the absolute tick (relative to
+/// the start of its parent track) at which the
+/// [`FF 58 04 nn dd cc bb`](MetaEvent::TimeSignature) meta event
+/// fires.
+///
+/// Returned by [`SmfFile::time_signatures`] — see that method for the
+/// merge semantics across multiple tracks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeSignatureChange {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). Format-1 files conventionally place all
+    /// time signatures on track 0; format-2 files keep them
+    /// per-track.
+    pub track: usize,
+    /// `nn` — beats per measure (numerator).
+    pub numerator: u8,
+    /// `dd` — denominator as a negative power of two
+    /// (`denominator = 1 << denominator_pow2`).
+    pub denominator_pow2: u8,
+    /// `cc` — MIDI clocks between metronome clicks (24 per quarter
+    /// note in the default mapping).
+    pub clocks_per_click: u8,
+    /// `bb` — number of notated 32nd notes per MIDI quarter note
+    /// (8 in the conventional mapping).
+    pub notated_32nd_per_quarter: u8,
+}
+
+impl TimeSignatureChange {
+    /// Decoded denominator value (`1 << denominator_pow2`). Clamped to
+    /// fit a `u32` so a pathological `dd >= 32` stays in-range without
+    /// overflowing — the spec doesn't bound `dd`, but every
+    /// real-world file uses small values (`0..=6`, i.e. whole-note
+    /// through 64th-note).
+    pub fn denominator(&self) -> u32 {
+        if self.denominator_pow2 >= 32 {
+            // Saturate rather than overflow on absurd input.
+            u32::MAX
+        } else {
+            1u32 << self.denominator_pow2
+        }
+    }
+}
+
+impl SmfFile {
+    /// Collect every [`MetaEvent::TimeSignature`] from every track,
+    /// pinned to the absolute tick at which it fires, in time order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two changes at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule the scheduler uses (`scheduler.rs` §"merged
+    /// event list, sorted by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries a time-signature
+    /// meta event. Per the SMF convention, a player that needs an
+    /// initial time signature should assume **4/4** until the first
+    /// change fires.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`] (the same cap the parser enforces).
+    pub fn time_signatures(&self) -> Vec<TimeSignatureChange> {
+        let mut out: Vec<TimeSignatureChange> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::TimeSignature {
+                    numerator,
+                    denominator_pow2,
+                    clocks_per_click,
+                    notated_32nd_per_quarter,
+                }) = &ev.kind
+                {
+                    out.push(TimeSignatureChange {
+                        tick: abs,
+                        track: track_idx,
+                        numerator: *numerator,
+                        denominator_pow2: *denominator_pow2,
+                        clocks_per_click: *clocks_per_click,
+                        notated_32nd_per_quarter: *notated_32nd_per_quarter,
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the
+        // per-track insertion order survives the sort (so track 0
+        // wins over track 1 at the same tick — matches the
+        // scheduler's merge convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+}
+
 // ───────────────────────── public entry point ─────────────────────────
 
 /// Parse a complete SMF file from a byte slice.
@@ -972,5 +1072,175 @@ mod tests {
         blob.extend(track_chunk(events));
         let err = parse(&blob).unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    // ───────── TimeSignatureChange / SmfFile::time_signatures ─────────
+
+    #[test]
+    fn time_signatures_empty_when_no_meta_event_present() {
+        // Track has just a note-on + note-off + EOT — no FF 58.
+        let events: &[u8] = &[
+            0x00, 0x90, 0x3C, 0x64, 0x40, 0x80, 0x3C, 0x40, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.time_signatures().is_empty());
+    }
+
+    #[test]
+    fn time_signatures_single_change_at_tick_zero() {
+        // delta=0 FF 58 04 04 02 18 08   time signature 4/4
+        // delta=0 FF 2F 00
+        let events: &[u8] = &[
+            0x00, 0xFF, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(events));
+        let smf = parse(&blob).unwrap();
+        let sigs = smf.time_signatures();
+        assert_eq!(sigs.len(), 1);
+        let ts = sigs[0];
+        assert_eq!(ts.tick, 0);
+        assert_eq!(ts.track, 0);
+        assert_eq!(ts.numerator, 4);
+        assert_eq!(ts.denominator_pow2, 2);
+        assert_eq!(ts.denominator(), 4);
+        assert_eq!(ts.clocks_per_click, 24);
+        assert_eq!(ts.notated_32nd_per_quarter, 8);
+    }
+
+    #[test]
+    fn time_signatures_multiple_changes_within_one_track_are_in_order() {
+        // delta=0   FF 58 04 04 02 18 08   4/4
+        // delta=480 FF 58 04 03 02 18 08   3/4
+        // delta=480 FF 58 04 06 03 18 08   6/8
+        // delta=0   FF 2F 00
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08]);
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0xFF, 0x58, 0x04, 0x03, 0x02, 0x18, 0x08]);
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0xFF, 0x58, 0x04, 0x06, 0x03, 0x18, 0x08]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sigs = smf.time_signatures();
+        assert_eq!(sigs.len(), 3);
+        assert_eq!(sigs[0].tick, 0);
+        assert_eq!((sigs[0].numerator, sigs[0].denominator()), (4, 4));
+        assert_eq!(sigs[1].tick, 480);
+        assert_eq!((sigs[1].numerator, sigs[1].denominator()), (3, 4));
+        assert_eq!(sigs[2].tick, 960);
+        assert_eq!((sigs[2].numerator, sigs[2].denominator()), (6, 8));
+    }
+
+    #[test]
+    fn time_signatures_merge_across_tracks_sorted_by_tick() {
+        // Track 0: tick 0 = 4/4, tick 1920 = 7/8, EOT at 1920.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xFF, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08]);
+        t0.extend_from_slice(&encode_vlq(1920));
+        t0.extend_from_slice(&[0xFF, 0x58, 0x04, 0x07, 0x03, 0x18, 0x08]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        // Track 1: tick 960 = 3/4, EOT at 1920.
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(960));
+        t1.extend_from_slice(&[0xFF, 0x58, 0x04, 0x03, 0x02, 0x18, 0x08]);
+        t1.extend_from_slice(&encode_vlq(960));
+        t1.extend_from_slice(&[0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let sigs = smf.time_signatures();
+        assert_eq!(sigs.len(), 3);
+        assert_eq!((sigs[0].tick, sigs[0].track, sigs[0].numerator), (0, 0, 4));
+        assert_eq!(
+            (sigs[1].tick, sigs[1].track, sigs[1].numerator),
+            (960, 1, 3),
+        );
+        assert_eq!(
+            (sigs[2].tick, sigs[2].track, sigs[2].numerator),
+            (1920, 0, 7),
+        );
+    }
+
+    #[test]
+    fn time_signatures_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        // Two tracks both place a time signature at tick 240. Track 0
+        // must appear first in the merged result (stable sort by tick,
+        // insertion order otherwise — track 0 was walked first).
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x58, 0x04, 0x02, 0x02, 0x18, 0x08]); // 2/4
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x58, 0x04, 0x05, 0x02, 0x18, 0x08]); // 5/4
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let sigs = smf.time_signatures();
+        assert_eq!(sigs.len(), 2);
+        // Both fire at tick 240; track 0 (2/4) precedes track 1 (5/4).
+        assert_eq!(sigs[0].tick, 240);
+        assert_eq!(sigs[0].track, 0);
+        assert_eq!(sigs[0].numerator, 2);
+        assert_eq!(sigs[1].tick, 240);
+        assert_eq!(sigs[1].track, 1);
+        assert_eq!(sigs[1].numerator, 5);
+    }
+
+    #[test]
+    fn time_signature_after_channel_events_tracks_absolute_tick() {
+        // A channel event uses running status mid-track; the time
+        // signature appears later. Make sure absolute-tick accounting
+        // doesn't lose the pre-event delta.
+        let mut events: Vec<u8> = Vec::new();
+        // tick 0 note-on key 60 vel 100
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        // delta=120 running-status note-on key 64 vel 80
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x40, 0x50]);
+        // delta=120 note-off (explicit status to clear running)
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x80, 0x3C, 0x40]);
+        // delta=240 time signature 12/8 (numerator=12, dd=3)
+        events.extend_from_slice(&encode_vlq(240));
+        events.extend_from_slice(&[0xFF, 0x58, 0x04, 0x0C, 0x03, 0x18, 0x08]);
+        // delta=0 EOT
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sigs = smf.time_signatures();
+        assert_eq!(sigs.len(), 1);
+        // 0 + 120 + 120 + 240 = 480 ticks.
+        assert_eq!(sigs[0].tick, 480);
+        assert_eq!((sigs[0].numerator, sigs[0].denominator()), (12, 8));
+    }
+
+    #[test]
+    fn time_signature_denominator_saturates_on_huge_pow2() {
+        // Construct a `TimeSignatureChange` directly with the spec-
+        // illegal `dd = 250`; the helper must return u32::MAX without
+        // overflowing the `1 << dd` shift.
+        let ts = TimeSignatureChange {
+            tick: 0,
+            track: 0,
+            numerator: 4,
+            denominator_pow2: 250,
+            clocks_per_click: 24,
+            notated_32nd_per_quarter: 8,
+        };
+        assert_eq!(ts.denominator(), u32::MAX);
     }
 }

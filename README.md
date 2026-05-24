@@ -21,6 +21,15 @@ framework but usable standalone.
   end-of-track, SMPTE offset, sequencer-specific). Running status is
   honoured; chunk lengths are validated against remaining bytes; total
   events per file are capped at 1 M to keep malformed input bounded.
+  Round 122 adds `SmfFile::time_signatures()` — a sorted iteration
+  helper that returns every `FF 58 04 nn dd cc bb` change as a
+  `TimeSignatureChange { tick, track, numerator, denominator_pow2,
+  clocks_per_click, notated_32nd_per_quarter }` with the absolute tick
+  (cumulative delta-sum) on the parent track. Per-track sequences are
+  stably merged so two changes at the same tick keep `(track,
+  in-track)` order — the same convention the scheduler uses.
+  `TimeSignatureChange::denominator()` returns the decoded `1 << dd`,
+  saturated at `u32::MAX` so pathological `dd >= 32` can't overflow.
 - `paths` — per-OS SoundFont/SFZ/DLS search paths plus the
   `OXIDEAV_SOUNDFONT_PATH` env-var override.
 - `instruments::sf2` — full SoundFont 2 RIFF reader and voice

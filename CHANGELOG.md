@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 122 — `SmfFile::time_signatures()` iteration helper
+
+- New `smf::TimeSignatureChange { tick, track, numerator,
+  denominator_pow2, clocks_per_click, notated_32nd_per_quarter }`
+  pins one decoded `FF 58 04 nn dd cc bb` meta event to the absolute
+  tick (cumulative delta-sum) at which it fires on its parent track.
+  `TimeSignatureChange::denominator()` returns `1 << dd`, saturated
+  at `u32::MAX` so a spec-illegal `dd >= 32` can't overflow the
+  shift.
+- New `SmfFile::time_signatures()` walks every track, sums per-track
+  deltas into absolute ticks, collects every
+  `MetaEvent::TimeSignature`, and returns the merged stream sorted
+  by tick. The sort is stable so two changes at the same tick keep
+  the per-track insertion order — track 0 wins over track 1 at the
+  same tick, matching the scheduler's merge convention.
+- 7 new lib tests (`smf::tests`): empty-when-no-meta-event;
+  single-change-at-tick-zero (all six fields); three changes within
+  one track; merge across two tracks sorted by tick; stable sort
+  keeps track 0 before track 1 at the same tick; absolute-tick
+  accounting after running-status channel events; denominator
+  saturates on a pathological `dd >= 32`.
+- 284 → 291 lib tests, 9 → 9 integration tests, 0 ignored.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-midi/compare/v0.0.1...v0.0.2) - 2026-05-24
 
 ### Added
