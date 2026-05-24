@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-midi/compare/v0.0.1...v0.0.2) - 2026-05-24
+
+### Added
+
+- *(midi)* GM2 Global Parameter Control (Universal Real-Time SysEx 04 05)
+- *(midi)* Master Balance (Universal Real-Time SysEx 04 02)
+- *(midi)* Data Increment / Decrement (CC 96/97) per RP-018
+
+### Other
+
+- round 98 — MIDI Tuning Standard (MTS) microtuning
+- Round 95: SFZ-side filter envelope + fil_type + cutoff wiring
+- rewrite release-envelope comment to remove FluidSynth citation
+- EG2 + 2-pole resonant low-pass filter on the shared SamplePlayer (round 91)
+- DLS art1/art2 articulation interpretation (round 80)
+- round 75 — MPE + RPN 1/2/5 + CA-25 master tuning + master volume SysEx
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+
 ### Round 114 — GM2 Global Parameter Control (Universal Real-Time SysEx `04 05`)
 
 - New `mixer::GmEffects` carries the GM2 system-wide Reverb + Chorus
