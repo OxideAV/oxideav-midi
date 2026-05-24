@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 114 — GM2 Global Parameter Control (Universal Real-Time SysEx `04 05`)
+
+- New `mixer::GmEffects` carries the GM2 system-wide Reverb + Chorus
+  parameters edited by the **Global Parameter Control** Universal
+  Real-Time SysEx message (`F0 7F <dev> 04 05 …`, MMA CA-024). The two
+  GM2-reserved slots are `0101` (Reverb) and `0102` (Chorus). Each raw
+  7-bit parameter value is decoded to its engineering unit with the
+  CA-024 "Recommended Practice for Reverb and Chorus Parameters (from
+  General MIDI Level 2)" formulas:
+  - Reverb `pp=0` Type (select), `pp=1` Time
+    `rt = exp((val − 40) · 0.025)` s.
+  - Chorus `pp=0` Type (select), `pp=1` Mod Rate `mr = val · 0.122` Hz,
+    `pp=2` Mod Depth `md = (val + 1) / 3.2` ms, `pp=3` Feedback
+    `fb = val · 0.763` %, `pp=4` Send-to-Reverb `ctr = val · 0.787` %.
+- New `Mixer::set_gm_reverb_param(pp, val)` /
+  `Mixer::set_gm_chorus_param(pp, val)` apply one parameter-value pair;
+  unrecognised parameter ids are ignored per CA-024 ("only that
+  parameter-value pair should be ignored"). `Mixer::gm_effects()`
+  exposes the current state and `Mixer::reset_gm_effects()` restores
+  the GM2 recommended initial defaults (Reverb Type 4 Large Hall,
+  Chorus Type 2 Chorus 3, with the per-type table values).
+- The scheduler's Universal Real-Time dispatch now routes sub-ID#2
+  `05` (`dispatch_global_parameter_control`): it parses the Slot Path
+  Length / Parameter-ID Width / Value Width header, requires the
+  GM2-reserved slot path (length 1, Slot MSB 1), reads the MSB-first
+  parameter ids and LSB-first values across the pair list to EOX, and
+  routes each into the reverb/chorus setters by Slot LSB. Non-GM2 slot
+  paths (Slot MSB ≠ 1 or length ≠ 1) are ignored.
+- GM 1 / GM 2 System On / GM System Off now also reset the GM2 effect
+  parameters to their CA-024 defaults.
+- Tests: GM2 defaults; reverb type+time decode; all five chorus
+  parameter decodes; non-GM2 slot ignored; unknown-parameter-in-a-pair
+  ignored (rest applied); GM-on resets effects. (+7 lib tests.)
+- The decoded parameters are observable program state; a reverb/chorus
+  DSP send is intentionally deferred to a later round.
+
 ### Round 105 — Master Balance (Universal Real-Time SysEx `04 02`)
 
 - New `Mixer::set_master_balance_14(value)` /

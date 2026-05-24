@@ -359,6 +359,9 @@ impl Scheduler {
 ///     [`Mixer::set_master_fine_tuning`].
 ///   * `04` Master Coarse Tuning (CA-25) — applied via
 ///     [`Mixer::set_master_coarse_tuning`].
+///   * `05` Global Parameter Control (CA-024) — the GM2 Reverb (slot
+///     `0101`) / Chorus (slot `0102`) parameter edits, applied via
+///     [`Mixer::set_gm_reverb_param`] / [`Mixer::set_gm_chorus_param`].
 ///
 /// All other Universal SysEx messages (sample dumps, file refs, MTC
 /// cueing, MMC, …) are silently ignored — they carry no semantics for
@@ -402,6 +405,7 @@ fn dispatch_universal_non_real_time(payload: &[u8], mixer: &mut crate::mixer::Mi
         mixer.set_master_fine_tuning(0, 0x40); // centre
         mixer.set_master_coarse_tuning(0, 0x40); // centre
         mixer.reset_tuning(); // back to equal temperament
+        mixer.reset_gm_effects(); // GM2 reverb/chorus defaults (CA-024)
     } else if sub_id1 == 0x08 {
         // MIDI Tuning Standard. The non-real-time area carries the
         // single-note tuning bank form (07) and the non-real-time
@@ -427,6 +431,11 @@ fn dispatch_universal_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer)
     }
     let sub_id2 = payload[3];
     if sub_id1 != 0x04 || payload.len() < 6 {
+        return;
+    }
+    if sub_id2 == 0x05 {
+        // Global Parameter Control (CA-024).
+        dispatch_global_parameter_control(payload, mixer);
         return;
     }
     // Device Control.
@@ -457,6 +466,89 @@ fn dispatch_universal_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer)
             mixer.set_master_coarse_tuning(payload[4], payload[5]);
         }
         _ => {}
+    }
+}
+
+/// Parse a **Global Parameter Control** Universal Real-Time SysEx body
+/// (CA-024) and route the GM2 Reverb / Chorus parameter edits into the
+/// mixer. `payload` is `7F <dev> 04 05 …` (trailing F7 already
+/// stripped).
+///
+/// Wire format (CA-024 "Details"):
+///
+/// ```text
+/// F0 7F <dev> 04 05 sw pw vw [[sh sl] ×sw] [pp×pw vv×vw] … F7
+///   sw  Slot Path Length   — number of 2-byte slot-path entries.
+///   pw  Parameter ID Width — bytes per <pp> field.
+///   vw  Value Width        — bytes per <vv> field.
+///   sh sl  Slot Number MSB / LSB (per slot-path entry).
+///   pp  Parameter ID, MSB first  (pw bytes).
+///   vv  Parameter Value, LSB first (vw bytes).
+/// ```
+///
+/// GM2 reserves Slot Path Length = 1 with Slot MSB = 1 ("all messages
+/// with Slot Path Length = 1 and Slot Path Number MSB = 1 shall be
+/// reserved for use only by GM2"). The Slot LSB then selects the effect:
+/// `01` = Reverb (slot `0101`), `02` = Chorus (slot `0102`). We model
+/// only those two GM2 effect slots; any other slot path is ignored.
+///
+/// Multiple parameter-value pairs may follow; we apply each in turn,
+/// silently skipping a pair whose parameter the slot doesn't recognise
+/// (per CA-024: "only that parameter-value pair should be ignored").
+fn dispatch_global_parameter_control(payload: &[u8], mixer: &mut crate::mixer::Mixer) {
+    // payload: [0]=7F [1]=dev [2]=04 [3]=05 [4]=sw [5]=pw [6]=vw …
+    if payload.len() < 7 {
+        return;
+    }
+    let sw = payload[4] as usize; // slot-path entry count
+    let pw = payload[5] as usize; // parameter-id byte width
+    let vw = payload[6] as usize; // value byte width
+                                  // A zero parameter or value width can't address anything; a GM2 edit
+                                  // always carries at least one byte of each.
+    if pw == 0 || vw == 0 {
+        return;
+    }
+    let mut p = 7;
+    // Read the slot path (sw entries × 2 bytes each).
+    let slot_path_end = p + sw * 2;
+    if slot_path_end > payload.len() {
+        return;
+    }
+    // GM2 reverb/chorus use exactly one slot-path entry: MSB=1, the LSB
+    // selects the effect. Anything else is outside the GM2 slots we
+    // model, so we ignore the whole message.
+    if sw != 1 {
+        return;
+    }
+    let slot_msb = payload[p];
+    let slot_lsb = payload[p + 1];
+    p = slot_path_end;
+    if slot_msb != 1 {
+        return;
+    }
+    // Walk the parameter-value pair list to EOX.
+    while p + pw + vw <= payload.len() {
+        // Parameter ID, MSB first → fold the pw bytes into one integer.
+        let mut pp: u32 = 0;
+        for &b in &payload[p..p + pw] {
+            pp = (pp << 7) | (b & 0x7F) as u32;
+        }
+        p += pw;
+        // Value, LSB first → fold the vw bytes (LSB at lowest index).
+        let mut vv: u32 = 0;
+        for (i, &b) in payload[p..p + vw].iter().enumerate() {
+            vv |= ((b & 0x7F) as u32) << (7 * i);
+        }
+        p += vw;
+        // Only the low byte of the parameter id / value is meaningful for
+        // the GM2 reverb / chorus parameters (all single-byte).
+        let pp8 = (pp & 0x7F) as u8;
+        let vv8 = (vv & 0x7F) as u8;
+        match slot_lsb {
+            0x01 => mixer.set_gm_reverb_param(pp8, vv8),
+            0x02 => mixer.set_gm_chorus_param(pp8, vv8),
+            _ => {}
+        }
     }
 }
 
@@ -954,6 +1046,142 @@ mod tests {
         let inst = ToneInstrument::new();
         s.step(8192, &mut mixer, &inst);
         assert_eq!(mixer.master_coarse_tune_semitones(), 12);
+    }
+
+    /// Build the SMF-escaped SysEx bytes for a one-track blob: a
+    /// leading `F0`, a VLQ length, the body, and a trailing `F7`. The
+    /// body does NOT include the leading F0 (the SMF stores the bytes
+    /// after it).
+    fn sysex_event(delta: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![delta, 0xF0, (body.len() + 1) as u8];
+        v.extend_from_slice(body);
+        v.push(0xF7);
+        v
+    }
+
+    #[test]
+    fn gm2_reverb_chorus_defaults() {
+        // No SysEx: the mixer should boot to the CA-024 GM2 recommended
+        // initial settings (Reverb Type 4, Chorus Type 2).
+        let mixer = Mixer::new();
+        let fx = mixer.gm_effects();
+        assert_eq!(fx.reverb_type, 4);
+        assert_eq!(fx.chorus_type, 2);
+        // Reverb Type-4 default time = val 64 → exp((64-40)*0.025) ≈ 1.822 s.
+        assert!((fx.reverb_time_s - ((24.0f32) * 0.025).exp()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn global_parameter_control_reverb_type_and_time() {
+        // CA-024 Slot 0101 (Reverb), one entry slot path (sw=1), pw=1,
+        // vw=1. Set Reverb Type (pp=0) = 2 and Reverb Time (pp=1) val=80.
+        //   F0 7F 7F 04 05 01 01 01 01 01 00 02 01 50 F7
+        //          dev  04 05 sw pw vw sh sl pp vv pp vv
+        let body = [
+            0x7F, 0x7F, 0x04, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x02, 0x01, 0x50,
+        ];
+        let mut ev = sysex_event(0x00, &body);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        let fx = mixer.gm_effects();
+        assert_eq!(fx.reverb_type, 2);
+        // val 0x50 = 80 → rt = exp((80-40)*0.025) = exp(1.0).
+        assert!(
+            (fx.reverb_time_s - 1.0f32.exp()).abs() < 1e-4,
+            "{}",
+            fx.reverb_time_s
+        );
+    }
+
+    #[test]
+    fn global_parameter_control_chorus_params() {
+        // Slot 0102 (Chorus): set every documented parameter at once.
+        //   pp=0 type=3, pp=1 rate=10, pp=2 depth=15, pp=3 fb=64, pp=4 send=50.
+        let body = [
+            0x7F, 0x7F, 0x04, 0x05, 0x01, 0x01, 0x01, // sw pw vw
+            0x01, 0x02, // slot 0102 = Chorus
+            0x00, 0x03, // type = 3
+            0x01, 0x0A, // mod rate val=10
+            0x02, 0x0F, // mod depth val=15
+            0x03, 0x40, // feedback val=64
+            0x04, 0x32, // send-to-reverb val=50
+        ];
+        let mut ev = sysex_event(0x00, &body);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        let fx = mixer.gm_effects();
+        assert_eq!(fx.chorus_type, 3);
+        assert!((fx.chorus_mod_rate_hz - 10.0 * 0.122).abs() < 1e-5);
+        assert!((fx.chorus_mod_depth_ms - (15.0 + 1.0) / 3.2).abs() < 1e-5);
+        assert!((fx.chorus_feedback_pct - 64.0 * 0.763).abs() < 1e-4);
+        assert!((fx.chorus_send_to_reverb_pct - 50.0 * 0.787).abs() < 1e-4);
+    }
+
+    #[test]
+    fn global_parameter_control_non_gm2_slot_ignored() {
+        // Slot MSB != 1 is NOT a GM2 slot → the whole message must be
+        // ignored, leaving the reverb type at its default (4).
+        let body = [
+            0x7F, 0x7F, 0x04, 0x05, 0x01, 0x01, 0x01, 0x02, 0x01, // slot 0201
+            0x00, 0x00, // would set reverb type 0 if it weren't ignored
+        ];
+        let mut ev = sysex_event(0x00, &body);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.gm_effects().reverb_type, 4);
+    }
+
+    #[test]
+    fn global_parameter_control_unknown_param_ignored() {
+        // A recognised Reverb slot but an out-of-range parameter id
+        // (pp=9): per CA-024 only that pair is ignored, the rest apply.
+        // Here we send pp=9 (ignored) then pp=0 type=1 (applies).
+        let body = [
+            0x7F, 0x7F, 0x04, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, // slot 0101
+            0x09, 0x7F, // unknown param → ignored
+            0x00, 0x01, // type = 1 → applies
+        ];
+        let mut ev = sysex_event(0x00, &body);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.gm_effects().reverb_type, 1);
+    }
+
+    #[test]
+    fn gm_on_resets_gm2_effects() {
+        // Push the reverb type off-default, then GM1 System On → the
+        // GM2 effect parameters reset to their CA-024 defaults.
+        let mut ev = Vec::new();
+        let gpc = [
+            0x7F, 0x7F, 0x04, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00,
+        ];
+        ev.extend_from_slice(&sysex_event(0x00, &gpc));
+        // GM1 System On.
+        ev.extend_from_slice(&[0x10, 0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.gm_effects().reverb_type, 4);
+        assert_eq!(mixer.gm_effects().chorus_type, 2);
     }
 
     #[test]

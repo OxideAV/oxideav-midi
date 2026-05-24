@@ -144,6 +144,19 @@ framework but usable standalone.
   gains `(1.0, 1.0)`, keeping the mix bit-identical to the
   pre-round-105 output until a SysEx moves balance off centre. GM 1 /
   GM 2 System On / GM System Off also reset Master Balance to centre.
+  Round 114 adds the **GM2 Global Parameter Control** state
+  (`mixer::GmEffects`, CA-024 Universal Real-Time SysEx `04 05`): the
+  system-wide Reverb (slot `0101`) and Chorus (slot `0102`)
+  parameters, decoded to engineering units via the CA-024 GM2 tables
+  (Reverb Type / Time `rt = exp((val-40)·0.025)` s; Chorus Type /
+  Mod-Rate `val·0.122` Hz / Mod-Depth `(val+1)/3.2` ms / Feedback
+  `val·0.763`% / Send-to-Reverb `val·0.787`%) via
+  [`Mixer::set_gm_reverb_param`] / [`Mixer::set_gm_chorus_param`].
+  Defaults are the GM2 recommended initial settings (Reverb Type 4
+  Large Hall, Chorus Type 2 Chorus 3); GM System On/Off resets them.
+  The parameters are decoded and observable but not yet applied as a
+  reverb/chorus DSP send — a later round can wire the effects bus
+  without re-parsing the SysEx.
 - `mixer::MpeZone` / `mixer::MpeRole` — MIDI Polyphonic Expression
   (M1-100-UM v1.1) support. The MCM (RPN 0x0006 on channel 0 for
   Lower, channel 15 for Upper) configures one or two zones; each
@@ -176,7 +189,13 @@ framework but usable standalone.
   Scale/Octave Tuning 1-byte (`08`) / 2-byte (`09`) forms into the
   `tuning` table; GM System On/Off additionally reset MTS tuning to
   equal temperament. Round 102 routes CC 96 / CC 97 (Data Increment /
-  Decrement, RP-018) into `Mixer::data_inc_dec`.
+  Decrement, RP-018) into `Mixer::data_inc_dec`. Round 114 routes the
+  Global Parameter Control message (`04 05`, CA-024): it parses the
+  Slot Path Length / Parameter-ID Width / Value Width header, walks the
+  GM2-reserved slot path (Slot Path Length 1, Slot MSB 1; Slot LSB
+  `01` = Reverb, `02` = Chorus), and applies each parameter-value pair
+  (MSB-first ID, LSB-first value) into the mixer's GM2 effect setters,
+  ignoring unrecognised slots/parameters per the spec.
 - `tuning` — MIDI Tuning Standard (MTS) microtuning state + Universal
   SysEx data-format decoders, per the MMA *MIDI Tuning Messages*
   specification (CA-020 / CA-021 / RP-020). A `TuningTable` holds a
@@ -237,7 +256,8 @@ Member Channels, Appendix-C combining of Member + Manager pitch
 bend, §2.2.5 default 48-semi Member PB sensitivity, §2.2.7 drop of
 Polyphonic Key Pressure on Member Channels, §2.2.3 sounding-note
 reset on zone reconfiguration. Plus **Universal Real-Time SysEx**
-Master Volume (`F0 7F <dev> 04 01 lsb msb F7`), Master Fine /
-Master Coarse Tuning (CA-25, `04 03` / `04 04`), and GM 1 / GM 2
-System On / GM System Off (Non-Real-Time, `09 01` / `09 02` /
-`09 03`).
+Master Volume (`F0 7F <dev> 04 01 lsb msb F7`), Master Balance
+(`04 02`), Master Fine / Master Coarse Tuning (CA-25, `04 03` /
+`04 04`), GM2 **Global Parameter Control** (CA-024, `04 05` — Reverb
+slot `0101` / Chorus slot `0102`), and GM 1 / GM 2 System On / GM
+System Off (Non-Real-Time, `09 01` / `09 02` / `09 03`).

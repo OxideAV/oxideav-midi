@@ -278,6 +278,78 @@ impl MpeZone {
     }
 }
 
+/// GM2 system-wide Reverb + Chorus parameters, edited via the Global
+/// Parameter Control Universal Real-Time SysEx message (`F0 7F <dev>
+/// 04 05 …`, CA-024). The two GM2-reserved slots are `01 01` (Reverb)
+/// and `01 02` (Chorus). Each parameter's raw 7-bit value is converted
+/// to its engineering unit using the formulas in CA-024 "Example of
+/// Recommended Practice for Reverb and Chorus Parameters (from General
+/// MIDI Level 2)".
+///
+/// The renderer does not yet apply a reverb/chorus DSP send — these
+/// values are decoded and stored so the program-state is observable and
+/// a later round can wire the effects bus without re-parsing the SysEx.
+/// The defaults are the GM2 recommended initial settings: Reverb Type 4
+/// (Large Hall) and Chorus Type 2 (Chorus 3), with the per-type Reverb
+/// Time / Chorus Mod-Rate / Mod-Depth / Feedback / Send-to-Reverb the
+/// CA-024 tables list for those types.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GmEffects {
+    /// Reverb Type select (CA-024 reverb `pp=0`): 0 Small Room, 1 Medium
+    /// Room, 2 Large Room, 3 Medium Hall, 4 Large Hall, 8 Plate. Stored
+    /// as the raw 7-bit select; GM2 default = 4.
+    pub reverb_type: u8,
+    /// Reverb Time in seconds (CA-024 reverb `pp=1`):
+    /// `rt = exp((val - 40) * 0.025)`, the inverse of the spec's
+    /// `val = ln(rt) / 0.025 + 40`. GM2 Type-4 default ≈ 1.8 s (val 64).
+    pub reverb_time_s: f32,
+    /// Chorus Type select (CA-024 chorus `pp=0`): 0..=5. GM2 default = 2.
+    pub chorus_type: u8,
+    /// Chorus Mod Rate in Hz (CA-024 chorus `pp=1`): `mr = val * 0.122`.
+    pub chorus_mod_rate_hz: f32,
+    /// Chorus Mod Depth in ms (CA-024 chorus `pp=2`):
+    /// `md = (val + 1) / 3.2`.
+    pub chorus_mod_depth_ms: f32,
+    /// Chorus Feedback in percent (CA-024 chorus `pp=3`):
+    /// `fb = val * 0.763`.
+    pub chorus_feedback_pct: f32,
+    /// Chorus Send-to-Reverb in percent (CA-024 chorus `pp=4`):
+    /// `ctr = val * 0.787`.
+    pub chorus_send_to_reverb_pct: f32,
+}
+
+impl GmEffects {
+    /// Decode a raw 7-bit Reverb Time value into seconds per CA-024
+    /// (`val = ln(rt) / 0.025 + 40` ⇒ `rt = exp((val - 40) * 0.025)`).
+    fn reverb_time_from_val(val: u8) -> f32 {
+        (((val & 0x7F) as f32 - 40.0) * 0.025).exp()
+    }
+
+    /// CA-024 GM2 recommended initial settings: Reverb Type 4 (Large
+    /// Hall), Chorus Type 2 (Chorus 3), and the per-type values the
+    /// CA-024 tables list for those two types.
+    fn gm2_default() -> Self {
+        Self {
+            reverb_type: 4,
+            // Reverb Type 4 (Large Hall) default time value = 64.
+            reverb_time_s: Self::reverb_time_from_val(64),
+            chorus_type: 2,
+            // Chorus Type 2 (Chorus 3) table row: Feedback 8, Mod Rate 3,
+            // Mod Depth 19, Send-to-Reverb 0.
+            chorus_mod_rate_hz: 3.0 * 0.122,
+            chorus_mod_depth_ms: (19.0 + 1.0) / 3.2,
+            chorus_feedback_pct: 8.0 * 0.763,
+            chorus_send_to_reverb_pct: 0.0,
+        }
+    }
+}
+
+impl Default for GmEffects {
+    fn default() -> Self {
+        Self::gm2_default()
+    }
+}
+
 /// Polyphonic voice pool with stereo mixdown.
 pub struct Mixer {
     slots: [VoiceSlot; MAX_VOICES],
@@ -321,6 +393,10 @@ pub struct Mixer {
     /// SysEx renders bit-identically to the pre-MTS path. The per-key
     /// offset is folded into every voice's pitch composition.
     tuning: crate::tuning::TuningTable,
+    /// GM2 system-wide Reverb + Chorus parameters (CA-024 Global
+    /// Parameter Control). Defaults to the GM2 recommended initial
+    /// settings; edited by the `04 05` Universal Real-Time SysEx.
+    gm_effects: GmEffects,
 }
 
 impl Default for Mixer {
@@ -347,6 +423,7 @@ impl Mixer {
             mpe_lower: None,
             mpe_upper: None,
             tuning: crate::tuning::TuningTable::new(),
+            gm_effects: GmEffects::default(),
         }
     }
 
@@ -997,6 +1074,63 @@ impl Mixer {
         self.tuning.reset();
         for ch in 0..NUM_CHANNELS {
             self.reapply_pitch_for_channel(ch as u8);
+        }
+    }
+
+    // ─────────────────── GM2 Global Parameter Control ───────────────────
+
+    /// Borrow the GM2 Reverb + Chorus parameter state (CA-024). Exposed
+    /// for tests / introspection.
+    pub fn gm_effects(&self) -> &GmEffects {
+        &self.gm_effects
+    }
+
+    /// Reset the GM2 Reverb + Chorus parameters to their CA-024
+    /// recommended initial settings. Wired to GM System On/Off (which
+    /// resets every controller to its default).
+    pub fn reset_gm_effects(&mut self) {
+        self.gm_effects = GmEffects::default();
+    }
+
+    /// Apply one GM2 Reverb-slot (`01 01`) parameter-value pair from a
+    /// Global Parameter Control message (CA-024 reverb table). `pp` is
+    /// the parameter ID, `val` the raw 7-bit value:
+    ///
+    ///   * `pp = 0` → Reverb Type select (stored verbatim).
+    ///   * `pp = 1` → Reverb Time, decoded to seconds via
+    ///     `rt = exp((val - 40) * 0.025)`.
+    ///
+    /// Unrecognised `pp` values are ignored per CA-024 ("If the device
+    /// receives an unrecognizable or inappropriate parameter for a slot,
+    /// only that parameter-value pair should be ignored").
+    pub fn set_gm_reverb_param(&mut self, pp: u8, val: u8) {
+        match pp {
+            0 => self.gm_effects.reverb_type = val & 0x7F,
+            1 => self.gm_effects.reverb_time_s = GmEffects::reverb_time_from_val(val),
+            _ => {}
+        }
+    }
+
+    /// Apply one GM2 Chorus-slot (`01 02`) parameter-value pair from a
+    /// Global Parameter Control message (CA-024 chorus table). `pp` is
+    /// the parameter ID, `val` the raw 7-bit value:
+    ///
+    ///   * `pp = 0` → Chorus Type select (stored verbatim).
+    ///   * `pp = 1` → Mod Rate Hz: `mr = val * 0.122`.
+    ///   * `pp = 2` → Mod Depth ms: `md = (val + 1) / 3.2`.
+    ///   * `pp = 3` → Feedback %: `fb = val * 0.763`.
+    ///   * `pp = 4` → Send-to-Reverb %: `ctr = val * 0.787`.
+    ///
+    /// Unrecognised `pp` values are ignored per CA-024.
+    pub fn set_gm_chorus_param(&mut self, pp: u8, val: u8) {
+        let v = (val & 0x7F) as f32;
+        match pp {
+            0 => self.gm_effects.chorus_type = val & 0x7F,
+            1 => self.gm_effects.chorus_mod_rate_hz = v * 0.122,
+            2 => self.gm_effects.chorus_mod_depth_ms = (v + 1.0) / 3.2,
+            3 => self.gm_effects.chorus_feedback_pct = v * 0.763,
+            4 => self.gm_effects.chorus_send_to_reverb_pct = v * 0.787,
+            _ => {}
         }
     }
 
