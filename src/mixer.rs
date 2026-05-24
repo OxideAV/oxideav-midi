@@ -278,6 +278,109 @@ impl MpeZone {
     }
 }
 
+/// Device-level **Global Parameter Control** state (Universal
+/// Real-Time SysEx `7F 7F 04 05`, CA-024). The message edits
+/// non-channel-specific parameters addressed by a slot path; the GM2
+/// Recommended Practice repeated in CA-024 defines two well-known
+/// single-entry slots — Reverb (`01 01`) and Chorus (`01 02`) — with
+/// the parameter tables this struct stores.
+///
+/// Each parameter is stored as the **raw value byte** received (the
+/// spec mandates storing what the message carries, and the unit
+/// formulas are evaluated lazily by the physical-unit accessors). The
+/// mixer carries no reverb/chorus DSP, so nothing in the render path
+/// consumes these values yet — they are kept verbatim for
+/// introspection + a future effects engine, and the default values
+/// below match GM2's recommended initial settings so a synth that
+/// never receives a Global Parameter Control message reports the GM2
+/// defaults. Audio output is unchanged.
+///
+/// Defaults (CA-024 GM2 R/P): Reverb Type 4 "Large Hall" is the
+/// recommended initial reverb setting and Chorus Type 2 "Chorus 3"
+/// the recommended initial chorus setting; the per-type tables seed
+/// the remaining values from those types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlobalEffects {
+    /// Reverb Type (slot `01 01`, pp = 0). GM2 values: 0 Small Room,
+    /// 1 Medium Room, 2 Large Room, 3 Medium Hall, 4 Large Hall,
+    /// 8 Plate. Default 4 (Large Hall).
+    pub reverb_type: u8,
+    /// Reverb Time raw value (slot `01 01`, pp = 1). Physical seconds
+    /// via [`GlobalEffects::reverb_time_secs`]. Default 64 (≈1.8 s,
+    /// the Large-Hall default time from the CA-024 table).
+    pub reverb_time: u8,
+    /// Chorus Type (slot `01 02`, pp = 0). GM2 values: 0 Chorus 1,
+    /// 1 Chorus 2, 2 Chorus 3, 3 Chorus 4, 4 FB Chorus, 5 Flanger.
+    /// Default 2 (Chorus 3).
+    pub chorus_type: u8,
+    /// Chorus Mod Rate raw value (slot `01 02`, pp = 1). Physical Hz
+    /// via [`GlobalEffects::chorus_mod_rate_hz`]. Default 3 (the
+    /// Chorus-3 Mod Rate from the CA-024 type table).
+    pub chorus_mod_rate: u8,
+    /// Chorus Mod Depth raw value (slot `01 02`, pp = 2). Physical ms
+    /// via [`GlobalEffects::chorus_mod_depth_ms`]. Default 19 (the
+    /// Chorus-3 Mod Depth from the CA-024 type table).
+    pub chorus_mod_depth: u8,
+    /// Chorus Feedback raw value (slot `01 02`, pp = 3). Physical
+    /// percent via [`GlobalEffects::chorus_feedback_percent`].
+    /// Default 8 (the Chorus-3 Feedback from the CA-024 type table).
+    pub chorus_feedback: u8,
+    /// Chorus Send to Reverb raw value (slot `01 02`, pp = 4).
+    /// Physical percent via
+    /// [`GlobalEffects::chorus_send_to_reverb_percent`]. Default 0
+    /// (the Chorus-3 Rev Send from the CA-024 type table).
+    pub chorus_send_to_reverb: u8,
+}
+
+impl Default for GlobalEffects {
+    fn default() -> Self {
+        // GM2 recommended initial settings (CA-024): Reverb Type 4
+        // (Large Hall, default time 64 = 1.8 s) and Chorus Type 2
+        // (Chorus 3): Feedback 8, Mod Rate 3, Mod Depth 19, Rev Send 0.
+        Self {
+            reverb_type: 4,
+            reverb_time: 64,
+            chorus_type: 2,
+            chorus_mod_rate: 3,
+            chorus_mod_depth: 19,
+            chorus_feedback: 8,
+            chorus_send_to_reverb: 0,
+        }
+    }
+}
+
+impl GlobalEffects {
+    /// Reverb Time in seconds. Inverts the CA-024 store formula
+    /// `val = ln(rt) / 0.025 + 40` → `rt = exp((val - 40) × 0.025)`.
+    /// CA-024 defines the meaningful range as 0.36–9.0 s; the raw
+    /// value is mapped without clamping so callers see exactly the
+    /// stored byte's reverb time.
+    pub fn reverb_time_secs(self) -> f32 {
+        ((self.reverb_time as f32 - 40.0) * 0.025).exp()
+    }
+
+    /// Chorus Mod Rate in Hz. CA-024: `mr = val × 0.122`.
+    pub fn chorus_mod_rate_hz(self) -> f32 {
+        self.chorus_mod_rate as f32 * 0.122
+    }
+
+    /// Chorus Mod Depth — peak-to-peak modulation swing in ms.
+    /// CA-024: `md = (val + 1) / 3.2`.
+    pub fn chorus_mod_depth_ms(self) -> f32 {
+        (self.chorus_mod_depth as f32 + 1.0) / 3.2
+    }
+
+    /// Chorus Feedback in percent. CA-024: `fb = val × 0.763`.
+    pub fn chorus_feedback_percent(self) -> f32 {
+        self.chorus_feedback as f32 * 0.763
+    }
+
+    /// Chorus Send to Reverb in percent. CA-024: `ctr = val × 0.787`.
+    pub fn chorus_send_to_reverb_percent(self) -> f32 {
+        self.chorus_send_to_reverb as f32 * 0.787
+    }
+}
+
 /// Polyphonic voice pool with stereo mixdown.
 pub struct Mixer {
     slots: [VoiceSlot; MAX_VOICES],
@@ -321,6 +424,11 @@ pub struct Mixer {
     /// SysEx renders bit-identically to the pre-MTS path. The per-key
     /// offset is folded into every voice's pitch composition.
     tuning: crate::tuning::TuningTable,
+    /// Device-level Global Parameter Control state (CA-024 / GM2
+    /// Reverb + Chorus). Stored verbatim; no DSP consumes it yet, so
+    /// it does not affect the rendered audio. Reset to GM2 defaults on
+    /// GM System On / Off.
+    global_effects: GlobalEffects,
 }
 
 impl Default for Mixer {
@@ -347,6 +455,7 @@ impl Mixer {
             mpe_lower: None,
             mpe_upper: None,
             tuning: crate::tuning::TuningTable::new(),
+            global_effects: GlobalEffects::default(),
         }
     }
 
@@ -947,6 +1056,82 @@ impl Mixer {
         self.master_coarse_tune_semitones
     }
 
+    // ─────────────────────── global parameter control ──────────────────────
+
+    /// Borrow the device-level Global Parameter Control state (CA-024
+    /// GM2 Reverb + Chorus parameters). Exposed for introspection /
+    /// tests and a future effects engine.
+    pub fn global_effects(&self) -> &GlobalEffects {
+        &self.global_effects
+    }
+
+    /// Apply one Global Parameter Control parameter-value pair against a
+    /// resolved slot path (Universal Real-Time SysEx `7F 7F 04 05`,
+    /// CA-024). `slot_path` is the list of `(MSB, LSB)` slot entries
+    /// the message carried (empty for top-level parameters); `param` is
+    /// the parameter ID and `value` its (low byte of the) value field.
+    ///
+    /// Only the two well-known GM2 single-entry slots are recognised:
+    ///
+    ///   * Reverb — slot path `[(0x01, 0x01)]`: pp 0 Reverb Type,
+    ///     pp 1 Reverb Time.
+    ///   * Chorus — slot path `[(0x01, 0x02)]`: pp 0 Chorus Type,
+    ///     pp 1 Mod Rate, pp 2 Mod Depth, pp 3 Feedback, pp 4 Send to
+    ///     Reverb.
+    ///
+    /// Per CA-024 an unrecognised or inappropriate parameter for a slot
+    /// is silently ignored (only that pair). Selecting a Reverb /
+    /// Chorus *Type* re-seeds the type-specific parameters to that
+    /// type's CA-024 defaults, matching the spec's "reset to
+    /// type-specific defaults whenever the type is changed" rule. The
+    /// value is stored as the raw byte; the [`GlobalEffects`]
+    /// physical-unit accessors evaluate the CA-024 formulas.
+    pub fn apply_global_parameter(&mut self, slot_path: &[(u8, u8)], param: u8, value: u8) {
+        match slot_path {
+            // Slot 0101: Reverb.
+            [(0x01, 0x01)] => match param {
+                0 => {
+                    self.global_effects.reverb_type = value;
+                    // CA-024: selecting a Reverb Type sets its default
+                    // Reverb Time from the type table.
+                    self.global_effects.reverb_time = reverb_default_time(value);
+                }
+                1 => self.global_effects.reverb_time = value,
+                _ => { /* unrecognised reverb parameter — ignored */ }
+            },
+            // Slot 0102: Chorus.
+            [(0x01, 0x02)] => match param {
+                0 => {
+                    self.global_effects.chorus_type = value;
+                    // CA-024: selecting a Chorus Type re-seeds Feedback,
+                    // Mod Rate, Mod Depth, and Rev Send from the type
+                    // table.
+                    if let Some(d) = chorus_type_defaults(value) {
+                        self.global_effects.chorus_feedback = d.feedback;
+                        self.global_effects.chorus_mod_rate = d.mod_rate;
+                        self.global_effects.chorus_mod_depth = d.mod_depth;
+                        self.global_effects.chorus_send_to_reverb = d.rev_send;
+                    }
+                }
+                1 => self.global_effects.chorus_mod_rate = value,
+                2 => self.global_effects.chorus_mod_depth = value,
+                3 => self.global_effects.chorus_feedback = value,
+                4 => self.global_effects.chorus_send_to_reverb = value,
+                _ => { /* unrecognised chorus parameter — ignored */ }
+            },
+            // Unknown slot path (including the GM2-reserved
+            // MSB=1/length=1 sentinel and any nested slot path) — the
+            // mixer models no other global slots, so it is ignored.
+            _ => {}
+        }
+    }
+
+    /// Reset Global Parameter Control state to the GM2 defaults. Wired
+    /// to GM System On / Off alongside the rest of the master reset.
+    pub fn reset_global_effects(&mut self) {
+        self.global_effects = GlobalEffects::default();
+    }
+
     // ─────────────────────────── MTS microtuning ───────────────────────────
 
     /// Borrow the MIDI Tuning Standard (MTS) state — the global
@@ -1396,6 +1581,61 @@ impl Mixer {
     pub fn live_voice_count(&self) -> usize {
         self.slots.iter().filter(|s| s.voice.is_some()).count()
     }
+}
+
+/// CA-024 GM2 Reverb default-time table. Selecting a Reverb Type sets
+/// the type's default Reverb Time. Raw values from the CA-024 "pp = 1:
+/// Reverb Time" table (Type → Time): 0→44, 1→50, 2→56, 3→64, 4→64,
+/// 8→50. Types outside the table keep the prior time (returns the
+/// Large-Hall default 64 for unknown types as a neutral fallback).
+fn reverb_default_time(reverb_type: u8) -> u8 {
+    match reverb_type {
+        0 => 44,
+        1 => 50,
+        2 => 56,
+        3 => 64,
+        4 => 64,
+        8 => 50,
+        _ => 64,
+    }
+}
+
+/// CA-024 GM2 Chorus per-type defaults (Feedback / Mod Rate / Mod Depth
+/// / Rev Send), from the "pp = 0: Chorus Type" table.
+struct ChorusDefaults {
+    feedback: u8,
+    mod_rate: u8,
+    mod_depth: u8,
+    rev_send: u8,
+}
+
+/// CA-024 GM2 Chorus type table. Returns `None` for a type outside the
+/// defined 0..=5 range (the parameter is then stored but no re-seed
+/// occurs).
+fn chorus_type_defaults(chorus_type: u8) -> Option<ChorusDefaults> {
+    // CA-024 "pp = 0: Chorus Type" table (raw values):
+    //   Type          Feedback  ModRate  ModDepth  RevSend
+    //   0 Chorus 1        0        3        5         0
+    //   1 Chorus 2        5        9       19         0
+    //   2 Chorus 3        8        3       19         0
+    //   3 Chorus 4       16        9       16         0
+    //   4 FB Chorus      64        2       24         0
+    //   5 Flanger       112        1        5         0
+    let (feedback, mod_rate, mod_depth, rev_send) = match chorus_type {
+        0 => (0, 3, 5, 0),
+        1 => (5, 9, 19, 0),
+        2 => (8, 3, 19, 0),
+        3 => (16, 9, 16, 0),
+        4 => (64, 2, 24, 0),
+        5 => (112, 1, 5, 0),
+        _ => return None,
+    };
+    Some(ChorusDefaults {
+        feedback,
+        mod_rate,
+        mod_depth,
+        rev_send,
+    })
 }
 
 // =========================================================================
@@ -2537,5 +2777,112 @@ mod tests {
         let (v2, bend2, _) = instrumented_voice(0.5, 1024);
         m.note_on(0, 60, 100, v2);
         assert_eq!(*bend2.lock().unwrap(), 0);
+    }
+
+    // ───────────────── global parameter control (CA-024) ─────────────────
+
+    #[test]
+    fn global_effects_default_is_gm2_recommended() {
+        // CA-024 GM2: Reverb Type 4 (Large Hall, default time 64) and
+        // Chorus Type 2 (Chorus 3): Feedback 8, Mod Rate 3, Mod Depth
+        // 19, Rev Send 0.
+        let m = Mixer::new();
+        let gx = *m.global_effects();
+        assert_eq!(gx.reverb_type, 4);
+        assert_eq!(gx.reverb_time, 64);
+        assert_eq!(gx.chorus_type, 2);
+        assert_eq!(gx.chorus_feedback, 8);
+        assert_eq!(gx.chorus_mod_rate, 3);
+        assert_eq!(gx.chorus_mod_depth, 19);
+        assert_eq!(gx.chorus_send_to_reverb, 0);
+    }
+
+    #[test]
+    fn global_parameter_sets_reverb_type_and_seeds_time() {
+        // Reverb slot 0101, pp 0 (Reverb Type) = 0 (Small Room) →
+        // default time 44 per the CA-024 type table.
+        let mut m = Mixer::new();
+        m.apply_global_parameter(&[(0x01, 0x01)], 0, 0);
+        assert_eq!(m.global_effects().reverb_type, 0);
+        assert_eq!(
+            m.global_effects().reverb_time,
+            44,
+            "Small Room should seed default time 44"
+        );
+    }
+
+    #[test]
+    fn global_parameter_sets_reverb_time_directly() {
+        // Reverb slot 0101, pp 1 (Reverb Time) = 64 → rt = exp((64-40)
+        // * 0.025) = exp(0.6) ≈ 1.822 s per the CA-024 inverse formula.
+        let mut m = Mixer::new();
+        m.apply_global_parameter(&[(0x01, 0x01)], 1, 64);
+        assert_eq!(m.global_effects().reverb_time, 64);
+        let rt = m.global_effects().reverb_time_secs();
+        assert!((rt - 1.8221188).abs() < 1e-4, "expected ~1.822 s, got {rt}");
+    }
+
+    #[test]
+    fn global_parameter_sets_chorus_type_and_reseeds_params() {
+        // Chorus slot 0102, pp 0 (Chorus Type) = 5 (Flanger) →
+        // Feedback 112, Mod Rate 1, Mod Depth 5, Rev Send 0 per CA-024.
+        let mut m = Mixer::new();
+        m.apply_global_parameter(&[(0x01, 0x02)], 0, 5);
+        let gx = *m.global_effects();
+        assert_eq!(gx.chorus_type, 5);
+        assert_eq!(gx.chorus_feedback, 112);
+        assert_eq!(gx.chorus_mod_rate, 1);
+        assert_eq!(gx.chorus_mod_depth, 5);
+        assert_eq!(gx.chorus_send_to_reverb, 0);
+    }
+
+    #[test]
+    fn global_parameter_chorus_unit_conversions() {
+        // CA-024 chorus formulas against worked values.
+        let mut m = Mixer::new();
+        m.apply_global_parameter(&[(0x01, 0x02)], 1, 10); // Mod Rate
+        m.apply_global_parameter(&[(0x01, 0x02)], 2, 31); // Mod Depth
+        m.apply_global_parameter(&[(0x01, 0x02)], 3, 100); // Feedback
+        m.apply_global_parameter(&[(0x01, 0x02)], 4, 100); // Rev Send
+        let gx = *m.global_effects();
+        // mr = 10 * 0.122 = 1.22 Hz
+        assert!((gx.chorus_mod_rate_hz() - 1.22).abs() < 1e-5);
+        // md = (31 + 1) / 3.2 = 10.0 ms
+        assert!((gx.chorus_mod_depth_ms() - 10.0).abs() < 1e-5);
+        // fb = 100 * 0.763 = 76.3 %
+        assert!((gx.chorus_feedback_percent() - 76.3).abs() < 1e-4);
+        // ctr = 100 * 0.787 = 78.7 %
+        assert!((gx.chorus_send_to_reverb_percent() - 78.7).abs() < 1e-4);
+    }
+
+    #[test]
+    fn global_parameter_unknown_param_is_ignored() {
+        // CA-024: an unrecognised parameter for a slot is ignored
+        // (only that pair). pp 9 on the Reverb slot does nothing.
+        let mut m = Mixer::new();
+        let before = *m.global_effects();
+        m.apply_global_parameter(&[(0x01, 0x01)], 9, 42);
+        assert_eq!(*m.global_effects(), before);
+    }
+
+    #[test]
+    fn global_parameter_unknown_slot_is_ignored() {
+        // The GM2-reserved sentinel slot (MSB=1, length 1, LSB unknown)
+        // and any other unmodelled slot are no-ops.
+        let mut m = Mixer::new();
+        let before = *m.global_effects();
+        m.apply_global_parameter(&[(0x01, 0x07)], 0, 1); // unknown slot
+        m.apply_global_parameter(&[(0x02, 0x01), (0x02, 0x03)], 4, 1); // nested
+        assert_eq!(*m.global_effects(), before);
+    }
+
+    #[test]
+    fn reset_global_effects_restores_gm2_defaults() {
+        let mut m = Mixer::new();
+        m.apply_global_parameter(&[(0x01, 0x01)], 0, 0); // Small Room
+        m.apply_global_parameter(&[(0x01, 0x02)], 0, 5); // Flanger
+        assert_ne!(*m.global_effects(), GlobalEffects::default());
+        m.reset_global_effects();
+        assert_eq!(*m.global_effects(), GlobalEffects::default());
     }
 }

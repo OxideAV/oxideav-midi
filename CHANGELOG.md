@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 114 — Global Parameter Control (Universal Real-Time SysEx `04 05`, CA-024)
+
+- New `mixer::GlobalEffects` carries the device-level
+  Global Parameter Control state from the MMA *Global Parameter
+  Control* recommended practice
+  (`docs/audio/midi/recommended-practices/ca24-Global-Parameter-Control-SysEx-Message.pdf`,
+  CA-024) — the GM2 Reverb (slot `01 01`) and Chorus (slot `01 02`)
+  parameter sets repeated in CA-024. Each parameter is stored as the
+  raw value byte; physical-unit accessors evaluate the CA-024 formulas
+  lazily: `reverb_time_secs` (inverse of `val = ln(rt)/0.025 + 40`),
+  `chorus_mod_rate_hz` (`val·0.122`), `chorus_mod_depth_ms`
+  (`(val+1)/3.2`), `chorus_feedback_percent` (`val·0.763`), and
+  `chorus_send_to_reverb_percent` (`val·0.787`). Defaults match GM2's
+  recommended initial settings (Reverb Type 4 "Large Hall", Chorus
+  Type 2 "Chorus 3"). The mixer carries no reverb/chorus DSP, so no
+  value is consumed by the render path yet and the rendered audio is
+  unchanged — the state is kept verbatim for introspection and a
+  future effects engine.
+- New `Mixer::apply_global_parameter(slot_path, param, value)` routes
+  one parameter-value pair against a resolved slot path. Selecting a
+  Reverb / Chorus *Type* re-seeds the type-specific parameters to that
+  type's CA-024 defaults per the spec's "reset to type-specific
+  defaults whenever the type is changed" rule (the Reverb-time and
+  Chorus Feedback/Mod-Rate/Mod-Depth/Rev-Send tables). Unrecognised
+  parameters and unmodelled slot paths (including the GM2-reserved
+  MSB=1/length-1 sentinel and any nested path) are silently ignored,
+  matching CA-024's "ignore only that parameter-value pair" rule. New
+  `Mixer::global_effects()` accessor and `Mixer::reset_global_effects()`
+  reset hook.
+- `scheduler::dispatch_universal_real_time` recognises sub-ID#2 `05`
+  and decodes the full `04 05 sw pw vw [[sh sl] ...] [pp vv] ...`
+  message via the new `dispatch_global_parameter_control`: the slot
+  path (`sw` 2-byte entries) and every parameter-value pair
+  (`pw`-byte parameter ID MSB-first, `vw`-byte value LSB-first) are
+  parsed and routed into `Mixer::apply_global_parameter`. The
+  parameter ID is reduced to its low byte and the value to its LSB
+  (the GM2 slots are single-byte). Truncated slot paths, zero-width
+  fields, and short pair lists are bounds-checked so malformed input
+  can never read past the payload. GM 1 / GM 2 System On / GM System
+  Off resets now also restore the GM2 effect defaults via
+  `reset_global_effects`.
+- 13 new tests (10 `mixer`, 3 `scheduler`): GM2 default state, Reverb
+  Type-select seeding default time, direct Reverb-Time set + the
+  `exp` unit conversion, Chorus Type-select re-seeding all four
+  params, the four Chorus unit conversions, unknown-parameter +
+  unknown-slot no-ops, the reset-to-defaults hook, and three scheduler
+  routings (reverb-type via SMF SysEx, a two-pair chorus message, and
+  a truncated slot path that must not panic). The existing
+  `universal_gm_on_sysex_resets_state` test gained a global-effects
+  reset assertion.
+
 ### Round 105 — Master Balance (Universal Real-Time SysEx `04 02`)
 
 - New `Mixer::set_master_balance_14(value)` /

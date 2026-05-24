@@ -359,6 +359,10 @@ impl Scheduler {
 ///     [`Mixer::set_master_fine_tuning`].
 ///   * `04` Master Coarse Tuning (CA-25) — applied via
 ///     [`Mixer::set_master_coarse_tuning`].
+///   * `05` Global Parameter Control (CA-024) — the slot path +
+///     parameter-value pairs are decoded and the GM2 Reverb (slot
+///     `01 01`) / Chorus (slot `01 02`) parameters routed via
+///     [`Mixer::apply_global_parameter`].
 ///
 /// All other Universal SysEx messages (sample dumps, file refs, MTC
 /// cueing, MMC, …) are silently ignored — they carry no semantics for
@@ -402,6 +406,7 @@ fn dispatch_universal_non_real_time(payload: &[u8], mixer: &mut crate::mixer::Mi
         mixer.set_master_fine_tuning(0, 0x40); // centre
         mixer.set_master_coarse_tuning(0, 0x40); // centre
         mixer.reset_tuning(); // back to equal temperament
+        mixer.reset_global_effects(); // GM2 reverb/chorus defaults
     } else if sub_id1 == 0x08 {
         // MIDI Tuning Standard. The non-real-time area carries the
         // single-note tuning bank form (07) and the non-real-time
@@ -456,7 +461,70 @@ fn dispatch_universal_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer)
             // Master Coarse Tuning (CA-25): `04 04 00 msb`.
             mixer.set_master_coarse_tuning(payload[4], payload[5]);
         }
+        0x05 => {
+            // Global Parameter Control (CA-024): `04 05 sw pw vw
+            // [[sh sl] ...] [pp vv] ...`. Decode the slot path and
+            // every parameter-value pair, routing each into the mixer.
+            dispatch_global_parameter_control(payload, mixer);
+        }
         _ => {}
+    }
+}
+
+/// Decode a **Global Parameter Control** message (Universal Real-Time
+/// SysEx, CA-024) and route each parameter-value pair into the mixer.
+///
+/// `payload` is `7F <dev> 04 05 sw pw vw [[sh sl] ...] [pp vv] ...`
+/// (trailing F7 already stripped). The layout, from
+/// `docs/audio/midi/recommended-practices/ca24-Global-Parameter-Control-SysEx-Message.pdf`:
+///
+///   * `sw` Slot Path Length — number of 2-byte `(MSB, LSB)` slot
+///     entries (0 for top-level parameters).
+///   * `pw` Parameter ID Width — bytes per parameter ID (MSB first).
+///   * `vw` Value Width — bytes per value (LSB first).
+///   * then `sw` slot entries, then a list of `pw + vw`-byte
+///     parameter-value pairs until EOX.
+///
+/// The mixer models only the single-byte GM2 Reverb / Chorus
+/// parameters, so a parameter ID is reduced to its low byte and a
+/// value to its low (first) byte. Malformed / truncated buffers are
+/// bounds-checked: parsing stops at the first incomplete field so a
+/// short message can never read past the payload.
+fn dispatch_global_parameter_control(payload: &[u8], mixer: &mut crate::mixer::Mixer) {
+    // Need at least `04 05 sw pw vw` → indices 2..=6.
+    if payload.len() < 7 {
+        return;
+    }
+    // `sw` slot path length (2-byte entries), `pw` parameter ID width,
+    // `vw` value width.
+    let sw = payload[4] as usize;
+    let pw = payload[5] as usize;
+    let vw = payload[6] as usize;
+    // A zero-width parameter or value field would make the pair list
+    // undecodable; reject rather than loop forever.
+    if pw == 0 || vw == 0 {
+        return;
+    }
+    let mut idx = 7;
+    // Slot path: `sw` entries of `(MSB, LSB)`.
+    let mut slot_path: Vec<(u8, u8)> = Vec::with_capacity(sw);
+    for _ in 0..sw {
+        if idx + 1 >= payload.len() {
+            return; // truncated slot path
+        }
+        slot_path.push((payload[idx] & 0x7F, payload[idx + 1] & 0x7F));
+        idx += 2;
+    }
+    // Parameter-value pairs until the payload is exhausted.
+    let pair_len = pw + vw;
+    while idx + pair_len <= payload.len() {
+        // Parameter ID, MSB first → keep the low byte (the only width
+        // the GM2 slots use).
+        let param = payload[idx + pw - 1] & 0x7F;
+        // Value, LSB first → the first byte is the LSB.
+        let value = payload[idx + pw] & 0x7F;
+        mixer.apply_global_parameter(&slot_path, param, value);
+        idx += pair_len;
     }
 }
 
@@ -979,6 +1047,74 @@ mod tests {
         assert_eq!(mixer.master_balance_14(), 0x2000);
         assert_eq!(mixer.master_fine_tune_cents(), 0);
         assert_eq!(mixer.master_coarse_tune_semitones(), 0);
+        // Global Parameter Control state back to GM2 defaults.
+        assert_eq!(
+            *mixer.global_effects(),
+            crate::mixer::GlobalEffects::default()
+        );
+    }
+
+    #[test]
+    fn universal_global_parameter_reverb_type_routes_to_mixer() {
+        // F0 [len] 7F 7F 04 05 sw=01 pw=01 vw=01 (slot 01 01) pp=00
+        // vv=00 F7 → Reverb slot, set Reverb Type 0 (Small Room).
+        // Bytes after F0: 7F 7F 04 05 01 01 01 01 01 00 00 F7 = 12.
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[
+            0x00, 0xF0, 0x0C, 0x7F, 0x7F, 0x04, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00,
+            0xF7,
+        ]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.global_effects().reverb_type, 0);
+        // Type select seeds Small Room's default time 44.
+        assert_eq!(mixer.global_effects().reverb_time, 44);
+    }
+
+    #[test]
+    fn universal_global_parameter_chorus_multi_pair_routes() {
+        // Chorus slot 01 02 with two parameter-value pairs in one
+        // message: pp=01 (Mod Rate)=10, pp=02 (Mod Depth)=31.
+        // Bytes after F0: 7F 7F 04 05 01 01 01 01 02 01 0A 02 1F F7 = 14.
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[
+            0x00, 0xF0, 0x0E, 0x7F, 0x7F, 0x04, 0x05, 0x01, 0x01, 0x01, 0x01, 0x02, 0x01, 0x0A,
+            0x02, 0x1F, 0xF7,
+        ]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(mixer.global_effects().chorus_mod_rate, 10);
+        assert_eq!(mixer.global_effects().chorus_mod_depth, 31);
+    }
+
+    #[test]
+    fn universal_global_parameter_truncated_slot_path_is_safe() {
+        // sw=02 promises two slot entries but the buffer ends after
+        // one — the decoder must bail without panicking and leave the
+        // GM2 defaults untouched.
+        // Bytes after F0: 7F 7F 04 05 02 01 01 01 01 F7 = 10.
+        let mut ev = Vec::new();
+        ev.extend_from_slice(&[
+            0x00, 0xF0, 0x0A, 0x7F, 0x7F, 0x04, 0x05, 0x02, 0x01, 0x01, 0x01, 0x01, 0xF7,
+        ]);
+        ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let smf = parse(&smf_with_events(96, &ev)).unwrap();
+        let mut s = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = ToneInstrument::new();
+        s.step(8192, &mut mixer, &inst);
+        assert_eq!(
+            *mixer.global_effects(),
+            crate::mixer::GlobalEffects::default()
+        );
     }
 
     #[test]

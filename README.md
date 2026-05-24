@@ -144,6 +144,21 @@ framework but usable standalone.
   gains `(1.0, 1.0)`, keeping the mix bit-identical to the
   pre-round-105 output until a SysEx moves balance off centre. GM 1 /
   GM 2 System On / GM System Off also reset Master Balance to centre.
+  Round 114 adds **Global Parameter Control** (`7F 7F 04 05`, CA-024):
+  the `04 05 sw pw vw [[sh sl] ...] [pp vv] ...` message decodes the
+  slot path + parameter-value pairs and stores the GM2 Reverb (slot
+  `01 01`) / Chorus (slot `01 02`) parameters in a new
+  `mixer::GlobalEffects` via [`Mixer::apply_global_parameter`]. Each
+  value is kept as the raw byte with physical-unit accessors
+  (`reverb_time_secs`, `chorus_mod_rate_hz`, `chorus_mod_depth_ms`,
+  `chorus_feedback_percent`, `chorus_send_to_reverb_percent`)
+  evaluating the CA-024 formulas; selecting a Reverb / Chorus Type
+  re-seeds the type-specific parameters to that type's CA-024 defaults.
+  There is no reverb/chorus DSP yet, so the stored state does not
+  change the rendered audio — it is surfaced for introspection and a
+  future effects engine. GM 1 / GM 2 System On / GM System Off reset
+  the effect state to the GM2 recommended defaults (Reverb Type 4
+  "Large Hall", Chorus Type 2 "Chorus 3").
 - `mixer::MpeZone` / `mixer::MpeRole` — MIDI Polyphonic Expression
   (M1-100-UM v1.1) support. The MCM (RPN 0x0006 on channel 0 for
   Lower, channel 15 for Upper) configures one or two zones; each
@@ -176,7 +191,10 @@ framework but usable standalone.
   Scale/Octave Tuning 1-byte (`08`) / 2-byte (`09`) forms into the
   `tuning` table; GM System On/Off additionally reset MTS tuning to
   equal temperament. Round 102 routes CC 96 / CC 97 (Data Increment /
-  Decrement, RP-018) into `Mixer::data_inc_dec`.
+  Decrement, RP-018) into `Mixer::data_inc_dec`. Round 114 routes
+  sub-ID#2 `05` (Global Parameter Control, CA-024) — the slot path +
+  parameter-value pairs are decoded and the GM2 Reverb / Chorus
+  parameters routed into `Mixer::apply_global_parameter`.
 - `tuning` — MIDI Tuning Standard (MTS) microtuning state + Universal
   SysEx data-format decoders, per the MMA *MIDI Tuning Messages*
   specification (CA-020 / CA-021 / RP-020). A `TuningTable` holds a
