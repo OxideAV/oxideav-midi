@@ -330,6 +330,119 @@ impl TempoChange {
     }
 }
 
+/// One key-signature change pinned to the absolute tick (relative to
+/// the start of its parent track) at which the
+/// [`FF 59 02 sf mi`](MetaEvent::KeySignature) meta event fires.
+///
+/// Returned by [`SmfFile::key_signatures`] — see that method for the
+/// merge semantics across multiple tracks.
+///
+/// Per the SMF spec, `sharps_flats` is a signed count in `-7..=+7`:
+/// negative means flats, positive means sharps, `0` is the natural
+/// scale (C major / A minor). `mode` is `0` for major and `1` for
+/// minor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeySignatureChange {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). Format-1 files conventionally place key
+    /// signatures on track 0; format-2 files keep them per-track.
+    pub track: usize,
+    /// `sf` — accidental count. Negative = flats, positive = sharps;
+    /// legal range per spec is `-7..=+7`.
+    pub sharps_flats: i8,
+    /// `mi` — `0` major, `1` minor. Anything else is preserved
+    /// verbatim (the spec doesn't reserve other values, but real
+    /// files have been seen with junk here).
+    pub mode: u8,
+}
+
+impl KeySignatureChange {
+    /// `true` when `mode == 1` (minor). Major / any-non-one is `false`.
+    pub fn is_minor(&self) -> bool {
+        self.mode == 1
+    }
+
+    /// `true` when `mode == 0` (major).
+    pub fn is_major(&self) -> bool {
+        self.mode == 0
+    }
+
+    /// Human-readable tonic name (e.g. `"C"`, `"F#"`, `"Bb"`).
+    ///
+    /// Returns `None` when `sharps_flats` is outside the spec range
+    /// `-7..=+7` or when `mode` is neither `0` (major) nor `1` (minor).
+    ///
+    /// Derived from the circle-of-fifths positions documented in the
+    /// SMF spec § "FF 59 02 sf mi Key Signature": each `+1` step adds
+    /// a sharp following `F# C# G# D# A# E# B#`; each `-1` step adds
+    /// a flat following `Bb Eb Ab Db Gb Cb Fb`. The minor-key column
+    /// is the relative minor (a sixth below the major tonic).
+    pub fn tonic_name(&self) -> Option<&'static str> {
+        // Index `sf + 7` maps `-7..=+7` to `0..=14`.
+        if !(-7..=7).contains(&self.sharps_flats) {
+            return None;
+        }
+        let idx = (self.sharps_flats + 7) as usize;
+        let names = match self.mode {
+            0 => MAJOR_TONICS,
+            1 => MINOR_TONICS,
+            _ => return None,
+        };
+        Some(names[idx])
+    }
+
+    /// Full key name (e.g. `"C major"`, `"A minor"`, `"F# minor"`,
+    /// `"Bb major"`). `None` under the same conditions as
+    /// [`tonic_name`](Self::tonic_name).
+    pub fn name(&self) -> Option<&'static str> {
+        if !(-7..=7).contains(&self.sharps_flats) {
+            return None;
+        }
+        let idx = (self.sharps_flats + 7) as usize;
+        let table = match self.mode {
+            0 => MAJOR_KEY_NAMES,
+            1 => MINOR_KEY_NAMES,
+            _ => return None,
+        };
+        Some(table[idx])
+    }
+}
+
+// Circle-of-fifths labels for the SMF FF 59 02 sf mi meta event.
+//
+// Index = `sf + 7`, so the entries run `-7 -6 -5 -4 -3 -2 -1  0  +1
+// +2 +3 +4 +5 +6 +7`. The major and minor rows are the standard
+// musical mapping (see e.g. SMF 1.0 spec page 11): minor is the
+// relative minor of the major three semitones below, so a 4-sharp
+// signature is E major / C# minor, etc. Spelling follows the
+// conventional accidental for each direction (sharp-side keys use
+// sharps, flat-side keys use flats).
+const MAJOR_TONICS: [&str; 15] = [
+    "Cb", "Gb", "Db", "Ab", "Eb", "Bb", "F", // sf = -7..-1
+    "C", // sf = 0
+    "G", "D", "A", "E", "B", "F#", "C#", // sf = +1..+7
+];
+
+const MINOR_TONICS: [&str; 15] = [
+    "Ab", "Eb", "Bb", "F", "C", "G", "D", // sf = -7..-1
+    "A", // sf = 0
+    "E", "B", "F#", "C#", "G#", "D#", "A#", // sf = +1..+7
+];
+
+const MAJOR_KEY_NAMES: [&str; 15] = [
+    "Cb major", "Gb major", "Db major", "Ab major", "Eb major", "Bb major", "F major", "C major",
+    "G major", "D major", "A major", "E major", "B major", "F# major", "C# major",
+];
+
+const MINOR_KEY_NAMES: [&str; 15] = [
+    "Ab minor", "Eb minor", "Bb minor", "F minor", "C minor", "G minor", "D minor", "A minor",
+    "E minor", "B minor", "F# minor", "C# minor", "G# minor", "D# minor", "A# minor",
+];
+
 impl SmfFile {
     /// Collect every [`MetaEvent::Tempo`] from every track, pinned to
     /// the absolute tick at which it fires, in time order.
@@ -417,6 +530,50 @@ impl SmfFile {
         // per-track insertion order survives the sort (so track 0
         // wins over track 1 at the same tick — matches the
         // scheduler's merge convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every [`MetaEvent::KeySignature`] from every track,
+    /// pinned to the absolute tick at which it fires, in time order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two changes at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::time_signatures`] /
+    /// [`SmfFile::tempo_map`] and the scheduler use (`scheduler.rs`
+    /// §"merged event list, sorted by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries a Key Signature
+    /// meta event. Per the SMF convention, a player that needs an
+    /// initial key signature should assume **C major** (`sf = 0,
+    /// mi = 0`) until the first change fires.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`] (the same cap the parser enforces).
+    pub fn key_signatures(&self) -> Vec<KeySignatureChange> {
+        let mut out: Vec<KeySignatureChange> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::KeySignature { sharps_flats, mode }) = &ev.kind {
+                    out.push(KeySignatureChange {
+                        tick: abs,
+                        track: track_idx,
+                        sharps_flats: *sharps_flats,
+                        mode: *mode,
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
         out.sort_by_key(|c| c.tick);
         out
     }
@@ -1512,5 +1669,276 @@ mod tests {
         assert_eq!(tc.microseconds_per_quarter_note, 0);
         assert!(tc.bpm.is_infinite());
         assert!(tc.bpm.is_sign_positive());
+    }
+
+    // ───────── KeySignatureChange / SmfFile::key_signatures ─────────
+
+    #[test]
+    fn key_signatures_empty_when_no_meta_event_present() {
+        // Track has just a note-on + note-off + EOT — no FF 59.
+        let events: &[u8] = &[
+            0x00, 0x90, 0x3C, 0x64, 0x40, 0x80, 0x3C, 0x40, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.key_signatures().is_empty());
+    }
+
+    #[test]
+    fn key_signatures_single_change_at_tick_zero_c_major() {
+        // delta=0 FF 59 02 00 00   C major (no accidentals)
+        // delta=0 FF 2F 00
+        let events: &[u8] = &[0x00, 0xFF, 0x59, 0x02, 0x00, 0x00, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(events));
+        let smf = parse(&blob).unwrap();
+        let keys = smf.key_signatures();
+        assert_eq!(keys.len(), 1);
+        let ks = keys[0];
+        assert_eq!(ks.tick, 0);
+        assert_eq!(ks.track, 0);
+        assert_eq!(ks.sharps_flats, 0);
+        assert_eq!(ks.mode, 0);
+        assert!(ks.is_major());
+        assert!(!ks.is_minor());
+        assert_eq!(ks.tonic_name(), Some("C"));
+        assert_eq!(ks.name(), Some("C major"));
+    }
+
+    #[test]
+    fn key_signatures_multiple_changes_within_one_track_are_in_order() {
+        // delta=0   FF 59 02 00 00  C major
+        // delta=480 FF 59 02 03 00  A major  (3 sharps, major)
+        // delta=480 FF 59 02 FD 01  C minor  (sf=-3, minor)
+        // delta=0   FF 2F 00
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x59, 0x02, 0x00, 0x00]);
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0xFF, 0x59, 0x02, 0x03, 0x00]);
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0xFF, 0x59, 0x02, 0xFD, 0x01]); // sf = -3
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let keys = smf.key_signatures();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0].tick, 0);
+        assert_eq!((keys[0].sharps_flats, keys[0].mode), (0, 0));
+        assert_eq!(keys[0].name(), Some("C major"));
+        assert_eq!(keys[1].tick, 480);
+        assert_eq!((keys[1].sharps_flats, keys[1].mode), (3, 0));
+        assert_eq!(keys[1].name(), Some("A major"));
+        assert_eq!(keys[2].tick, 960);
+        assert_eq!((keys[2].sharps_flats, keys[2].mode), (-3, 1));
+        assert_eq!(keys[2].name(), Some("C minor"));
+        assert!(keys[2].is_minor());
+    }
+
+    #[test]
+    fn key_signatures_merge_across_tracks_sorted_by_tick() {
+        // Track 0: tick 0 = C major, tick 1920 = E major (sf=4 mi=0), EOT at 1920.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xFF, 0x59, 0x02, 0x00, 0x00]);
+        t0.extend_from_slice(&encode_vlq(1920));
+        t0.extend_from_slice(&[0xFF, 0x59, 0x02, 0x04, 0x00]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        // Track 1: tick 960 = D minor (sf=-1 mi=1), EOT at 1920.
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(960));
+        t1.extend_from_slice(&[0xFF, 0x59, 0x02, 0xFF, 0x01]); // sf = -1
+        t1.extend_from_slice(&encode_vlq(960));
+        t1.extend_from_slice(&[0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let keys = smf.key_signatures();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(
+            (
+                keys[0].tick,
+                keys[0].track,
+                keys[0].sharps_flats,
+                keys[0].mode
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            (
+                keys[1].tick,
+                keys[1].track,
+                keys[1].sharps_flats,
+                keys[1].mode
+            ),
+            (960, 1, -1, 1)
+        );
+        assert_eq!(keys[1].name(), Some("D minor"));
+        assert_eq!(
+            (
+                keys[2].tick,
+                keys[2].track,
+                keys[2].sharps_flats,
+                keys[2].mode
+            ),
+            (1920, 0, 4, 0)
+        );
+        assert_eq!(keys[2].name(), Some("E major"));
+    }
+
+    #[test]
+    fn key_signatures_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        // Two tracks both place a key signature at tick 240. Track 0
+        // must appear first in the merged result.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x59, 0x02, 0x02, 0x00]); // 2 sharps major = D major
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x59, 0x02, 0xFE, 0x01]); // sf=-2 minor = G minor
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let keys = smf.key_signatures();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].tick, 240);
+        assert_eq!(keys[0].track, 0);
+        assert_eq!(keys[0].name(), Some("D major"));
+        assert_eq!(keys[1].tick, 240);
+        assert_eq!(keys[1].track, 1);
+        assert_eq!(keys[1].name(), Some("G minor"));
+    }
+
+    #[test]
+    fn key_signature_after_channel_events_tracks_absolute_tick() {
+        // A channel event uses running status mid-track; the key
+        // signature appears later. Make sure absolute-tick accounting
+        // doesn't lose the pre-event delta.
+        let mut events: Vec<u8> = Vec::new();
+        // tick 0 note-on key 60 vel 100
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        // delta=120 running-status note-on key 64 vel 80
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x40, 0x50]);
+        // delta=120 note-off (explicit status to clear running)
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x80, 0x3C, 0x40]);
+        // delta=240 key signature F# major (sf=6 mi=0)
+        events.extend_from_slice(&encode_vlq(240));
+        events.extend_from_slice(&[0xFF, 0x59, 0x02, 0x06, 0x00]);
+        // delta=0 EOT
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let keys = smf.key_signatures();
+        assert_eq!(keys.len(), 1);
+        // 0 + 120 + 120 + 240 = 480 ticks.
+        assert_eq!(keys[0].tick, 480);
+        assert_eq!(keys[0].name(), Some("F# major"));
+    }
+
+    #[test]
+    fn key_signature_tonic_table_covers_full_circle_of_fifths() {
+        // Walk every sf in -7..=+7 for both modes and confirm the
+        // names match the textbook circle of fifths. The major / minor
+        // rows are the spec's standard mapping (e.g. SMF 1.0 spec
+        // page 11): minor is the relative minor of the major a sixth
+        // up from its tonic.
+        let expected_major = [
+            (-7i8, "Cb major"),
+            (-6, "Gb major"),
+            (-5, "Db major"),
+            (-4, "Ab major"),
+            (-3, "Eb major"),
+            (-2, "Bb major"),
+            (-1, "F major"),
+            (0, "C major"),
+            (1, "G major"),
+            (2, "D major"),
+            (3, "A major"),
+            (4, "E major"),
+            (5, "B major"),
+            (6, "F# major"),
+            (7, "C# major"),
+        ];
+        for (sf, name) in expected_major {
+            let ks = KeySignatureChange {
+                tick: 0,
+                track: 0,
+                sharps_flats: sf,
+                mode: 0,
+            };
+            assert_eq!(ks.name(), Some(name), "major sf={sf}");
+        }
+        let expected_minor = [
+            (-7i8, "Ab minor"),
+            (-6, "Eb minor"),
+            (-5, "Bb minor"),
+            (-4, "F minor"),
+            (-3, "C minor"),
+            (-2, "G minor"),
+            (-1, "D minor"),
+            (0, "A minor"),
+            (1, "E minor"),
+            (2, "B minor"),
+            (3, "F# minor"),
+            (4, "C# minor"),
+            (5, "G# minor"),
+            (6, "D# minor"),
+            (7, "A# minor"),
+        ];
+        for (sf, name) in expected_minor {
+            let ks = KeySignatureChange {
+                tick: 0,
+                track: 0,
+                sharps_flats: sf,
+                mode: 1,
+            };
+            assert_eq!(ks.name(), Some(name), "minor sf={sf}");
+        }
+    }
+
+    #[test]
+    fn key_signature_out_of_range_or_unknown_mode_yields_none() {
+        // sf outside -7..=+7 — name() returns None.
+        let ks = KeySignatureChange {
+            tick: 0,
+            track: 0,
+            sharps_flats: 8,
+            mode: 0,
+        };
+        assert_eq!(ks.tonic_name(), None);
+        assert_eq!(ks.name(), None);
+
+        let ks = KeySignatureChange {
+            tick: 0,
+            track: 0,
+            sharps_flats: -8,
+            mode: 1,
+        };
+        assert_eq!(ks.tonic_name(), None);
+        assert_eq!(ks.name(), None);
+
+        // mode neither 0 nor 1 — name() returns None even with a
+        // valid sf. is_major() / is_minor() both report false.
+        let ks = KeySignatureChange {
+            tick: 0,
+            track: 0,
+            sharps_flats: 0,
+            mode: 2,
+        };
+        assert_eq!(ks.tonic_name(), None);
+        assert_eq!(ks.name(), None);
+        assert!(!ks.is_major());
+        assert!(!ks.is_minor());
     }
 }

@@ -40,6 +40,16 @@ framework but usable standalone.
   divide-by-zero. Players that need an initial tempo before any
   explicit Set Tempo should assume 500 000 µs/qn = 120 BPM per
   convention.
+  Round 128 adds `SmfFile::key_signatures()` — every
+  `FF 59 02 sf mi` change as a
+  `KeySignatureChange { tick, track, sharps_flats, mode }` with the
+  absolute tick on the parent track, stably merged across tracks
+  (track 0 before track 1 at the same tick).
+  `KeySignatureChange::tonic_name()` / `name()` resolve the signed
+  `-7..=+7` accidental count and `0`/`1` mode bit to a textbook
+  circle-of-fifths label (`"C major"`, `"A minor"`, `"F# major"`,
+  `"Bb minor"`, …); out-of-range `sf` or unknown `mode` returns
+  `None` rather than fabricating a label.
 - `paths` — per-OS SoundFont/SFZ/DLS search paths plus the
   `OXIDEAV_SOUNDFONT_PATH` env-var override.
 - `instruments::sf2` — full SoundFont 2 RIFF reader and voice

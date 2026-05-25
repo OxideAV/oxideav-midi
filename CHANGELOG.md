@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 128 — `SmfFile::key_signatures()` iteration helper
+
+- New `smf::KeySignatureChange { tick, track, sharps_flats, mode }`
+  pins one decoded `FF 59 02 sf mi` Key Signature meta event to the
+  absolute tick (cumulative delta-sum) at which it fires on its parent
+  track. `sharps_flats` is the signed `-7..=+7` accidental count
+  (negative = flats); `mode` is `0` major or `1` minor.
+  `KeySignatureChange::tonic_name()` returns the tonic spelling
+  (`"C"`, `"F#"`, `"Bb"`, …) and `name()` returns the full key name
+  (`"C major"`, `"A minor"`, …). Both helpers consult a 15-entry
+  lookup keyed by `sf + 7` and return `None` for out-of-range `sf`
+  or any `mode` other than 0 / 1, so junk payloads stay observable
+  but never panic. `is_major()` / `is_minor()` mirror the mode bit.
+- New `SmfFile::key_signatures()` walks every track, sums per-track
+  deltas into absolute ticks, collects every
+  `MetaEvent::KeySignature`, and returns the merged stream sorted by
+  tick. The sort is stable so two changes at the same tick keep the
+  per-track insertion order — track 0 wins over track 1 at the same
+  tick, matching the scheduler's merge convention and the existing
+  `tempo_map` / `time_signatures` helpers.
+- 8 new lib tests (`smf::tests`): empty-when-no-meta-event;
+  single-change-at-tick-zero (C major, all four fields + the two
+  display helpers); three changes within one track (C major →
+  A major → C minor); merge across two tracks sorted by tick; stable
+  sort keeps track 0 before track 1 at the same tick; absolute-tick
+  accounting after running-status channel events; the full 30-entry
+  circle-of-fifths name table (both modes, every `sf` in `-7..=+7`);
+  out-of-range `sf` / unknown `mode` produce `None`.
+- 298 → 306 lib tests, 14 → 14 integration tests, 0 ignored.
+
 ### Round 125 — `SmfFile::tempo_map()` iteration helper
 
 - New `smf::TempoChange { tick, track, microseconds_per_quarter_note,
