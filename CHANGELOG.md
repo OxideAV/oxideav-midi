@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 172 — cargo-fuzz harness over every attacker-facing parser
+
+- New `fuzz/` crate (its own `[workspace]` so it doesn't drag the
+  umbrella) with four libfuzzer-sys targets covering every parser
+  that takes attacker-controlled bytes end-to-end:
+  - `smf` exercises `oxideav_midi::smf::parse` plus the three public
+    iteration helpers (`tempo_map`, `time_signatures`,
+    `key_signatures`) on every successful parse, so the
+    cumulative-tick accounting + meta-event extraction paths cover
+    fuzz-discovered shapes too.
+  - `sf2` exercises `instruments::sf2::Sf2Bank::parse` (the full
+    `RIFF/sfbk` walker + LIST INFO / LIST sdta / LIST pdta
+    cross-link resolution).
+  - `dls` exercises `instruments::dls::DlsBank::parse` (the
+    `RIFF/DLS<space>` walker + `colh` / `ptbl` / `lins-list` /
+    `wvpl-list` / per-instrument `rgn ` / `rgn2` / `wsmp` / `wlnk` /
+    `art1` / `art2` chain).
+  - `sfz` exercises `instruments::sfz::parse_str` (the comment
+    stripper + tokenizer + `<global>` / `<master>` / `<group>` /
+    `<region>` header walker + opcode flattening + every typed
+    field parser).
+- Each target asserts the contract every parser advertises: arbitrary
+  bytes return a `Result`, with no panic / OOM / integer overflow
+  (debug) / out-of-bounds index on any path. The return value is
+  intentionally discarded.
+- Curated seed corpora under `fuzz/corpus/<target>/` give the fuzzer
+  a head start across the well-formed, partial-but-legal, and
+  known-edge shapes. The `sfz` corpus also keeps the round-172
+  regression input (`regression_r172_octave_overflow.sfz.bin`) so the
+  fixed crash stays under perpetual fuzzer pressure.
+- **Fuzz-discovered bug fix**: `sfz::parse_key` (note-name → MIDI key
+  conversion) used to panic with `attempt to multiply with overflow`
+  in a debug build when handed an octave whose magnitude approached
+  `i32::MAX` (e.g. `lokey=C-2011420400`, the libfuzzer crash sample).
+  The `(octave + 1) * 12 + note_idx + accidental` chain now uses
+  `checked_add` / `checked_mul` and falls out to `None` on overflow,
+  matching the existing `xyz` / `c100` / `c-100` rejection paths.
+  New `parse_key_octave_extremes_do_not_overflow` lib test pins the
+  fix against `C-2011420400`, `i32::MAX`, `i32::MIN`, the `g`
+  note-name variant, and the previously-tested moderate
+  out-of-MIDI-range pair (`c100` / `c-100`).
+- Initial 4×~45 s runs cleared **30+ million inputs** across smf /
+  sf2 / dls and **2 M inputs** across sfz with zero remaining
+  crashes. The harness can run indefinitely; CI does not gate on
+  fuzz time.
+- 306 → 307 lib tests, 14 → 14 integration tests, 0 ignored.
+
 ### Round 128 — `SmfFile::key_signatures()` iteration helper
 
 - New `smf::KeySignatureChange { tick, track, sharps_flats, mode }`

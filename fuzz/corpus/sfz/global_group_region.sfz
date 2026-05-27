@@ -1,0 +1,24 @@
+<control>
+default_path=samples/
+
+<global>
+ampeg_attack=0.01
+volume=-3
+
+<group>
+lokey=60 hikey=72
+loop_mode=loop_continuous
+fil_type=lpf_2p
+cutoff=2000
+resonance=6
+
+<region>
+sample=c4.wav
+pitch_keycenter=60
+lovel=1 hivel=63
+
+<region>
+sample=c4_loud.wav
+pitch_keycenter=60
+lovel=64 hivel=127
+fileg_attack=0.05 fileg_depth=2400

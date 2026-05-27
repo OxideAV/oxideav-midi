@@ -290,3 +290,31 @@ Master Volume (`F0 7F <dev> 04 01 lsb msb F7`), Master Balance
 `04 04`), GM2 **Global Parameter Control** (CA-024, `04 05` — Reverb
 slot `0101` / Chorus slot `0102`), and GM 1 / GM 2 System On / GM
 System Off (Non-Real-Time, `09 01` / `09 02` / `09 03`).
+
+## Fuzzing
+
+Round 172 stands up a `cargo-fuzz` (libfuzzer-sys) harness over every
+attacker-facing parser:
+
+```
+cargo +nightly fuzz run smf    # smf::parse + tempo/time/key iterators
+cargo +nightly fuzz run sf2    # instruments::sf2::Sf2Bank::parse
+cargo +nightly fuzz run dls    # instruments::dls::DlsBank::parse
+cargo +nightly fuzz run sfz    # instruments::sfz::parse_str
+```
+
+Each target asserts the contract every parser already advertises:
+arbitrary bytes return a `Result`, with no panic / OOM / integer
+overflow / out-of-bounds index on any path. Curated seed corpora
+under `fuzz/corpus/<target>/` give the fuzzer a head start across
+the well-formed, partial-but-legal, and known-edge shapes. The
+`sfz` corpus also keeps the round-172 regression input
+(`regression_r172_octave_overflow.sfz.bin`) so the
+`parse_key("C-2011420400")` overflow stays under perpetual
+fuzzer pressure after the fix.
+
+Initial 4×~45 s runs cleared 30+ million inputs total across smf /
+sf2 / dls and 2 M across sfz with zero remaining crashes. The
+single round-172 finding (overflow in the SFZ key-name octave
+multiplication) was fixed in-place and pinned by a new
+`parse_key_octave_extremes_do_not_overflow` unit test.

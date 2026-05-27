@@ -1,0 +1,82 @@
+[package]
+name = "oxideav-midi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Four input surfaces in oxideav-midi take attacker-controlled bytes
+# and walk variable-length structures end-to-end:
+#
+#   * `smf::parse`          — Standard MIDI File (`.mid`): RIFF-style
+#                             MThd + MTrk chunks, per-event VLQ deltas,
+#                             running status, sysex (`F0`/`F7`) and
+#                             meta-event (`FF …`) payloads with their
+#                             own varlen lengths.
+#   * `instruments::sf2::Sf2Bank::parse` — SoundFont 2 (`.sf2`):
+#                             RIFF/sfbk form, LIST INFO + LIST sdta
+#                             (smpl + optional sm24) + LIST pdta
+#                             (phdr / pbag / pgen / inst / ibag / igen /
+#                             shdr) record arrays, generator chains
+#                             cross-resolved by id.
+#   * `instruments::dls::DlsBank::parse` — DLS Level 1/2 (`.dls`):
+#                             RIFF/DLS<space> form, colh / ptbl /
+#                             lins-list / wvpl-list, per-instrument
+#                             rgnh / wsmp / wlnk / lart-list, art1 /
+#                             art2 connection blocks.
+#   * `sfz::parse_str`      — SFZ patch text: line + block comments,
+#                             `<control>` / `<global>` / `<master>` /
+#                             `<group>` / `<region>` headers, opcode
+#                             `name=value` pairs with space-bearing
+#                             values, key/MIDI-name parsing.
+#
+# Every contract under test is identical: a malformed input yields
+# `Err(oxideav_core::Error::…)`, a well-formed one yields `Ok(…)`, and
+# *neither* path may panic, integer-overflow (debug), index out of
+# bounds, or allocate from an attacker-controlled length field. The
+# return value is intentionally discarded by every target.
+#
+# Decoder-only fuzzing matches the project's clean-room rule: every
+# parser is exercised end-to-end against arbitrary bytes without
+# consulting any reference implementation as an oracle.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-midi]
+path = ".."
+
+# Detach from the umbrella workspace so the fuzz crate is built with
+# its own Cargo.lock + libfuzzer toolchain settings without dragging in
+# every sibling crate.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "smf"
+path = "fuzz_targets/smf.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sf2"
+path = "fuzz_targets/sf2.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "dls"
+path = "fuzz_targets/dls.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sfz"
+path = "fuzz_targets/sfz.rs"
+test = false
+doc = false

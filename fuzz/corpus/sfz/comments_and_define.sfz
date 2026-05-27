@@ -1,0 +1,8 @@
+// line comment
+/* block
+   comment */
+#define $KIT samples
+<region>
+sample=$KIT/snare.wav
+key=C4
+lokey=C-1 hikey=G9
