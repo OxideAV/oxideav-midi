@@ -908,10 +908,17 @@ fn parse_key(value: &str) -> Option<u8> {
     if i >= bytes.len() {
         return None;
     }
-    // Octave can be negative ("c-1" = 0).
+    // Octave can be negative ("c-1" = 0). Compute the MIDI key with
+    // checked arithmetic so a pathological `lokey=C-2011420400`-style
+    // input from a malformed patch falls out as `None` rather than
+    // overflowing the i32 multiplication (fuzz-discovered, round 172).
     let octave_str = &s[i..];
     let octave: i32 = octave_str.parse().ok()?;
-    let midi = (octave + 1) * 12 + note_idx + accidental;
+    let midi = octave
+        .checked_add(1)?
+        .checked_mul(12)?
+        .checked_add(note_idx)?
+        .checked_add(accidental)?;
     if (0..=127).contains(&midi) {
         Some(midi as u8)
     } else {
@@ -1163,6 +1170,24 @@ mod tests {
         assert_eq!(parse_key("c-1"), Some(0));
         assert_eq!(parse_key("g9"), Some(127));
         assert_eq!(parse_key("xyz"), None);
+    }
+
+    #[test]
+    fn parse_key_octave_extremes_do_not_overflow() {
+        // Regression for the round-172 cargo-fuzz finding: a note name
+        // with a huge octave (`C-2011420400` from the crash sample, or
+        // the `i32::MAX` / `i32::MIN` boundary) used to panic at
+        // `(octave + 1) * 12` with `attempt to multiply with overflow`
+        // in a debug build. Both must now return `None` rather than
+        // panic.
+        assert_eq!(parse_key("C-2011420400"), None);
+        assert_eq!(parse_key("c2147483647"), None);
+        assert_eq!(parse_key("c-2147483648"), None);
+        assert_eq!(parse_key("g2147483647"), None);
+        // Out-of-MIDI-range but arithmetically representable still maps
+        // to `None` per the existing 0..=127 check.
+        assert_eq!(parse_key("c100"), None);
+        assert_eq!(parse_key("c-100"), None);
     }
 
     #[test]
