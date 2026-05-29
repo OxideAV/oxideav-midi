@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 176 — `SmfFile::markers()` iteration helper (`FF 06`)
+
+- New `smf::MarkerEvent { tick, track, text }` plus
+  `SmfFile::markers() -> Vec<MarkerEvent>`. Collects every marker
+  meta event (`FF 06 len text`, the DAW song-section convention)
+  from every track, pins each one to the absolute tick of its
+  parent track via cumulative `TrackEvent::delta` sums, then merges
+  the per-track sequences with a stable sort by `tick` — track 0
+  wins over track 1 at the same tick, matching the same merge
+  rule used by `SmfFile::tempo_map()` /
+  `SmfFile::time_signatures()` / `SmfFile::key_signatures()` and
+  by `scheduler.rs` §"merged event list, sorted by absolute tick".
+- Only `FF 06` is selected. Other text-kind meta events
+  (`FF 03` track name, `FF 05` lyric, `FF 07` cue point, …)
+  are filtered out so callers iterating section labels don't have
+  to discriminate themselves.
+- `MarkerEvent::text_bytes()` borrows the raw `text` payload
+  unchanged (the SMF spec leaves the encoding unspecified —
+  historically Latin-1, modern DAWs emit UTF-8). `text_lossy()`
+  returns `Cow<str>` using `String::from_utf8_lossy`, so invalid
+  UTF-8 surfaces as `U+FFFD` replacement characters rather than
+  panicking — convenient default for callers that only need the
+  human-readable label.
+- Cost is linear in the total event count and bounded above by
+  the parser's existing `MAX_EVENTS_PER_FILE` cap; the helper
+  does not introduce a new allocation ceiling.
+- 8 new unit tests in `src/smf.rs::tests` cover: empty input,
+  single marker at tick 0, multiple per-track markers in order,
+  multi-track merge order, stable sort at the same tick,
+  filtering against neighbouring text kinds (`FF 03` / `FF 05`),
+  absolute-tick accounting through running-status channel
+  events, and `text_lossy()` resilience against non-UTF-8 bytes.
+  Brings the in-crate suite from 307 to 315 unit tests, all
+  passing under `cargo test -p oxideav-midi`.
+
 ### Round 172 — cargo-fuzz harness over every attacker-facing parser
 
 - New `fuzz/` crate (its own `[workspace]` so it doesn't drag the

@@ -443,6 +443,51 @@ const MINOR_KEY_NAMES: [&str; 15] = [
     "E minor", "B minor", "F# minor", "C# minor", "G# minor", "D# minor", "A# minor",
 ];
 
+/// One marker meta event pinned to the absolute tick (relative to the
+/// start of its parent track) at which the
+/// [`FF 06 len text`](MetaEvent::Text) meta event fires.
+///
+/// Returned by [`SmfFile::markers`] — see that method for the merge
+/// semantics across multiple tracks.
+///
+/// The marker text is preserved byte-for-byte from the SMF stream. The
+/// spec does not pin a character set, so callers that need a Rust
+/// string should call [`MarkerEvent::text_lossy`] (UTF-8 with U+FFFD
+/// substitutes) or pick their own decoding strategy from the raw
+/// bytes returned by [`MarkerEvent::text_bytes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkerEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). Format-1 files conventionally place all
+    /// markers on track 0; format-2 files keep them per-track.
+    pub track: usize,
+    /// Raw marker text bytes (the `text` payload of `FF 06 len text`).
+    /// The SMF spec leaves the encoding unspecified — historically
+    /// Latin-1 was conventional, modern DAWs emit UTF-8. Stored as
+    /// `Vec<u8>` so we don't fabricate a decoding.
+    pub text: Vec<u8>,
+}
+
+impl MarkerEvent {
+    /// Borrow the raw marker bytes.
+    pub fn text_bytes(&self) -> &[u8] {
+        &self.text
+    }
+
+    /// Lossy UTF-8 decode of the marker text. Invalid sequences are
+    /// replaced with `U+FFFD` (REPLACEMENT CHARACTER), so this never
+    /// fails. Callers that need a strict decoding should call
+    /// [`std::str::from_utf8`] on [`text_bytes`](Self::text_bytes)
+    /// themselves.
+    pub fn text_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.text)
+    }
+}
+
 impl SmfFile {
     /// Collect every [`MetaEvent::Tempo`] from every track, pinned to
     /// the absolute tick at which it fires, in time order.
@@ -566,6 +611,57 @@ impl SmfFile {
                         track: track_idx,
                         sharps_flats: *sharps_flats,
                         mode: *mode,
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every marker meta event (`FF 06 len text`, surfaced as
+    /// [`MetaEvent::Text`] with `kind == 0x06`) from every track,
+    /// pinned to the absolute tick at which it fires, in time order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two markers at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::tempo_map`] /
+    /// [`SmfFile::time_signatures`] / [`SmfFile::key_signatures`] and
+    /// the scheduler use (`scheduler.rs` §"merged event list, sorted
+    /// by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries a marker meta
+    /// event. The spec does not bound how many markers a file may
+    /// declare; the overall cap remains [`MAX_EVENTS_PER_FILE`] (the
+    /// same cap the parser enforces, applied across every event kind).
+    ///
+    /// Markers are conventionally used by DAWs to label song sections
+    /// (e.g. `"Verse"`, `"Chorus"`) and are distinct from the more
+    /// general text events (`FF 01..=05, 07..=0F`) which carry
+    /// copyright, track name, instrument name, lyric, cue point, and
+    /// program name payloads — only `FF 06` is selected here.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn markers(&self) -> Vec<MarkerEvent> {
+        let mut out: Vec<MarkerEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::Text { kind: 0x06, text }) = &ev.kind {
+                    out.push(MarkerEvent {
+                        tick: abs,
+                        track: track_idx,
+                        text: text.clone(),
                     });
                 }
             }
@@ -1940,5 +2036,193 @@ mod tests {
         assert_eq!(ks.name(), None);
         assert!(!ks.is_major());
         assert!(!ks.is_minor());
+    }
+
+    // ───────── MarkerEvent / SmfFile::markers ─────────
+
+    #[test]
+    fn markers_empty_when_no_meta_event_present() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.markers().is_empty());
+    }
+
+    #[test]
+    fn markers_single_event_at_tick_zero() {
+        // delta=0 FF 06 05 "Verse"
+        // delta=0 FF 2F 00
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x06, 0x05];
+        events.extend_from_slice(b"Verse");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let mk = smf.markers();
+        assert_eq!(mk.len(), 1);
+        assert_eq!(mk[0].tick, 0);
+        assert_eq!(mk[0].track, 0);
+        assert_eq!(mk[0].text_bytes(), b"Verse");
+        assert_eq!(mk[0].text_lossy(), "Verse");
+    }
+
+    #[test]
+    fn markers_multiple_events_within_one_track_are_in_order() {
+        // delta=0 FF 06 5 "Intro"
+        // delta=240 FF 06 5 "Verse"
+        // delta=240 FF 06 6 "Chorus"
+        // delta=0 FF 2F 00
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x06, 0x05];
+        events.extend_from_slice(b"Intro");
+        events.extend_from_slice(&encode_vlq(240));
+        events.extend_from_slice(&[0xFF, 0x06, 0x05]);
+        events.extend_from_slice(b"Verse");
+        events.extend_from_slice(&encode_vlq(240));
+        events.extend_from_slice(&[0xFF, 0x06, 0x06]);
+        events.extend_from_slice(b"Chorus");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let mk = smf.markers();
+        assert_eq!(mk.len(), 3);
+        assert_eq!(mk[0].tick, 0);
+        assert_eq!(mk[0].text_bytes(), b"Intro");
+        assert_eq!(mk[1].tick, 240);
+        assert_eq!(mk[1].text_bytes(), b"Verse");
+        assert_eq!(mk[2].tick, 480);
+        assert_eq!(mk[2].text_bytes(), b"Chorus");
+    }
+
+    #[test]
+    fn markers_merge_across_tracks_sorted_by_tick() {
+        // track 0: delta=240 marker "A"
+        // track 1: delta=120 marker "B"; delta=240 marker "C"
+        // → A is at tick 240 on track 0; B at 120, C at 360 on track 1.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x06, 0x01]);
+        t0.extend_from_slice(b"A");
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(120));
+        t1.extend_from_slice(&[0xFF, 0x06, 0x01]);
+        t1.extend_from_slice(b"B");
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x06, 0x01]);
+        t1.extend_from_slice(b"C");
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let mk = smf.markers();
+        assert_eq!(mk.len(), 3);
+        assert_eq!(mk[0].tick, 120);
+        assert_eq!(mk[0].track, 1);
+        assert_eq!(mk[0].text_bytes(), b"B");
+        assert_eq!(mk[1].tick, 240);
+        assert_eq!(mk[1].track, 0);
+        assert_eq!(mk[1].text_bytes(), b"A");
+        assert_eq!(mk[2].tick, 360);
+        assert_eq!(mk[2].track, 1);
+        assert_eq!(mk[2].text_bytes(), b"C");
+    }
+
+    #[test]
+    fn markers_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        // Both tracks land a marker at tick 240. Stable sort keeps
+        // track 0 first (matches the scheduler's merge convention).
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x06, 0x04]);
+        t0.extend_from_slice(b"trk0");
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x06, 0x04]);
+        t1.extend_from_slice(b"trk1");
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let mk = smf.markers();
+        assert_eq!(mk.len(), 2);
+        assert_eq!(mk[0].tick, 240);
+        assert_eq!(mk[0].track, 0);
+        assert_eq!(mk[0].text_bytes(), b"trk0");
+        assert_eq!(mk[1].tick, 240);
+        assert_eq!(mk[1].track, 1);
+        assert_eq!(mk[1].text_bytes(), b"trk1");
+    }
+
+    #[test]
+    fn markers_filter_excludes_other_text_kinds() {
+        // FF 03 "Track1" (track name) + FF 06 "Mark" (marker) + FF 05
+        // "lyric" (lyric) — only the marker should land in
+        // SmfFile::markers().
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x03, 0x06];
+        events.extend_from_slice(b"Track1");
+        events.extend_from_slice(&[0x00, 0xFF, 0x06, 0x04]);
+        events.extend_from_slice(b"Mark");
+        events.extend_from_slice(&[0x00, 0xFF, 0x05, 0x05]);
+        events.extend_from_slice(b"lyric");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let mk = smf.markers();
+        assert_eq!(mk.len(), 1);
+        assert_eq!(mk[0].text_bytes(), b"Mark");
+    }
+
+    #[test]
+    fn marker_after_channel_events_tracks_absolute_tick() {
+        // Running-status note-ons interleaved with delta-positioned
+        // markers — verifies absolute tick accounting matches the
+        // tempo/time/key helpers.
+        let mut events: Vec<u8> = Vec::new();
+        // tick 0 note-on key 60 vel 100
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        // delta=120 running-status note-on key 64 vel 80
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x40, 0x50]);
+        // delta=120 marker "X"
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0xFF, 0x06, 0x01]);
+        events.extend_from_slice(b"X");
+        // delta=0 EOT
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let mk = smf.markers();
+        assert_eq!(mk.len(), 1);
+        // 0 + 120 + 120 = 240
+        assert_eq!(mk[0].tick, 240);
+        assert_eq!(mk[0].text_bytes(), b"X");
+    }
+
+    #[test]
+    fn marker_text_lossy_replaces_invalid_utf8() {
+        // 0xFF 0xFE is not a valid UTF-8 sequence — text_lossy() must
+        // not panic and must surface U+FFFD substitutes.
+        let mk = MarkerEvent {
+            tick: 0,
+            track: 0,
+            text: vec![0xFF, 0xFE],
+        };
+        // U+FFFD is 3 bytes in UTF-8, two replacement chars = 6 bytes.
+        let lossy = mk.text_lossy();
+        assert!(lossy.contains('\u{FFFD}'));
+        assert_eq!(mk.text_bytes(), &[0xFF, 0xFE]);
     }
 }

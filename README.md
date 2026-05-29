@@ -50,6 +50,17 @@ framework but usable standalone.
   circle-of-fifths label (`"C major"`, `"A minor"`, `"F# major"`,
   `"Bb minor"`, …); out-of-range `sf` or unknown `mode` returns
   `None` rather than fabricating a label.
+  Round 176 adds `SmfFile::markers()` — every `FF 06 len text`
+  marker meta event as a `MarkerEvent { tick, track, text }` with
+  the absolute tick on the parent track, stably merged across
+  tracks (track 0 before track 1 at the same tick). Only `FF 06`
+  is selected — neighbouring text-kind metas (`FF 03` track name,
+  `FF 05` lyric, etc.) are filtered out so the helper matches the
+  DAW convention of one section-label list per song.
+  `MarkerEvent::text_bytes()` returns the raw payload (the SMF spec
+  leaves the encoding unspecified); `text_lossy()` returns a
+  UTF-8-decoded `Cow<str>` with `U+FFFD` substitutes for invalid
+  sequences so callers don't have to encode-detect themselves.
 - `paths` — per-OS SoundFont/SFZ/DLS search paths plus the
   `OXIDEAV_SOUNDFONT_PATH` env-var override.
 - `instruments::sf2` — full SoundFont 2 RIFF reader and voice
