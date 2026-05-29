@@ -541,6 +541,62 @@ impl LyricEvent {
     }
 }
 
+/// One cue-point meta event pinned to the absolute tick (relative to
+/// the start of its parent track) at which the
+/// [`FF 07 len text`](MetaEvent::Text) meta event fires.
+///
+/// Returned by [`SmfFile::cue_points`] — see that method for the merge
+/// semantics across multiple tracks.
+///
+/// Cue points are the film-score / theatrical sync convention from the
+/// original Standard MIDI File Specification 1.0: each event labels a
+/// point in the sequence where some external action should occur
+/// (a scene change, an SFX trigger, a video cue, …). They share the
+/// same byte shape as markers (`FF 06`) and lyrics (`FF 05`) but
+/// indicate "sync with an external event" rather than "label a song
+/// section" or "display a karaoke syllable". This helper isolates the
+/// `FF 07` stream so callers driving external synchronisation don't
+/// have to discriminate against neighbouring text-meta kinds.
+///
+/// The cue text is preserved byte-for-byte from the SMF stream. The
+/// spec does not pin a character set, so callers that need a Rust
+/// string should call [`CueEvent::text_lossy`] (UTF-8 with `U+FFFD`
+/// substitutes) or pick their own decoding strategy from the raw bytes
+/// returned by [`CueEvent::text_bytes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CueEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). Format-1 files conventionally place sync
+    /// cues on a dedicated track (often the conductor / tempo track);
+    /// format-2 files keep them per-track.
+    pub track: usize,
+    /// Raw cue-point text bytes (the `text` payload of `FF 07 len
+    /// text`). The SMF spec leaves the encoding unspecified —
+    /// historically Latin-1 was conventional, modern editors emit
+    /// UTF-8. Stored as `Vec<u8>` so we don't fabricate a decoding.
+    pub text: Vec<u8>,
+}
+
+impl CueEvent {
+    /// Borrow the raw cue-point bytes.
+    pub fn text_bytes(&self) -> &[u8] {
+        &self.text
+    }
+
+    /// Lossy UTF-8 decode of the cue-point text. Invalid sequences are
+    /// replaced with `U+FFFD` (REPLACEMENT CHARACTER), so this never
+    /// fails. Callers that need a strict decoding should call
+    /// [`std::str::from_utf8`] on [`text_bytes`](Self::text_bytes)
+    /// themselves.
+    pub fn text_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.text)
+    }
+}
+
 impl SmfFile {
     /// Collect every [`MetaEvent::Tempo`] from every track, pinned to
     /// the absolute tick at which it fires, in time order.
@@ -701,7 +757,8 @@ impl SmfFile {
     /// general text events (`FF 01..=05, 07..=0F`) which carry
     /// copyright, track name, instrument name, lyric, cue point, and
     /// program name payloads — only `FF 06` is selected here. For
-    /// `FF 05` karaoke syllables see [`SmfFile::lyrics`].
+    /// `FF 05` karaoke syllables see [`SmfFile::lyrics`]; for `FF 07`
+    /// film-score sync points see [`SmfFile::cue_points`].
     ///
     /// Cost is linear in the total event count and bounded above by
     /// [`MAX_EVENTS_PER_FILE`].
@@ -758,7 +815,8 @@ impl SmfFile {
     /// - `FF 04` instrument name
     /// - `FF 06` marker — song-section labels (see
     ///   [`SmfFile::markers`])
-    /// - `FF 07` cue point — film-score sync markers
+    /// - `FF 07` cue point — film-score sync markers (see
+    ///   [`SmfFile::cue_points`])
     ///
     /// Only `FF 05` is selected here so callers iterating karaoke
     /// syllables don't have to discriminate themselves.
@@ -773,6 +831,68 @@ impl SmfFile {
                 abs = abs.saturating_add(ev.delta as u64);
                 if let Event::Meta(MetaEvent::Text { kind: 0x05, text }) = &ev.kind {
                     out.push(LyricEvent {
+                        tick: abs,
+                        track: track_idx,
+                        text: text.clone(),
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every cue-point meta event (`FF 07 len text`, surfaced
+    /// as [`MetaEvent::Text`] with `kind == 0x07`) from every track,
+    /// pinned to the absolute tick at which it fires, in time order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two cues at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::markers`] / [`SmfFile::lyrics`] /
+    /// [`SmfFile::tempo_map`] / [`SmfFile::time_signatures`] /
+    /// [`SmfFile::key_signatures`] and the scheduler use
+    /// (`scheduler.rs` §"merged event list, sorted by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries a cue-point meta
+    /// event. The spec does not bound how many cue points a file may
+    /// declare; the overall cap remains [`MAX_EVENTS_PER_FILE`] (the
+    /// same cap the parser enforces, applied across every event kind).
+    ///
+    /// Cue points are the film-score / theatrical sync convention
+    /// from the Standard MIDI File Specification 1.0 — each event
+    /// names an external action point (scene change, SFX trigger,
+    /// video cue, …). They are distinct from the neighbouring
+    /// text-meta kinds:
+    ///
+    /// - `FF 01` general text — free-form annotation
+    /// - `FF 02` copyright notice
+    /// - `FF 03` track name
+    /// - `FF 04` instrument name
+    /// - `FF 05` lyric — karaoke syllables (see [`SmfFile::lyrics`])
+    /// - `FF 06` marker — song-section labels (see
+    ///   [`SmfFile::markers`])
+    ///
+    /// Only `FF 07` is selected here so callers driving external
+    /// synchronisation don't have to discriminate themselves.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn cue_points(&self) -> Vec<CueEvent> {
+        let mut out: Vec<CueEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::Text { kind: 0x07, text }) = &ev.kind {
+                    out.push(CueEvent {
                         tick: abs,
                         track: track_idx,
                         text: text.clone(),
@@ -2533,5 +2653,199 @@ mod tests {
         let lossy = ly.text_lossy();
         assert!(lossy.contains('\u{FFFD}'));
         assert_eq!(ly.text_bytes(), &[0xFF, 0xFE]);
+    }
+
+    // ───────── CueEvent / SmfFile::cue_points ─────────
+
+    #[test]
+    fn cue_points_empty_when_no_meta_event_present() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.cue_points().is_empty());
+    }
+
+    #[test]
+    fn cue_points_single_event_at_tick_zero() {
+        // delta=0 FF 07 05 "Scene"
+        // delta=0 FF 2F 00
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x07, 0x05];
+        events.extend_from_slice(b"Scene");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let cp = smf.cue_points();
+        assert_eq!(cp.len(), 1);
+        assert_eq!(cp[0].tick, 0);
+        assert_eq!(cp[0].track, 0);
+        assert_eq!(cp[0].text_bytes(), b"Scene");
+        assert_eq!(cp[0].text_lossy(), "Scene");
+    }
+
+    #[test]
+    fn cue_points_multiple_within_one_track_are_in_order() {
+        // Film-score convention: a stream of named sync points.
+        // delta=0   FF 07 5 "Intro"
+        // delta=240 FF 07 5 "SceneA"  (relative-encoded len of 6)
+        // delta=240 FF 07 5 "SceneB"
+        // delta=0   FF 2F 00
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x07, 0x05]);
+        events.extend_from_slice(b"Intro");
+        events.extend_from_slice(&encode_vlq(240));
+        events.extend_from_slice(&[0xFF, 0x07, 0x06]);
+        events.extend_from_slice(b"SceneA");
+        events.extend_from_slice(&encode_vlq(240));
+        events.extend_from_slice(&[0xFF, 0x07, 0x06]);
+        events.extend_from_slice(b"SceneB");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let cp = smf.cue_points();
+        assert_eq!(cp.len(), 3);
+        assert_eq!(cp[0].tick, 0);
+        assert_eq!(cp[0].text_bytes(), b"Intro");
+        assert_eq!(cp[1].tick, 240);
+        assert_eq!(cp[1].text_bytes(), b"SceneA");
+        assert_eq!(cp[2].tick, 480);
+        assert_eq!(cp[2].text_bytes(), b"SceneB");
+    }
+
+    #[test]
+    fn cue_points_merge_across_tracks_sorted_by_tick() {
+        // track 0: delta=240 cue "A"
+        // track 1: delta=120 cue "B"; delta=240 cue "C"
+        // → A is at tick 240 on track 0; B at 120, C at 360 on track 1.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x07, 0x01]);
+        t0.extend_from_slice(b"A");
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(120));
+        t1.extend_from_slice(&[0xFF, 0x07, 0x01]);
+        t1.extend_from_slice(b"B");
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x07, 0x01]);
+        t1.extend_from_slice(b"C");
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let cp = smf.cue_points();
+        assert_eq!(cp.len(), 3);
+        assert_eq!(cp[0].tick, 120);
+        assert_eq!(cp[0].track, 1);
+        assert_eq!(cp[0].text_bytes(), b"B");
+        assert_eq!(cp[1].tick, 240);
+        assert_eq!(cp[1].track, 0);
+        assert_eq!(cp[1].text_bytes(), b"A");
+        assert_eq!(cp[2].tick, 360);
+        assert_eq!(cp[2].track, 1);
+        assert_eq!(cp[2].text_bytes(), b"C");
+    }
+
+    #[test]
+    fn cue_points_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        // Both tracks land a cue at tick 240. Stable sort keeps
+        // track 0 first (matches the scheduler's merge convention).
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x07, 0x04]);
+        t0.extend_from_slice(b"trk0");
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x07, 0x04]);
+        t1.extend_from_slice(b"trk1");
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let cp = smf.cue_points();
+        assert_eq!(cp.len(), 2);
+        assert_eq!(cp[0].tick, 240);
+        assert_eq!(cp[0].track, 0);
+        assert_eq!(cp[0].text_bytes(), b"trk0");
+        assert_eq!(cp[1].tick, 240);
+        assert_eq!(cp[1].track, 1);
+        assert_eq!(cp[1].text_bytes(), b"trk1");
+    }
+
+    #[test]
+    fn cue_points_filter_excludes_other_text_kinds() {
+        // FF 03 "Track1" (track name) + FF 06 "Mark" (marker) +
+        // FF 05 "syll" (lyric) + FF 07 "Cue!" (cue point). Only the
+        // cue point should land in SmfFile::cue_points().
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x03, 0x06];
+        events.extend_from_slice(b"Track1");
+        events.extend_from_slice(&[0x00, 0xFF, 0x06, 0x04]);
+        events.extend_from_slice(b"Mark");
+        events.extend_from_slice(&[0x00, 0xFF, 0x05, 0x04]);
+        events.extend_from_slice(b"syll");
+        events.extend_from_slice(&[0x00, 0xFF, 0x07, 0x04]);
+        events.extend_from_slice(b"Cue!");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let cp = smf.cue_points();
+        assert_eq!(cp.len(), 1);
+        assert_eq!(cp[0].text_bytes(), b"Cue!");
+        // And neither the marker nor the lyric should be polluted.
+        assert_eq!(smf.markers().len(), 1);
+        assert_eq!(smf.lyrics().len(), 1);
+    }
+
+    #[test]
+    fn cue_point_after_channel_events_tracks_absolute_tick() {
+        // Running-status note-ons interleaved with a delta-positioned
+        // cue — verifies absolute tick accounting matches the
+        // tempo/time/key/markers/lyrics helpers.
+        let mut events: Vec<u8> = Vec::new();
+        // tick 0 note-on key 60 vel 100
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        // delta=120 running-status note-on key 64 vel 80
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x40, 0x50]);
+        // delta=120 cue "go"
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0xFF, 0x07, 0x02]);
+        events.extend_from_slice(b"go");
+        // delta=0 EOT
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let cp = smf.cue_points();
+        assert_eq!(cp.len(), 1);
+        // 0 + 120 + 120 = 240
+        assert_eq!(cp[0].tick, 240);
+        assert_eq!(cp[0].text_bytes(), b"go");
+    }
+
+    #[test]
+    fn cue_point_text_lossy_replaces_invalid_utf8() {
+        // 0xFF 0xFE is not a valid UTF-8 sequence — text_lossy() must
+        // not panic and must surface U+FFFD substitutes.
+        let cp = CueEvent {
+            tick: 0,
+            track: 0,
+            text: vec![0xFF, 0xFE],
+        };
+        let lossy = cp.text_lossy();
+        assert!(lossy.contains('\u{FFFD}'));
+        assert_eq!(cp.text_bytes(), &[0xFF, 0xFE]);
     }
 }

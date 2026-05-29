@@ -75,6 +75,20 @@ framework but usable standalone.
   (encoding is spec-unspecified — historically Latin-1, modern
   files emit UTF-8), `text_lossy()` for a `Cow<str>` UTF-8 decode
   with `U+FFFD` substitutes for invalid sequences.
+  Round 186 adds the film-score sync companion
+  `SmfFile::cue_points()` — every `FF 07 len text` cue-point meta
+  event as a `CueEvent { tick, track, text }` with the absolute
+  tick on the parent track, stably merged across tracks (track 0
+  before track 1 at the same tick) under the same merge rule as
+  `markers()` / `lyrics()` / `tempo_map()` / `time_signatures()` /
+  `key_signatures()`. Only `FF 07` is selected so callers driving
+  external synchronisation (scene change, SFX trigger, video cue)
+  get a clean time-ordered list independent of the surrounding
+  `FF 03` track name / `FF 05` lyric / `FF 06` marker streams.
+  Same accessor shape as the marker and lyric helpers:
+  `CueEvent::text_bytes()` for the raw payload (encoding is
+  spec-unspecified), `text_lossy()` for a `Cow<str>` UTF-8 decode
+  with `U+FFFD` substitutes for invalid sequences.
 - `paths` — per-OS SoundFont/SFZ/DLS search paths plus the
   `OXIDEAV_SOUNDFONT_PATH` env-var override.
 - `instruments::sf2` — full SoundFont 2 RIFF reader and voice

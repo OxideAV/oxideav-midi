@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 186 — `SmfFile::cue_points()` iteration helper (`FF 07`)
+
+- New `smf::CueEvent { tick, track, text }` plus
+  `SmfFile::cue_points() -> Vec<CueEvent>`. Collects every cue-point
+  meta event (`FF 07 len text`, the Standard MIDI File 1.0
+  film-score / theatrical sync convention) from every track, pins
+  each one to the absolute tick of its parent track via cumulative
+  `TrackEvent::delta` sums, then merges the per-track sequences
+  with a stable sort by `tick` — track 0 wins over track 1 at the
+  same tick, matching the same merge rule used by
+  `SmfFile::markers()` / `SmfFile::lyrics()` /
+  `SmfFile::tempo_map()` / `SmfFile::time_signatures()` /
+  `SmfFile::key_signatures()` and by `scheduler.rs` §"merged event
+  list, sorted by absolute tick".
+- Only `FF 07` is selected. Other text-kind meta events
+  (`FF 01` general text, `FF 02` copyright, `FF 03` track name,
+  `FF 04` instrument name, `FF 05` lyric, `FF 06` marker, …) are
+  filtered out so callers driving external synchronisation (scene
+  change, SFX trigger, video cue) don't have to discriminate
+  themselves.
+- `CueEvent::text_bytes()` borrows the raw `text` payload unchanged
+  (the SMF spec leaves the encoding unspecified — historically
+  Latin-1, modern editors emit UTF-8). `text_lossy()` returns
+  `Cow<str>` using `String::from_utf8_lossy`, so invalid UTF-8
+  surfaces as `U+FFFD` replacement characters rather than panicking
+  — convenient default for callers that only need the human-readable
+  cue name.
+- Cost is linear in the total event count and bounded above by
+  the parser's existing `MAX_EVENTS_PER_FILE` cap; the helper does
+  not introduce a new allocation ceiling.
+- 8 new unit tests in `src/smf.rs::tests` cover: empty input,
+  single cue at tick 0, three-cue in-order sequence (the
+  Intro / SceneA / SceneB shape), multi-track merge order,
+  stable sort at the same tick, filtering against neighbouring
+  text kinds (`FF 03` track name, `FF 05` lyric, `FF 06` marker —
+  with a cross-check that the marker and lyric helpers stay
+  uncontaminated), absolute-tick accounting through running-status
+  channel events, and `text_lossy()` resilience against non-UTF-8
+  bytes. Brings the in-crate suite from 323 to 331 unit tests, all
+  passing under `cargo test -p oxideav-midi`.
+- Docstring cross-links: `SmfFile::markers()` and `SmfFile::lyrics()`
+  now point at `SmfFile::cue_points()` for the film-score sync
+  stream so callers searching either doc find the cue companion.
+
 ### Round 182 — `SmfFile::lyrics()` iteration helper (`FF 05`)
 
 - New `smf::LyricEvent { tick, track, text }` plus
