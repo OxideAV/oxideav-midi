@@ -488,6 +488,59 @@ impl MarkerEvent {
     }
 }
 
+/// One lyric meta event pinned to the absolute tick (relative to the
+/// start of its parent track) at which the
+/// [`FF 05 len text`](MetaEvent::Text) meta event fires.
+///
+/// Returned by [`SmfFile::lyrics`] — see that method for the merge
+/// semantics across multiple tracks.
+///
+/// Lyric meta events are the karaoke staple: each event carries one
+/// syllable (or fragment) of the song text, pinned to the tick at which
+/// the player should display it. The `.kar` convention layers a syllable
+/// stream onto an otherwise ordinary SMF; players render lyrics by
+/// walking the time-ordered list in step with playback.
+///
+/// The lyric text is preserved byte-for-byte from the SMF stream. The
+/// spec does not pin a character set, so callers that need a Rust
+/// string should call [`LyricEvent::text_lossy`] (UTF-8 with `U+FFFD`
+/// substitutes) or pick their own decoding strategy from the raw bytes
+/// returned by [`LyricEvent::text_bytes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LyricEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). The `.kar` convention places every lyric
+    /// on a single track (often track 1, named `"Words"` / `"Lyrics"`
+    /// via a preceding `FF 03` track-name meta event); format-2 files
+    /// keep them per-track.
+    pub track: usize,
+    /// Raw lyric text bytes (the `text` payload of `FF 05 len text`).
+    /// The SMF spec leaves the encoding unspecified — historically
+    /// Latin-1 was conventional, modern DAWs emit UTF-8. Stored as
+    /// `Vec<u8>` so we don't fabricate a decoding.
+    pub text: Vec<u8>,
+}
+
+impl LyricEvent {
+    /// Borrow the raw lyric bytes.
+    pub fn text_bytes(&self) -> &[u8] {
+        &self.text
+    }
+
+    /// Lossy UTF-8 decode of the lyric text. Invalid sequences are
+    /// replaced with `U+FFFD` (REPLACEMENT CHARACTER), so this never
+    /// fails. Callers that need a strict decoding should call
+    /// [`std::str::from_utf8`] on [`text_bytes`](Self::text_bytes)
+    /// themselves.
+    pub fn text_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.text)
+    }
+}
+
 impl SmfFile {
     /// Collect every [`MetaEvent::Tempo`] from every track, pinned to
     /// the absolute tick at which it fires, in time order.
@@ -647,7 +700,8 @@ impl SmfFile {
     /// (e.g. `"Verse"`, `"Chorus"`) and are distinct from the more
     /// general text events (`FF 01..=05, 07..=0F`) which carry
     /// copyright, track name, instrument name, lyric, cue point, and
-    /// program name payloads — only `FF 06` is selected here.
+    /// program name payloads — only `FF 06` is selected here. For
+    /// `FF 05` karaoke syllables see [`SmfFile::lyrics`].
     ///
     /// Cost is linear in the total event count and bounded above by
     /// [`MAX_EVENTS_PER_FILE`].
@@ -659,6 +713,66 @@ impl SmfFile {
                 abs = abs.saturating_add(ev.delta as u64);
                 if let Event::Meta(MetaEvent::Text { kind: 0x06, text }) = &ev.kind {
                     out.push(MarkerEvent {
+                        tick: abs,
+                        track: track_idx,
+                        text: text.clone(),
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every lyric meta event (`FF 05 len text`, surfaced as
+    /// [`MetaEvent::Text`] with `kind == 0x05`) from every track,
+    /// pinned to the absolute tick at which it fires, in time order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two lyrics at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::markers`] / [`SmfFile::tempo_map`]
+    /// / [`SmfFile::time_signatures`] / [`SmfFile::key_signatures`]
+    /// and the scheduler use (`scheduler.rs` §"merged event list,
+    /// sorted by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries a lyric meta
+    /// event. The spec does not bound how many lyrics a file may
+    /// declare; the overall cap remains [`MAX_EVENTS_PER_FILE`] (the
+    /// same cap the parser enforces, applied across every event kind).
+    ///
+    /// Lyrics are the karaoke (`.kar`) convention — one syllable
+    /// fragment per event, pinned to its display tick. They are
+    /// distinct from the neighbouring text events:
+    ///
+    /// - `FF 01` general text — free-form annotation
+    /// - `FF 02` copyright notice
+    /// - `FF 03` track name
+    /// - `FF 04` instrument name
+    /// - `FF 06` marker — song-section labels (see
+    ///   [`SmfFile::markers`])
+    /// - `FF 07` cue point — film-score sync markers
+    ///
+    /// Only `FF 05` is selected here so callers iterating karaoke
+    /// syllables don't have to discriminate themselves.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn lyrics(&self) -> Vec<LyricEvent> {
+        let mut out: Vec<LyricEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::Text { kind: 0x05, text }) = &ev.kind {
+                    out.push(LyricEvent {
                         tick: abs,
                         track: track_idx,
                         text: text.clone(),
@@ -2224,5 +2338,200 @@ mod tests {
         let lossy = mk.text_lossy();
         assert!(lossy.contains('\u{FFFD}'));
         assert_eq!(mk.text_bytes(), &[0xFF, 0xFE]);
+    }
+
+    // ───────── LyricEvent / SmfFile::lyrics ─────────
+
+    #[test]
+    fn lyrics_empty_when_no_meta_event_present() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.lyrics().is_empty());
+    }
+
+    #[test]
+    fn lyrics_single_event_at_tick_zero() {
+        // delta=0 FF 05 04 "love"
+        // delta=0 FF 2F 00
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x05, 0x04];
+        events.extend_from_slice(b"love");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ly = smf.lyrics();
+        assert_eq!(ly.len(), 1);
+        assert_eq!(ly[0].tick, 0);
+        assert_eq!(ly[0].track, 0);
+        assert_eq!(ly[0].text_bytes(), b"love");
+        assert_eq!(ly[0].text_lossy(), "love");
+    }
+
+    #[test]
+    fn lyrics_multiple_syllables_within_one_track_are_in_order() {
+        // .kar convention: one syllable per event, pinned per tick.
+        // delta=0   FF 05 4 "Twin"
+        // delta=120 FF 05 4 "kle "
+        // delta=120 FF 05 4 "twin"
+        // delta=120 FF 05 4 "kle "
+        // delta=0   FF 2F 00
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x05, 0x04]);
+        events.extend_from_slice(b"Twin");
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0xFF, 0x05, 0x04]);
+        events.extend_from_slice(b"kle ");
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0xFF, 0x05, 0x04]);
+        events.extend_from_slice(b"twin");
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0xFF, 0x05, 0x04]);
+        events.extend_from_slice(b"kle ");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ly = smf.lyrics();
+        assert_eq!(ly.len(), 4);
+        assert_eq!(ly[0].tick, 0);
+        assert_eq!(ly[0].text_bytes(), b"Twin");
+        assert_eq!(ly[1].tick, 120);
+        assert_eq!(ly[1].text_bytes(), b"kle ");
+        assert_eq!(ly[2].tick, 240);
+        assert_eq!(ly[2].text_bytes(), b"twin");
+        assert_eq!(ly[3].tick, 360);
+        assert_eq!(ly[3].text_bytes(), b"kle ");
+    }
+
+    #[test]
+    fn lyrics_merge_across_tracks_sorted_by_tick() {
+        // track 0: delta=240 lyric "A"
+        // track 1: delta=120 lyric "B"; delta=240 lyric "C"
+        // → A is at tick 240 on track 0; B at 120, C at 360 on track 1.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x05, 0x01]);
+        t0.extend_from_slice(b"A");
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(120));
+        t1.extend_from_slice(&[0xFF, 0x05, 0x01]);
+        t1.extend_from_slice(b"B");
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x05, 0x01]);
+        t1.extend_from_slice(b"C");
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let ly = smf.lyrics();
+        assert_eq!(ly.len(), 3);
+        assert_eq!(ly[0].tick, 120);
+        assert_eq!(ly[0].track, 1);
+        assert_eq!(ly[0].text_bytes(), b"B");
+        assert_eq!(ly[1].tick, 240);
+        assert_eq!(ly[1].track, 0);
+        assert_eq!(ly[1].text_bytes(), b"A");
+        assert_eq!(ly[2].tick, 360);
+        assert_eq!(ly[2].track, 1);
+        assert_eq!(ly[2].text_bytes(), b"C");
+    }
+
+    #[test]
+    fn lyrics_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        // Both tracks land a lyric at tick 240. Stable sort keeps
+        // track 0 first (matches the scheduler's merge convention).
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x05, 0x04]);
+        t0.extend_from_slice(b"trk0");
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x05, 0x04]);
+        t1.extend_from_slice(b"trk1");
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let ly = smf.lyrics();
+        assert_eq!(ly.len(), 2);
+        assert_eq!(ly[0].tick, 240);
+        assert_eq!(ly[0].track, 0);
+        assert_eq!(ly[0].text_bytes(), b"trk0");
+        assert_eq!(ly[1].tick, 240);
+        assert_eq!(ly[1].track, 1);
+        assert_eq!(ly[1].text_bytes(), b"trk1");
+    }
+
+    #[test]
+    fn lyrics_filter_excludes_other_text_kinds() {
+        // FF 03 "Track1" (track name) + FF 06 "Mark" (marker) + FF 05
+        // "syll" (lyric) — only the lyric should land in
+        // SmfFile::lyrics().
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x03, 0x06];
+        events.extend_from_slice(b"Track1");
+        events.extend_from_slice(&[0x00, 0xFF, 0x06, 0x04]);
+        events.extend_from_slice(b"Mark");
+        events.extend_from_slice(&[0x00, 0xFF, 0x05, 0x04]);
+        events.extend_from_slice(b"syll");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ly = smf.lyrics();
+        assert_eq!(ly.len(), 1);
+        assert_eq!(ly[0].text_bytes(), b"syll");
+    }
+
+    #[test]
+    fn lyric_after_channel_events_tracks_absolute_tick() {
+        // Running-status note-ons interleaved with delta-positioned
+        // lyrics — verifies absolute tick accounting matches the
+        // tempo/time/key/markers helpers.
+        let mut events: Vec<u8> = Vec::new();
+        // tick 0 note-on key 60 vel 100
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        // delta=120 running-status note-on key 64 vel 80
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x40, 0x50]);
+        // delta=120 lyric "la"
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0xFF, 0x05, 0x02]);
+        events.extend_from_slice(b"la");
+        // delta=0 EOT
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ly = smf.lyrics();
+        assert_eq!(ly.len(), 1);
+        // 0 + 120 + 120 = 240
+        assert_eq!(ly[0].tick, 240);
+        assert_eq!(ly[0].text_bytes(), b"la");
+    }
+
+    #[test]
+    fn lyric_text_lossy_replaces_invalid_utf8() {
+        // 0xFF 0xFE is not a valid UTF-8 sequence — text_lossy() must
+        // not panic and must surface U+FFFD substitutes.
+        let ly = LyricEvent {
+            tick: 0,
+            track: 0,
+            text: vec![0xFF, 0xFE],
+        };
+        let lossy = ly.text_lossy();
+        assert!(lossy.contains('\u{FFFD}'));
+        assert_eq!(ly.text_bytes(), &[0xFF, 0xFE]);
     }
 }

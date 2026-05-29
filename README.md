@@ -61,6 +61,20 @@ framework but usable standalone.
   leaves the encoding unspecified); `text_lossy()` returns a
   UTF-8-decoded `Cow<str>` with `U+FFFD` substitutes for invalid
   sequences so callers don't have to encode-detect themselves.
+  Round 182 adds the karaoke companion `SmfFile::lyrics()` —
+  every `FF 05 len text` lyric meta event as a
+  `LyricEvent { tick, track, text }` with the absolute tick on
+  the parent track, stably merged across tracks (track 0 before
+  track 1 at the same tick) under the same merge rule as
+  `markers()` / `tempo_map()` / `time_signatures()` /
+  `key_signatures()`. Only `FF 05` is selected so the `.kar`
+  syllable stream comes out as a clean time-ordered list,
+  independent of any surrounding `FF 03` track name / `FF 06`
+  marker / `FF 07` cue point events. Same accessor shape as the
+  marker helper: `LyricEvent::text_bytes()` for the raw payload
+  (encoding is spec-unspecified — historically Latin-1, modern
+  files emit UTF-8), `text_lossy()` for a `Cow<str>` UTF-8 decode
+  with `U+FFFD` substitutes for invalid sequences.
 - `paths` — per-OS SoundFont/SFZ/DLS search paths plus the
   `OXIDEAV_SOUNDFONT_PATH` env-var override.
 - `instruments::sf2` — full SoundFont 2 RIFF reader and voice
