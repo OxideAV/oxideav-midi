@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-midi/compare/v0.0.2...v0.0.3) - 2026-05-30
+
+### Other
+
+- SmfFile::track_names() iteration helper (FF 03)
+- SmfFile::cue_points() iteration helper (FF 07)
+- SmfFile::lyrics() iteration helper (FF 05)
+- SmfFile::markers() iteration helper (FF 06)
+- add cargo-fuzz harness over smf / sf2 / dls / sfz parsers (round 172)
+- fix parse_key integer overflow on huge octave magnitudes
+- add SmfFile::key_signatures() iteration helper
+- SmfFile::tempo_map() iteration helper (FF 51)
+- SmfFile::time_signatures() iteration helper (FF 58)
+
 ### Round 192 — `SmfFile::track_names()` iteration helper (`FF 03`)
 
 - New `smf::TrackNameEvent { tick, track, text }` plus
