@@ -89,6 +89,27 @@ framework but usable standalone.
   `CueEvent::text_bytes()` for the raw payload (encoding is
   spec-unspecified), `text_lossy()` for a `Cow<str>` UTF-8 decode
   with `U+FFFD` substitutes for invalid sequences.
+  Round 192 adds the DAW-track-list companion
+  `SmfFile::track_names()` — every `FF 03 len text` track-name meta
+  event as a `TrackNameEvent { tick, track, text }` with the
+  absolute tick on the parent track, stably merged across tracks
+  (track 0 before track 1 at the same tick) under the same merge
+  rule as `cue_points()` / `markers()` / `lyrics()` / `tempo_map()`
+  / `time_signatures()` / `key_signatures()`. Only `FF 03` is
+  selected so callers populating the DAW track list get a clean
+  per-track label stream independent of the surrounding `FF 01`
+  general text / `FF 02` copyright / `FF 04` instrument name /
+  `FF 05` lyric / `FF 06` marker / `FF 07` cue point events.
+  Authoring tools conventionally emit at most one `FF 03` per
+  track at tick 0 (on a format-0 file the single track's `FF 03`
+  is read as the sequence title); the helper surfaces every
+  occurrence so callers that only want the first name per track
+  can collect into a `HashMap<usize, TrackNameEvent>` keyed on
+  `TrackNameEvent::track`. Same accessor shape as the cue / marker
+  / lyric helpers: `TrackNameEvent::text_bytes()` for the raw
+  payload (encoding is spec-unspecified — historically Latin-1,
+  modern files emit UTF-8), `text_lossy()` for a `Cow<str>` UTF-8
+  decode with `U+FFFD` substitutes for invalid sequences.
 - `paths` — per-OS SoundFont/SFZ/DLS search paths plus the
   `OXIDEAV_SOUNDFONT_PATH` env-var override.
 - `instruments::sf2` — full SoundFont 2 RIFF reader and voice

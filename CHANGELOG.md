@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 192 — `SmfFile::track_names()` iteration helper (`FF 03`)
+
+- New `smf::TrackNameEvent { tick, track, text }` plus
+  `SmfFile::track_names() -> Vec<TrackNameEvent>`. Collects every
+  track-name meta event (`FF 03 len text`, the DAW-track-list
+  convention from the Standard MIDI File 1.0 specification) from
+  every track, pins each one to the absolute tick of its parent
+  track via cumulative `TrackEvent::delta` sums, then merges the
+  per-track sequences with a stable sort by `tick` — track 0 wins
+  over track 1 at the same tick, matching the same merge rule used
+  by `SmfFile::cue_points()` / `SmfFile::markers()` /
+  `SmfFile::lyrics()` / `SmfFile::tempo_map()` /
+  `SmfFile::time_signatures()` / `SmfFile::key_signatures()` and by
+  `scheduler.rs` §"merged event list, sorted by absolute tick".
+- Only `FF 03` is selected. Other text-kind meta events
+  (`FF 01` general text, `FF 02` copyright, `FF 04` instrument
+  name, `FF 05` lyric, `FF 06` marker, `FF 07` cue point) are
+  filtered out so callers populating a DAW track-list label don't
+  have to discriminate themselves.
+- Authoring tools conventionally emit at most one `FF 03` per track
+  at tick 0, but the spec does not constrain count or placement.
+  The helper surfaces every occurrence so callers that only want
+  the first name per track can collect into a
+  `HashMap<usize, TrackNameEvent>` keyed on `TrackNameEvent::track`,
+  while callers tracking renames over time read the full `Vec`. On
+  a format-0 file the single track's `FF 03` is conventionally read
+  as the sequence title.
+- `TrackNameEvent::text_bytes()` borrows the raw `text` payload
+  unchanged (the SMF spec leaves the encoding unspecified —
+  historically Latin-1, modern DAWs emit UTF-8). `text_lossy()`
+  returns `Cow<str>` using `String::from_utf8_lossy`, so invalid
+  UTF-8 surfaces as `U+FFFD` replacement characters rather than
+  panicking — convenient default for callers that only need the
+  human-readable track label.
+- Cost is linear in the total event count and bounded above by the
+  parser's existing `MAX_EVENTS_PER_FILE` cap; the helper does not
+  introduce a new allocation ceiling.
+- 6 new unit tests in `src/smf.rs::tests` cover: empty input,
+  single name at tick 0, per-track names on a format-1 two-track
+  file (`Drums` / `Bass`), two `FF 03` events on one track in time
+  order (`Intro` at tick 0, `Main` at tick 480), stable sort at the
+  same tick across two tracks, filtering against the full
+  text-meta neighbourhood (`FF 01` general text, `FF 02` copyright,
+  `FF 04` instrument name, `FF 05` lyric, `FF 06` marker, `FF 07`
+  cue — with cross-checks that the marker / lyric / cue helpers
+  stay uncontaminated), and `text_lossy()` resilience against
+  non-UTF-8 bytes. Brings the in-crate unit suite from 333 to 339
+  unit tests, all passing under `cargo test`.
+- Docstring cross-links: `SmfFile::lyrics()` and
+  `SmfFile::cue_points()` now point at `SmfFile::track_names` in
+  their "distinct from" enumerations, so the doc graph between the
+  six text-meta helpers stays bidirectionally connected.
+
 ### Round 186 — `SmfFile::cue_points()` iteration helper (`FF 07`)
 
 - New `smf::CueEvent { tick, track, text }` plus
