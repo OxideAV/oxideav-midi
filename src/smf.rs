@@ -610,7 +610,8 @@ impl CueEvent {
 /// track list; this helper isolates the `FF 03` stream so callers
 /// populating that label don't have to discriminate against the
 /// neighbouring text-meta kinds (free-form text, copyright, instrument
-/// name, lyric, marker, cue point).
+/// name [see [`SmfFile::instrument_names`]], lyric, marker, cue
+/// point).
 ///
 /// SMF authoring tools conventionally place at most one `FF 03` per
 /// track at tick 0, but the spec doesn't constrain count or placement;
@@ -654,6 +655,67 @@ impl TrackNameEvent {
     /// fails. Callers that need a strict decoding should call
     /// [`std::str::from_utf8`] on [`text_bytes`](Self::text_bytes)
     /// themselves.
+    pub fn text_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.text)
+    }
+}
+
+/// One instrument-name meta event pinned to the absolute tick (relative
+/// to the start of its parent track) at which the
+/// [`FF 04 len text`](MetaEvent::Text) meta event fires.
+///
+/// Returned by [`SmfFile::instrument_names`] — see that method for the
+/// merge semantics across multiple tracks.
+///
+/// `FF 04` declares the name of the *instrument* a track is targeting
+/// (e.g. `"Grand Piano"`, `"Drum Kit"`, `"Trumpet"`), as distinct from
+/// the *track* name (`FF 03`) which labels the track itself in the DAW
+/// track list. A single track may legally carry both — the track-list
+/// label and the instrument it is voicing. Authoring tools
+/// conventionally place the instrument name near the head of the track
+/// (often at tick 0, before the first note), but the spec doesn't
+/// constrain count or placement; this helper surfaces every occurrence
+/// so callers that only want the first per track can take `.next()` on
+/// the iterator while callers that want the full history can read the
+/// whole `Vec`.
+///
+/// The name text is preserved byte-for-byte from the SMF stream. The
+/// spec does not pin a character set, so callers that need a Rust
+/// string should call [`InstrumentNameEvent::text_lossy`] (UTF-8 with
+/// `U+FFFD` substitutes) or pick their own decoding strategy from the
+/// raw bytes returned by [`InstrumentNameEvent::text_bytes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstrumentNameEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase. Typically `0`
+    /// since instrument names conventionally land at the head of the
+    /// track, but the spec permits later placement (e.g. to label a
+    /// patch change mid-track).
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). On a format-1 file each music track that
+    /// targets a specific instrument usually carries its own `FF 04`;
+    /// the conductor / tempo track typically does not.
+    pub track: usize,
+    /// Raw instrument-name text bytes (the `text` payload of `FF 04
+    /// len text`). The SMF spec leaves the encoding unspecified —
+    /// historically Latin-1 was conventional, modern DAWs emit UTF-8.
+    /// Stored as `Vec<u8>` so we don't fabricate a decoding.
+    pub text: Vec<u8>,
+}
+
+impl InstrumentNameEvent {
+    /// Borrow the raw instrument-name bytes.
+    pub fn text_bytes(&self) -> &[u8] {
+        &self.text
+    }
+
+    /// Lossy UTF-8 decode of the instrument-name text. Invalid
+    /// sequences are replaced with `U+FFFD` (REPLACEMENT CHARACTER),
+    /// so this never fails. Callers that need a strict decoding should
+    /// call [`std::str::from_utf8`] on
+    /// [`text_bytes`](Self::text_bytes) themselves.
     pub fn text_lossy(&self) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(&self.text)
     }
@@ -819,7 +881,9 @@ impl SmfFile {
     /// general text events (`FF 01..=05, 07..=0F`) which carry
     /// copyright, track name, instrument name, lyric, cue point, and
     /// program name payloads — only `FF 06` is selected here. For
-    /// `FF 05` karaoke syllables see [`SmfFile::lyrics`]; for `FF 07`
+    /// `FF 03` track names see [`SmfFile::track_names`]; for `FF 04`
+    /// instrument names see [`SmfFile::instrument_names`]; for `FF 05`
+    /// karaoke syllables see [`SmfFile::lyrics`]; for `FF 07`
     /// film-score sync points see [`SmfFile::cue_points`].
     ///
     /// Cost is linear in the total event count and bounded above by
@@ -874,7 +938,7 @@ impl SmfFile {
     /// - `FF 01` general text — free-form annotation
     /// - `FF 02` copyright notice
     /// - `FF 03` track name (see [`SmfFile::track_names`])
-    /// - `FF 04` instrument name
+    /// - `FF 04` instrument name (see [`SmfFile::instrument_names`])
     /// - `FF 06` marker — song-section labels (see
     ///   [`SmfFile::markers`])
     /// - `FF 07` cue point — film-score sync markers (see
@@ -937,7 +1001,7 @@ impl SmfFile {
     /// - `FF 01` general text — free-form annotation
     /// - `FF 02` copyright notice
     /// - `FF 03` track name (see [`SmfFile::track_names`])
-    /// - `FF 04` instrument name
+    /// - `FF 04` instrument name (see [`SmfFile::instrument_names`])
     /// - `FF 05` lyric — karaoke syllables (see [`SmfFile::lyrics`])
     /// - `FF 06` marker — song-section labels (see
     ///   [`SmfFile::markers`])
@@ -999,7 +1063,7 @@ impl SmfFile {
     ///
     /// - `FF 01` general text — free-form annotation
     /// - `FF 02` copyright notice
-    /// - `FF 04` instrument name
+    /// - `FF 04` instrument name (see [`SmfFile::instrument_names`])
     /// - `FF 05` lyric — karaoke syllables (see [`SmfFile::lyrics`])
     /// - `FF 06` marker — song-section labels (see
     ///   [`SmfFile::markers`])
@@ -1023,6 +1087,79 @@ impl SmfFile {
                 abs = abs.saturating_add(ev.delta as u64);
                 if let Event::Meta(MetaEvent::Text { kind: 0x03, text }) = &ev.kind {
                     out.push(TrackNameEvent {
+                        tick: abs,
+                        track: track_idx,
+                        text: text.clone(),
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every instrument-name meta event (`FF 04 len text`,
+    /// surfaced as [`MetaEvent::Text`] with `kind == 0x04`) from every
+    /// track, pinned to the absolute tick at which it fires, in time
+    /// order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two names at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::track_names`] /
+    /// [`SmfFile::cue_points`] / [`SmfFile::markers`] /
+    /// [`SmfFile::lyrics`] / [`SmfFile::tempo_map`] /
+    /// [`SmfFile::time_signatures`] / [`SmfFile::key_signatures`] and
+    /// the scheduler use (`scheduler.rs` §"merged event list, sorted
+    /// by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries an instrument-name
+    /// meta event. The spec does not bound how many names a file may
+    /// declare; the overall cap remains [`MAX_EVENTS_PER_FILE`] (the
+    /// same cap the parser enforces, applied across every event kind).
+    ///
+    /// Instrument names label the *voice* a track is targeting (e.g.
+    /// `"Grand Piano"`, `"Drum Kit"`, `"Trumpet"`) and are distinct
+    /// from the *track* names (`FF 03`) that label the track itself in
+    /// the DAW track list. A single track may legally carry both; this
+    /// helper isolates the `FF 04` stream so callers populating
+    /// patch / preset metadata don't have to discriminate against the
+    /// neighbouring text-meta kinds:
+    ///
+    /// - `FF 01` general text — free-form annotation
+    /// - `FF 02` copyright notice
+    /// - `FF 03` track name (see [`SmfFile::track_names`])
+    /// - `FF 05` lyric — karaoke syllables (see [`SmfFile::lyrics`])
+    /// - `FF 06` marker — song-section labels (see
+    ///   [`SmfFile::markers`])
+    /// - `FF 07` cue point — film-score sync markers (see
+    ///   [`SmfFile::cue_points`])
+    ///
+    /// Only `FF 04` is selected here so callers populating per-track
+    /// instrument metadata get a clean per-track stream. Authoring
+    /// tools conventionally emit at most one `FF 04` per track at
+    /// tick 0 (often paired with an opening Program Change); callers
+    /// that only want the first name per track can collect into a
+    /// `HashMap<usize, InstrumentNameEvent>` keyed on
+    /// [`InstrumentNameEvent::track`].
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn instrument_names(&self) -> Vec<InstrumentNameEvent> {
+        let mut out: Vec<InstrumentNameEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::Text { kind: 0x04, text }) = &ev.kind {
+                    out.push(InstrumentNameEvent {
                         tick: abs,
                         track: track_idx,
                         text: text.clone(),
@@ -3165,5 +3302,254 @@ mod tests {
         let lossy = tn.text_lossy();
         assert!(lossy.contains('\u{FFFD}'));
         assert_eq!(tn.text_bytes(), &[0xFF, 0xFE]);
+    }
+
+    // ───────── InstrumentNameEvent / SmfFile::instrument_names ─────────
+
+    #[test]
+    fn instrument_names_empty_when_no_meta_event_present() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.instrument_names().is_empty());
+    }
+
+    #[test]
+    fn instrument_names_single_event_at_tick_zero() {
+        // delta=0 FF 04 0B "Grand Piano"
+        // delta=0 FF 2F 00
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x04, 0x0B];
+        events.extend_from_slice(b"Grand Piano");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let inst = smf.instrument_names();
+        assert_eq!(inst.len(), 1);
+        assert_eq!(inst[0].tick, 0);
+        assert_eq!(inst[0].track, 0);
+        assert_eq!(inst[0].text_bytes(), b"Grand Piano");
+        assert_eq!(inst[0].text_lossy(), "Grand Piano");
+    }
+
+    #[test]
+    fn instrument_names_per_track_in_format_1() {
+        // Format-1 convention: each music track that targets a
+        // specific instrument carries its own FF 04 at tick 0. The
+        // merge keeps track 0's name before track 1's.
+        let mut t0: Vec<u8> = vec![0x00, 0xFF, 0x04, 0x08];
+        t0.extend_from_slice(b"Drum Kit");
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = vec![0x00, 0xFF, 0x04, 0x07];
+        t1.extend_from_slice(b"Trumpet");
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let inst = smf.instrument_names();
+        assert_eq!(inst.len(), 2);
+        assert_eq!(inst[0].tick, 0);
+        assert_eq!(inst[0].track, 0);
+        assert_eq!(inst[0].text_bytes(), b"Drum Kit");
+        assert_eq!(inst[1].tick, 0);
+        assert_eq!(inst[1].track, 1);
+        assert_eq!(inst[1].text_bytes(), b"Trumpet");
+    }
+
+    #[test]
+    fn instrument_names_multiple_within_one_track_are_in_order() {
+        // The spec doesn't forbid multiple FF 04 on one track. We
+        // surface every occurrence in time order so callers that
+        // only want the first can take .next() on the iterator.
+        // delta=0   FF 04 5 "Piano"
+        // delta=480 FF 04 6 "Organ"
+        // delta=0   FF 2F 00
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x04, 0x05]);
+        events.extend_from_slice(b"Piano");
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0xFF, 0x04, 0x05]);
+        events.extend_from_slice(b"Organ");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let inst = smf.instrument_names();
+        assert_eq!(inst.len(), 2);
+        assert_eq!(inst[0].tick, 0);
+        assert_eq!(inst[0].text_bytes(), b"Piano");
+        assert_eq!(inst[1].tick, 480);
+        assert_eq!(inst[1].text_bytes(), b"Organ");
+    }
+
+    #[test]
+    fn instrument_names_merge_across_tracks_sorted_by_tick() {
+        // track 0: delta=240 FF 04 "A"
+        // track 1: delta=120 FF 04 "B"; delta=240 FF 04 "C"
+        // → A is at tick 240 on track 0; B at 120, C at 360 on track 1.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x04, 0x01]);
+        t0.extend_from_slice(b"A");
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(120));
+        t1.extend_from_slice(&[0xFF, 0x04, 0x01]);
+        t1.extend_from_slice(b"B");
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x04, 0x01]);
+        t1.extend_from_slice(b"C");
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let inst = smf.instrument_names();
+        assert_eq!(inst.len(), 3);
+        assert_eq!(inst[0].tick, 120);
+        assert_eq!(inst[0].track, 1);
+        assert_eq!(inst[0].text_bytes(), b"B");
+        assert_eq!(inst[1].tick, 240);
+        assert_eq!(inst[1].track, 0);
+        assert_eq!(inst[1].text_bytes(), b"A");
+        assert_eq!(inst[2].tick, 360);
+        assert_eq!(inst[2].track, 1);
+        assert_eq!(inst[2].text_bytes(), b"C");
+    }
+
+    #[test]
+    fn instrument_names_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        // Both tracks land an FF 04 at tick 240. Stable sort keeps
+        // track 0 first (matches the scheduler's merge convention).
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x04, 0x04]);
+        t0.extend_from_slice(b"trk0");
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x04, 0x04]);
+        t1.extend_from_slice(b"trk1");
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let inst = smf.instrument_names();
+        assert_eq!(inst.len(), 2);
+        assert_eq!(inst[0].tick, 240);
+        assert_eq!(inst[0].track, 0);
+        assert_eq!(inst[0].text_bytes(), b"trk0");
+        assert_eq!(inst[1].tick, 240);
+        assert_eq!(inst[1].track, 1);
+        assert_eq!(inst[1].text_bytes(), b"trk1");
+    }
+
+    #[test]
+    fn instrument_names_filter_excludes_other_text_kinds() {
+        // FF 01 "Note" (general text) + FF 02 "(c)26" (copyright) +
+        // FF 03 "Lead" (track name) + FF 04 "Piano" (instrument) +
+        // FF 05 "la" (lyric) + FF 06 "Verse" (marker) +
+        // FF 07 "Sync" (cue). Only the instrument name lands here.
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x01, 0x04];
+        events.extend_from_slice(b"Note");
+        events.extend_from_slice(&[0x00, 0xFF, 0x02, 0x05]);
+        events.extend_from_slice(b"(c)26");
+        events.extend_from_slice(&[0x00, 0xFF, 0x03, 0x04]);
+        events.extend_from_slice(b"Lead");
+        events.extend_from_slice(&[0x00, 0xFF, 0x04, 0x05]);
+        events.extend_from_slice(b"Piano");
+        events.extend_from_slice(&[0x00, 0xFF, 0x05, 0x02]);
+        events.extend_from_slice(b"la");
+        events.extend_from_slice(&[0x00, 0xFF, 0x06, 0x05]);
+        events.extend_from_slice(b"Verse");
+        events.extend_from_slice(&[0x00, 0xFF, 0x07, 0x04]);
+        events.extend_from_slice(b"Sync");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let inst = smf.instrument_names();
+        assert_eq!(inst.len(), 1);
+        assert_eq!(inst[0].text_bytes(), b"Piano");
+        // The sibling helpers must not pick up the instrument-name
+        // event either.
+        assert_eq!(smf.track_names().len(), 1);
+        assert_eq!(smf.markers().len(), 1);
+        assert_eq!(smf.lyrics().len(), 1);
+        assert_eq!(smf.cue_points().len(), 1);
+    }
+
+    #[test]
+    fn instrument_name_after_channel_events_tracks_absolute_tick() {
+        // Running-status note-ons followed by a late-positioned
+        // FF 04 — verifies absolute tick accounting matches the
+        // tempo/time/key/markers/lyrics/cue_points/track_names
+        // helpers. The spec permits FF 04 anywhere in the track.
+        let mut events: Vec<u8> = Vec::new();
+        // tick 0 note-on key 60 vel 100
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        // delta=120 running-status note-on key 64 vel 80
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x40, 0x50]);
+        // delta=120 FF 04 04 "harp"
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0xFF, 0x04, 0x04]);
+        events.extend_from_slice(b"harp");
+        // delta=0 EOT
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let inst = smf.instrument_names();
+        assert_eq!(inst.len(), 1);
+        // 0 + 120 + 120 = 240
+        assert_eq!(inst[0].tick, 240);
+        assert_eq!(inst[0].text_bytes(), b"harp");
+    }
+
+    #[test]
+    fn instrument_name_coexists_with_track_name_on_same_track() {
+        // A track may legally carry both FF 03 (track-list label) and
+        // FF 04 (voice/instrument name). The two helpers must surface
+        // them independently — neither shall be polluted by the other.
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x03, 0x04];
+        events.extend_from_slice(b"Lead");
+        events.extend_from_slice(&[0x00, 0xFF, 0x04, 0x05]);
+        events.extend_from_slice(b"Piano");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let tn = smf.track_names();
+        let inst = smf.instrument_names();
+        assert_eq!(tn.len(), 1);
+        assert_eq!(tn[0].text_bytes(), b"Lead");
+        assert_eq!(inst.len(), 1);
+        assert_eq!(inst[0].text_bytes(), b"Piano");
+    }
+
+    #[test]
+    fn instrument_name_text_lossy_replaces_invalid_utf8() {
+        // 0xFF 0xFE is not a valid UTF-8 sequence — text_lossy() must
+        // not panic and must surface U+FFFD substitutes.
+        let inst = InstrumentNameEvent {
+            tick: 0,
+            track: 0,
+            text: vec![0xFF, 0xFE],
+        };
+        let lossy = inst.text_lossy();
+        assert!(lossy.contains('\u{FFFD}'));
+        assert_eq!(inst.text_bytes(), &[0xFF, 0xFE]);
     }
 }

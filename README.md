@@ -110,6 +110,24 @@ framework but usable standalone.
   payload (encoding is spec-unspecified — historically Latin-1,
   modern files emit UTF-8), `text_lossy()` for a `Cow<str>` UTF-8
   decode with `U+FFFD` substitutes for invalid sequences.
+  Round 196 adds the voice/patch companion
+  `SmfFile::instrument_names()` — every `FF 04 len text`
+  instrument-name meta event as an `InstrumentNameEvent { tick,
+  track, text }`, distinct from the `FF 03` track-list label so a
+  single track may legally carry both. Pinned to the absolute tick
+  on the parent track, stably merged across tracks (track 0 before
+  track 1 at the same tick) under the same merge rule as the other
+  seven text-meta helpers; only `FF 04` is selected so callers
+  populating per-track patch / preset metadata get a clean
+  per-track instrument stream independent of the surrounding
+  `FF 01` general text / `FF 02` copyright / `FF 03` track name /
+  `FF 05` lyric / `FF 06` marker / `FF 07` cue point events. Lifts
+  the family from 7 to 8 helpers
+  (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
+  lyrics,cue_points,track_names,instrument_names}`). Same accessor
+  shape as the others: `InstrumentNameEvent::text_bytes()` for the
+  raw payload, `text_lossy()` for a `Cow<str>` UTF-8 decode with
+  `U+FFFD` substitutes for invalid sequences.
 - `paths` — per-OS SoundFont/SFZ/DLS search paths plus the
   `OXIDEAV_SOUNDFONT_PATH` env-var override.
 - `instruments::sf2` — full SoundFont 2 RIFF reader and voice

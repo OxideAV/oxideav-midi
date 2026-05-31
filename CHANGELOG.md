@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 196 — `SmfFile::instrument_names()` iteration helper (`FF 04`)
+
+- New `smf::InstrumentNameEvent { tick, track, text }` plus
+  `SmfFile::instrument_names() -> Vec<InstrumentNameEvent>`. Collects
+  every instrument-name meta event (`FF 04 len text`, the per-track
+  voice / patch label distinct from the `FF 03` track-list label) from
+  every track, pins each one to the absolute tick of its parent track
+  via cumulative `TrackEvent::delta` sums, then merges the per-track
+  sequences with a stable sort by `tick` — track 0 wins over track 1
+  at the same tick, matching the same merge rule used by
+  `SmfFile::track_names()` / `cue_points()` / `markers()` / `lyrics()`
+  / `tempo_map()` / `time_signatures()` / `key_signatures()` and by
+  `scheduler.rs` §"merged event list, sorted by absolute tick".
+- Only `FF 04` is selected. The other text-kind meta events
+  (`FF 01` general text, `FF 02` copyright, `FF 03` track name,
+  `FF 05` lyric, `FF 06` marker, `FF 07` cue point) are filtered out
+  so callers populating per-track instrument metadata get a clean
+  per-track stream without having to discriminate themselves. A
+  dedicated round-trip test asserts that a single track may legally
+  carry both `FF 03` and `FF 04` and that the two helpers surface
+  them independently.
+- Lifts the SMF text-meta iterator family from 7 to 8 helpers
+  (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
+  lyrics,cue_points,track_names,instrument_names}`).
+- Same accessor shape as the other six text-meta helpers:
+  `InstrumentNameEvent::text_bytes()` for the raw payload (encoding
+  is spec-unspecified — historically Latin-1, modern files emit
+  UTF-8), `text_lossy()` for a `Cow<str>` UTF-8 decode with `U+FFFD`
+  substitutes for invalid sequences.
+- 10 dedicated tests: empty, single event, per-track in format-1,
+  multiple within one track, multi-track merge sorted by tick, stable
+  sort track-0-before-track-1 at same tick, filter excludes other
+  text kinds (including a sanity check that the sibling helpers stay
+  uncontaminated), absolute-tick accounting through running-status
+  channel events, coexistence with `FF 03` on the same track, and
+  `text_lossy()` invalid-UTF-8 substitution.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-midi/compare/v0.0.2...v0.0.3) - 2026-05-30
 
 ### Other
