@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 202 — `SmfFile::texts()` + `SmfFile::copyrights()` iteration helpers (`FF 01` + `FF 02`)
+
+- New `smf::TextEvent { tick, track, text }` plus
+  `SmfFile::texts() -> Vec<TextEvent>`. Collects every free-form /
+  general text meta event (`FF 01 len text`, the catch-all annotation
+  kind used for production notes, "do not edit", version stamps,
+  mix-engineer comments, …) from every track, pins each one to the
+  absolute tick of its parent track via cumulative
+  `TrackEvent::delta` sums, then merges the per-track sequences with
+  a stable sort by `tick` — track 0 wins over track 1 at the same
+  tick, matching the same merge rule used by the seven existing
+  text-meta helpers (`markers` / `lyrics` / `cue_points` /
+  `track_names` / `instrument_names`) and the rhythmic helpers
+  (`tempo_map` / `time_signatures` / `key_signatures`) and by
+  `scheduler.rs` §"merged event list, sorted by absolute tick".
+- New `smf::CopyrightEvent { tick, track, text }` plus
+  `SmfFile::copyrights() -> Vec<CopyrightEvent>`. Collects every
+  copyright-notice meta event (`FF 02 len text`) from every track
+  under the same merge rule. The SMF specification recommends
+  placing the notice on the first track at tick 0 so players can
+  surface authorship without scanning the whole file; this helper
+  surfaces every occurrence in time order regardless, so callers
+  that only want the first notice can take `.next()` on the
+  iterator while callers that want the full history can read the
+  whole `Vec`.
+- Only `FF 01` / `FF 02` are selected by their respective helpers.
+  The five sibling text-kind meta events (`FF 03` track name,
+  `FF 04` instrument name, `FF 05` lyric, `FF 06` marker, `FF 07`
+  cue point) are filtered out so callers populating the relevant
+  metadata get a clean per-track stream without having to
+  discriminate themselves. A dedicated round-trip test asserts
+  that a single track may legally carry both `FF 01` and `FF 02`
+  and that the two helpers surface them independently — and the
+  cross-kind filter tests now assert that all seven text-meta
+  helpers stay uncontaminated when every text-kind event is
+  present.
+- Lifts the SMF text-meta iterator family from 8 to **10**
+  helpers (`SmfFile::{tempo_map,time_signatures,key_signatures,
+  markers,lyrics,cue_points,track_names,instrument_names,texts,
+  copyrights}`), covering every `FF 01..=07` text-flavour meta
+  event the spec defines.
+- Same accessor shape as the other eight text-meta helpers:
+  `TextEvent::text_bytes()` / `CopyrightEvent::text_bytes()` for
+  the raw payload (encoding is spec-unspecified — historically
+  Latin-1, modern files emit UTF-8), `text_lossy()` for a
+  `Cow<str>` UTF-8 decode with `U+FFFD` substitutes for invalid
+  sequences.
+- 19 new dedicated tests (10 for `texts()`, 9 for `copyrights()`):
+  empty, single event, multiple within one track, multi-track
+  merge sorted by tick, stable sort track-0-before-track-1 at
+  same tick, filter excludes other text kinds (with sibling-
+  helper uncontamination check), absolute-tick accounting
+  through running-status channel events, `text_lossy()`
+  invalid-UTF-8 substitution, and a cross-kind coexistence test
+  proving `FF 01` and `FF 02` on the same track surface
+  independently.
+
 ### Round 196 — `SmfFile::instrument_names()` iteration helper (`FF 04`)
 
 - New `smf::InstrumentNameEvent { tick, track, text }` plus

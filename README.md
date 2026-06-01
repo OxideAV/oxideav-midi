@@ -128,6 +128,27 @@ framework but usable standalone.
   shape as the others: `InstrumentNameEvent::text_bytes()` for the
   raw payload, `text_lossy()` for a `Cow<str>` UTF-8 decode with
   `U+FFFD` substitutes for invalid sequences.
+  Round 202 closes the text-meta family with two more helpers:
+  `SmfFile::texts()` (`FF 01` general / free-form text) and
+  `SmfFile::copyrights()` (`FF 02` copyright notice), each surfacing
+  the matching event kind as a `TextEvent` / `CopyrightEvent
+  { tick, track, text }` value pinned to the absolute tick on the
+  parent track and stably merged across tracks under the same
+  track-0-before-track-1-at-the-same-tick rule as the prior six
+  text-meta helpers and the scheduler. `FF 01` is the catch-all
+  annotation kind (production notes, "do not edit", version
+  stamps); `FF 02` declares the sequence's copyright notice (the
+  SMF specification recommends placing it on the first track at
+  tick 0 but the helper surfaces every occurrence in time order).
+  Same accessor shape as the rest of the family:
+  `TextEvent::text_bytes()` / `CopyrightEvent::text_bytes()` for
+  the raw payload (encoding is spec-unspecified), `text_lossy()`
+  for a `Cow<str>` UTF-8 decode with `U+FFFD` substitutes for
+  invalid sequences. Lifts the family from 8 to **10** helpers
+  (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
+  lyrics,cue_points,track_names,instrument_names,texts,copyrights}`
+  ), covering every `FF 01..=07` text-flavour meta event the spec
+  defines.
 - `paths` — per-OS SoundFont/SFZ/DLS search paths plus the
   `OXIDEAV_SOUNDFONT_PATH` env-var override.
 - `instruments::sf2` — full SoundFont 2 RIFF reader and voice

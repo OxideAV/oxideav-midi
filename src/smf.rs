@@ -721,6 +721,119 @@ impl InstrumentNameEvent {
     }
 }
 
+/// One free-form text meta event pinned to the absolute tick (relative
+/// to the start of its parent track) at which the
+/// [`FF 01 len text`](MetaEvent::Text) meta event fires.
+///
+/// Returned by [`SmfFile::texts`] — see that method for the merge
+/// semantics across multiple tracks.
+///
+/// `FF 01` is the generic / free-form text meta event: a catch-all for
+/// annotations that don't fit one of the more specific text-meta kinds
+/// (`FF 02` copyright, `FF 03` track name, `FF 04` instrument name,
+/// `FF 05` lyric, `FF 06` marker, `FF 07` cue point). Authoring tools
+/// emit it for production notes, mix-engineer comments, "do not edit",
+/// version stamps, and anything else the editor wants to keep next to
+/// the music without it being recognised as one of the structured kinds.
+/// This helper isolates the `FF 01` stream so callers reading annotation
+/// text don't have to discriminate against the neighbouring text-meta
+/// kinds.
+///
+/// The text is preserved byte-for-byte from the SMF stream. The spec
+/// does not pin a character set, so callers that need a Rust string
+/// should call [`TextEvent::text_lossy`] (UTF-8 with `U+FFFD`
+/// substitutes) or pick their own decoding strategy from the raw bytes
+/// returned by [`TextEvent::text_bytes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). Authoring tools may place free-form text
+    /// on any track; format-1 files frequently keep production
+    /// annotations on the conductor track.
+    pub track: usize,
+    /// Raw text bytes (the `text` payload of `FF 01 len text`). The
+    /// SMF spec leaves the encoding unspecified — historically Latin-1
+    /// was conventional, modern DAWs emit UTF-8. Stored as `Vec<u8>`
+    /// so we don't fabricate a decoding.
+    pub text: Vec<u8>,
+}
+
+impl TextEvent {
+    /// Borrow the raw text bytes.
+    pub fn text_bytes(&self) -> &[u8] {
+        &self.text
+    }
+
+    /// Lossy UTF-8 decode of the free-form text. Invalid sequences are
+    /// replaced with `U+FFFD` (REPLACEMENT CHARACTER), so this never
+    /// fails. Callers that need a strict decoding should call
+    /// [`std::str::from_utf8`] on [`text_bytes`](Self::text_bytes)
+    /// themselves.
+    pub fn text_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.text)
+    }
+}
+
+/// One copyright-notice meta event pinned to the absolute tick (relative
+/// to the start of its parent track) at which the
+/// [`FF 02 len text`](MetaEvent::Text) meta event fires.
+///
+/// Returned by [`SmfFile::copyrights`] — see that method for the merge
+/// semantics across multiple tracks.
+///
+/// `FF 02` declares a copyright notice for the sequence. The original
+/// Standard MIDI File Specification 1.0 recommends placing it at the
+/// head of the first track (tick 0) so a player can surface authorship
+/// without scanning the whole file. The spec does not forbid multiple
+/// occurrences or later placement, so this helper surfaces every
+/// occurrence in time order; callers that only want the first notice
+/// can take `.next()` on the iterator.
+///
+/// The notice text is preserved byte-for-byte from the SMF stream. The
+/// spec does not pin a character set, so callers that need a Rust
+/// string should call [`CopyrightEvent::text_lossy`] (UTF-8 with
+/// `U+FFFD` substitutes) or pick their own decoding strategy from the
+/// raw bytes returned by [`CopyrightEvent::text_bytes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyrightEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase. Typically `0`
+    /// since copyright notices conventionally land at the head of the
+    /// first track, but the spec permits later placement.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). The SMF specification recommends placing
+    /// the copyright on the first track; this helper surfaces the
+    /// notice wherever it actually appears.
+    pub track: usize,
+    /// Raw copyright text bytes (the `text` payload of `FF 02 len
+    /// text`). The SMF spec leaves the encoding unspecified —
+    /// historically Latin-1 was conventional, modern DAWs emit UTF-8.
+    /// Stored as `Vec<u8>` so we don't fabricate a decoding.
+    pub text: Vec<u8>,
+}
+
+impl CopyrightEvent {
+    /// Borrow the raw copyright bytes.
+    pub fn text_bytes(&self) -> &[u8] {
+        &self.text
+    }
+
+    /// Lossy UTF-8 decode of the copyright text. Invalid sequences are
+    /// replaced with `U+FFFD` (REPLACEMENT CHARACTER), so this never
+    /// fails. Callers that need a strict decoding should call
+    /// [`std::str::from_utf8`] on [`text_bytes`](Self::text_bytes)
+    /// themselves.
+    pub fn text_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.text)
+    }
+}
+
 impl SmfFile {
     /// Collect every [`MetaEvent::Tempo`] from every track, pinned to
     /// the absolute tick at which it fires, in time order.
@@ -1115,7 +1228,8 @@ impl SmfFile {
     /// before track 1's at the same tick. This matches the same
     /// stable-merge rule [`SmfFile::track_names`] /
     /// [`SmfFile::cue_points`] / [`SmfFile::markers`] /
-    /// [`SmfFile::lyrics`] / [`SmfFile::tempo_map`] /
+    /// [`SmfFile::lyrics`] / [`SmfFile::texts`] /
+    /// [`SmfFile::copyrights`] / [`SmfFile::tempo_map`] /
     /// [`SmfFile::time_signatures`] / [`SmfFile::key_signatures`] and
     /// the scheduler use (`scheduler.rs` §"merged event list, sorted
     /// by absolute tick").
@@ -1133,8 +1247,8 @@ impl SmfFile {
     /// patch / preset metadata don't have to discriminate against the
     /// neighbouring text-meta kinds:
     ///
-    /// - `FF 01` general text — free-form annotation
-    /// - `FF 02` copyright notice
+    /// - `FF 01` general text (see [`SmfFile::texts`])
+    /// - `FF 02` copyright notice (see [`SmfFile::copyrights`])
     /// - `FF 03` track name (see [`SmfFile::track_names`])
     /// - `FF 05` lyric — karaoke syllables (see [`SmfFile::lyrics`])
     /// - `FF 06` marker — song-section labels (see
@@ -1160,6 +1274,143 @@ impl SmfFile {
                 abs = abs.saturating_add(ev.delta as u64);
                 if let Event::Meta(MetaEvent::Text { kind: 0x04, text }) = &ev.kind {
                     out.push(InstrumentNameEvent {
+                        tick: abs,
+                        track: track_idx,
+                        text: text.clone(),
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every free-form text meta event (`FF 01 len text`,
+    /// surfaced as [`MetaEvent::Text`] with `kind == 0x01`) from every
+    /// track, pinned to the absolute tick at which it fires, in time
+    /// order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two annotations at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::copyrights`] /
+    /// [`SmfFile::track_names`] / [`SmfFile::instrument_names`] /
+    /// [`SmfFile::cue_points`] / [`SmfFile::markers`] /
+    /// [`SmfFile::lyrics`] / [`SmfFile::tempo_map`] /
+    /// [`SmfFile::time_signatures`] / [`SmfFile::key_signatures`] and
+    /// the scheduler use (`scheduler.rs` §"merged event list, sorted
+    /// by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries a free-form text
+    /// meta event. The spec does not bound how many annotations a file
+    /// may declare; the overall cap remains [`MAX_EVENTS_PER_FILE`]
+    /// (the same cap the parser enforces, applied across every event
+    /// kind).
+    ///
+    /// `FF 01` is the generic / free-form text meta event — production
+    /// notes, mix-engineer comments, "do not edit", version stamps,
+    /// anything that doesn't fit one of the more specific text-meta
+    /// kinds. It is distinct from the neighbouring text-meta kinds:
+    ///
+    /// - `FF 02` copyright notice (see [`SmfFile::copyrights`])
+    /// - `FF 03` track name (see [`SmfFile::track_names`])
+    /// - `FF 04` instrument name (see [`SmfFile::instrument_names`])
+    /// - `FF 05` lyric — karaoke syllables (see [`SmfFile::lyrics`])
+    /// - `FF 06` marker — song-section labels (see
+    ///   [`SmfFile::markers`])
+    /// - `FF 07` cue point — film-score sync markers (see
+    ///   [`SmfFile::cue_points`])
+    ///
+    /// Only `FF 01` is selected here so callers reading annotations
+    /// don't have to discriminate themselves.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn texts(&self) -> Vec<TextEvent> {
+        let mut out: Vec<TextEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::Text { kind: 0x01, text }) = &ev.kind {
+                    out.push(TextEvent {
+                        tick: abs,
+                        track: track_idx,
+                        text: text.clone(),
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every copyright-notice meta event (`FF 02 len text`,
+    /// surfaced as [`MetaEvent::Text`] with `kind == 0x02`) from every
+    /// track, pinned to the absolute tick at which it fires, in time
+    /// order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two notices at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::texts`] / [`SmfFile::track_names`]
+    /// / [`SmfFile::instrument_names`] / [`SmfFile::cue_points`] /
+    /// [`SmfFile::markers`] / [`SmfFile::lyrics`] /
+    /// [`SmfFile::tempo_map`] / [`SmfFile::time_signatures`] /
+    /// [`SmfFile::key_signatures`] and the scheduler use
+    /// (`scheduler.rs` §"merged event list, sorted by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries a copyright-notice
+    /// meta event. The spec does not bound how many notices a file may
+    /// declare; the overall cap remains [`MAX_EVENTS_PER_FILE`] (the
+    /// same cap the parser enforces, applied across every event kind).
+    ///
+    /// `FF 02` declares a copyright notice for the sequence. The SMF
+    /// specification recommends placing it on the first track at
+    /// tick 0 so players can surface authorship without scanning the
+    /// full file; this helper surfaces every occurrence in time order
+    /// regardless. It is distinct from the neighbouring text-meta
+    /// kinds:
+    ///
+    /// - `FF 01` general text (see [`SmfFile::texts`])
+    /// - `FF 03` track name (see [`SmfFile::track_names`])
+    /// - `FF 04` instrument name (see [`SmfFile::instrument_names`])
+    /// - `FF 05` lyric — karaoke syllables (see [`SmfFile::lyrics`])
+    /// - `FF 06` marker — song-section labels (see
+    ///   [`SmfFile::markers`])
+    /// - `FF 07` cue point — film-score sync markers (see
+    ///   [`SmfFile::cue_points`])
+    ///
+    /// Only `FF 02` is selected here so callers populating
+    /// authorship metadata don't have to discriminate themselves.
+    /// Callers that only want the first notice can take `.next()` on
+    /// the iterator; callers that want the full history can read the
+    /// whole `Vec`.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn copyrights(&self) -> Vec<CopyrightEvent> {
+        let mut out: Vec<CopyrightEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::Text { kind: 0x02, text }) = &ev.kind {
+                    out.push(CopyrightEvent {
                         tick: abs,
                         track: track_idx,
                         text: text.clone(),
@@ -3551,5 +3802,385 @@ mod tests {
         let lossy = inst.text_lossy();
         assert!(lossy.contains('\u{FFFD}'));
         assert_eq!(inst.text_bytes(), &[0xFF, 0xFE]);
+    }
+
+    // ───────── TextEvent / SmfFile::texts (FF 01) ─────────
+
+    #[test]
+    fn texts_empty_when_no_meta_event_present() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.texts().is_empty());
+    }
+
+    #[test]
+    fn texts_single_event_at_tick_zero() {
+        // delta=0 FF 01 0B "do not edit"
+        // delta=0 FF 2F 00
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x01, 0x0B];
+        events.extend_from_slice(b"do not edit");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let tx = smf.texts();
+        assert_eq!(tx.len(), 1);
+        assert_eq!(tx[0].tick, 0);
+        assert_eq!(tx[0].track, 0);
+        assert_eq!(tx[0].text_bytes(), b"do not edit");
+        assert_eq!(tx[0].text_lossy(), "do not edit");
+    }
+
+    #[test]
+    fn texts_multiple_within_one_track_are_in_order() {
+        // delta=0   FF 01 4 "head"
+        // delta=480 FF 01 4 "mid1"
+        // delta=0   FF 2F 00
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x01, 0x04]);
+        events.extend_from_slice(b"head");
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0xFF, 0x01, 0x04]);
+        events.extend_from_slice(b"mid1");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let tx = smf.texts();
+        assert_eq!(tx.len(), 2);
+        assert_eq!(tx[0].tick, 0);
+        assert_eq!(tx[0].text_bytes(), b"head");
+        assert_eq!(tx[1].tick, 480);
+        assert_eq!(tx[1].text_bytes(), b"mid1");
+    }
+
+    #[test]
+    fn texts_merge_across_tracks_sorted_by_tick() {
+        // track 0: delta=240 FF 01 "A"
+        // track 1: delta=120 FF 01 "B"; delta=240 FF 01 "C"
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x01, 0x01]);
+        t0.extend_from_slice(b"A");
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(120));
+        t1.extend_from_slice(&[0xFF, 0x01, 0x01]);
+        t1.extend_from_slice(b"B");
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x01, 0x01]);
+        t1.extend_from_slice(b"C");
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let tx = smf.texts();
+        assert_eq!(tx.len(), 3);
+        assert_eq!(tx[0].tick, 120);
+        assert_eq!(tx[0].track, 1);
+        assert_eq!(tx[0].text_bytes(), b"B");
+        assert_eq!(tx[1].tick, 240);
+        assert_eq!(tx[1].track, 0);
+        assert_eq!(tx[1].text_bytes(), b"A");
+        assert_eq!(tx[2].tick, 360);
+        assert_eq!(tx[2].track, 1);
+        assert_eq!(tx[2].text_bytes(), b"C");
+    }
+
+    #[test]
+    fn texts_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x01, 0x04]);
+        t0.extend_from_slice(b"trk0");
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x01, 0x04]);
+        t1.extend_from_slice(b"trk1");
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let tx = smf.texts();
+        assert_eq!(tx.len(), 2);
+        assert_eq!(tx[0].track, 0);
+        assert_eq!(tx[0].text_bytes(), b"trk0");
+        assert_eq!(tx[1].track, 1);
+        assert_eq!(tx[1].text_bytes(), b"trk1");
+    }
+
+    #[test]
+    fn texts_filter_excludes_other_text_kinds() {
+        // FF 01 "Note" picked up; FF 02..=FF 07 all filtered out.
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x01, 0x04];
+        events.extend_from_slice(b"Note");
+        events.extend_from_slice(&[0x00, 0xFF, 0x02, 0x05]);
+        events.extend_from_slice(b"(c)26");
+        events.extend_from_slice(&[0x00, 0xFF, 0x03, 0x04]);
+        events.extend_from_slice(b"Lead");
+        events.extend_from_slice(&[0x00, 0xFF, 0x04, 0x05]);
+        events.extend_from_slice(b"Piano");
+        events.extend_from_slice(&[0x00, 0xFF, 0x05, 0x02]);
+        events.extend_from_slice(b"la");
+        events.extend_from_slice(&[0x00, 0xFF, 0x06, 0x05]);
+        events.extend_from_slice(b"Verse");
+        events.extend_from_slice(&[0x00, 0xFF, 0x07, 0x04]);
+        events.extend_from_slice(b"Sync");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let tx = smf.texts();
+        assert_eq!(tx.len(), 1);
+        assert_eq!(tx[0].text_bytes(), b"Note");
+        // Sibling helpers stay uncontaminated.
+        assert_eq!(smf.copyrights().len(), 1);
+        assert_eq!(smf.track_names().len(), 1);
+        assert_eq!(smf.instrument_names().len(), 1);
+        assert_eq!(smf.lyrics().len(), 1);
+        assert_eq!(smf.markers().len(), 1);
+        assert_eq!(smf.cue_points().len(), 1);
+    }
+
+    #[test]
+    fn text_after_channel_events_tracks_absolute_tick() {
+        // Running-status note-ons followed by a late-positioned FF 01.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x40, 0x50]);
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0xFF, 0x01, 0x04]);
+        events.extend_from_slice(b"note");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let tx = smf.texts();
+        assert_eq!(tx.len(), 1);
+        assert_eq!(tx[0].tick, 240);
+        assert_eq!(tx[0].text_bytes(), b"note");
+    }
+
+    #[test]
+    fn text_text_lossy_replaces_invalid_utf8() {
+        let ev = TextEvent {
+            tick: 0,
+            track: 0,
+            text: vec![0xFF, 0xFE],
+        };
+        let lossy = ev.text_lossy();
+        assert!(lossy.contains('\u{FFFD}'));
+        assert_eq!(ev.text_bytes(), &[0xFF, 0xFE]);
+    }
+
+    // ───────── CopyrightEvent / SmfFile::copyrights (FF 02) ─────────
+
+    #[test]
+    fn copyrights_empty_when_no_meta_event_present() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.copyrights().is_empty());
+    }
+
+    #[test]
+    fn copyrights_single_event_at_tick_zero() {
+        // delta=0 FF 02 0E "(c) 2026 KLB"
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x02, 0x0C];
+        events.extend_from_slice(b"(c) 2026 KLB");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let cp = smf.copyrights();
+        assert_eq!(cp.len(), 1);
+        assert_eq!(cp[0].tick, 0);
+        assert_eq!(cp[0].track, 0);
+        assert_eq!(cp[0].text_bytes(), b"(c) 2026 KLB");
+        assert_eq!(cp[0].text_lossy(), "(c) 2026 KLB");
+    }
+
+    #[test]
+    fn copyrights_multiple_within_one_track_are_in_order() {
+        // delta=0   FF 02 5 "(c)A"
+        // delta=480 FF 02 4 "(c)B"
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x02, 0x04]);
+        events.extend_from_slice(b"(c)A");
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0xFF, 0x02, 0x04]);
+        events.extend_from_slice(b"(c)B");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let cp = smf.copyrights();
+        assert_eq!(cp.len(), 2);
+        assert_eq!(cp[0].tick, 0);
+        assert_eq!(cp[0].text_bytes(), b"(c)A");
+        assert_eq!(cp[1].tick, 480);
+        assert_eq!(cp[1].text_bytes(), b"(c)B");
+    }
+
+    #[test]
+    fn copyrights_merge_across_tracks_sorted_by_tick() {
+        // track 0: delta=240 FF 02 "A"
+        // track 1: delta=120 FF 02 "B"; delta=240 FF 02 "C"
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x02, 0x01]);
+        t0.extend_from_slice(b"A");
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(120));
+        t1.extend_from_slice(&[0xFF, 0x02, 0x01]);
+        t1.extend_from_slice(b"B");
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x02, 0x01]);
+        t1.extend_from_slice(b"C");
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let cp = smf.copyrights();
+        assert_eq!(cp.len(), 3);
+        assert_eq!(cp[0].tick, 120);
+        assert_eq!(cp[0].track, 1);
+        assert_eq!(cp[0].text_bytes(), b"B");
+        assert_eq!(cp[1].tick, 240);
+        assert_eq!(cp[1].track, 0);
+        assert_eq!(cp[1].text_bytes(), b"A");
+        assert_eq!(cp[2].tick, 360);
+        assert_eq!(cp[2].track, 1);
+        assert_eq!(cp[2].text_bytes(), b"C");
+    }
+
+    #[test]
+    fn copyrights_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x02, 0x04]);
+        t0.extend_from_slice(b"trk0");
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x02, 0x04]);
+        t1.extend_from_slice(b"trk1");
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let cp = smf.copyrights();
+        assert_eq!(cp.len(), 2);
+        assert_eq!(cp[0].track, 0);
+        assert_eq!(cp[0].text_bytes(), b"trk0");
+        assert_eq!(cp[1].track, 1);
+        assert_eq!(cp[1].text_bytes(), b"trk1");
+    }
+
+    #[test]
+    fn copyrights_filter_excludes_other_text_kinds() {
+        // FF 01..07 — only FF 02 picked up.
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x01, 0x04];
+        events.extend_from_slice(b"Note");
+        events.extend_from_slice(&[0x00, 0xFF, 0x02, 0x05]);
+        events.extend_from_slice(b"(c)26");
+        events.extend_from_slice(&[0x00, 0xFF, 0x03, 0x04]);
+        events.extend_from_slice(b"Lead");
+        events.extend_from_slice(&[0x00, 0xFF, 0x04, 0x05]);
+        events.extend_from_slice(b"Piano");
+        events.extend_from_slice(&[0x00, 0xFF, 0x05, 0x02]);
+        events.extend_from_slice(b"la");
+        events.extend_from_slice(&[0x00, 0xFF, 0x06, 0x05]);
+        events.extend_from_slice(b"Verse");
+        events.extend_from_slice(&[0x00, 0xFF, 0x07, 0x04]);
+        events.extend_from_slice(b"Sync");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let cp = smf.copyrights();
+        assert_eq!(cp.len(), 1);
+        assert_eq!(cp[0].text_bytes(), b"(c)26");
+        // The seven sibling helpers must each see exactly their one
+        // event — none of them contaminate each other.
+        assert_eq!(smf.texts().len(), 1);
+        assert_eq!(smf.track_names().len(), 1);
+        assert_eq!(smf.instrument_names().len(), 1);
+        assert_eq!(smf.lyrics().len(), 1);
+        assert_eq!(smf.markers().len(), 1);
+        assert_eq!(smf.cue_points().len(), 1);
+    }
+
+    #[test]
+    fn copyright_after_channel_events_tracks_absolute_tick() {
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x40, 0x50]);
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0xFF, 0x02, 0x04]);
+        events.extend_from_slice(b"(c)2");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let cp = smf.copyrights();
+        assert_eq!(cp.len(), 1);
+        assert_eq!(cp[0].tick, 240);
+        assert_eq!(cp[0].text_bytes(), b"(c)2");
+    }
+
+    #[test]
+    fn copyright_text_lossy_replaces_invalid_utf8() {
+        let ev = CopyrightEvent {
+            tick: 0,
+            track: 0,
+            text: vec![0xFF, 0xFE],
+        };
+        let lossy = ev.text_lossy();
+        assert!(lossy.contains('\u{FFFD}'));
+        assert_eq!(ev.text_bytes(), &[0xFF, 0xFE]);
+    }
+
+    #[test]
+    fn texts_and_copyrights_independent_on_same_track() {
+        // A track may legally carry both FF 01 (free text) and FF 02
+        // (copyright). The two helpers must surface them independently.
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x01, 0x04];
+        events.extend_from_slice(b"note");
+        events.extend_from_slice(&[0x00, 0xFF, 0x02, 0x05]);
+        events.extend_from_slice(b"(c)KL");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let tx = smf.texts();
+        let cp = smf.copyrights();
+        assert_eq!(tx.len(), 1);
+        assert_eq!(tx[0].text_bytes(), b"note");
+        assert_eq!(cp.len(), 1);
+        assert_eq!(cp[0].text_bytes(), b"(c)KL");
     }
 }
