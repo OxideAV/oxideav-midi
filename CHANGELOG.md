@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 208 — `SmfFile::smpte_offsets()` iteration helper + `FrameRate` decoder (`FF 54`)
+
+- New `smf::SmpteOffsetEvent { tick, track, hours_raw, minutes,
+  seconds, frames, subframes }` plus `SmfFile::smpte_offsets() ->
+  Vec<SmpteOffsetEvent>`. Collects every SMPTE Offset meta event
+  (`FF 54 05 hr mn se fr ff`, the wall-clock cue declaring when a
+  track's first event is meant to fire) from every track, pins each
+  one to the absolute tick of its parent track via cumulative
+  `TrackEvent::delta` sums, then merges the per-track sequences
+  with a stable sort by `tick` — track 0 wins over track 1 at the
+  same tick, matching the same merge rule used by the ten existing
+  text + rhythmic helpers (`tempo_map` / `time_signatures` /
+  `key_signatures` / `markers` / `lyrics` / `cue_points` /
+  `track_names` / `instrument_names` / `texts` / `copyrights`) and
+  by `scheduler.rs` §"merged event list, sorted by absolute tick".
+- New `smf::FrameRate` enum (`Fps24` / `Fps25` / `Fps30DropFrame`
+  / `Fps30NonDrop`) decoded from the packed `hr` byte per the
+  MIDI Time Code spec, RP-004/008 §"HOURS COUNT": bits 5-6 hold
+  the rate type (`00=24fps`, `01=25fps`, `10=30fps drop-frame`,
+  `11=30fps non-drop`); bits 0-4 hold the hours count; bit 7 is
+  reserved. `FrameRate::from_hours_byte(hr)` exposes the raw
+  decode; `frames_per_second()` returns the nominal counter rate
+  (drop-frame still numbers 30 frames per wall-second);
+  `is_drop_frame()` distinguishes the two 30-Hz variants.
+- `SmpteOffsetEvent::frame_rate()` / `hours_count()` /
+  `seconds_total()` surface the SMPTE-cueing semantics without
+  forcing callers to re-mask the `hr` byte. `seconds_total()`
+  returns the wall-clock offset as `h*3600 + m*60 + s + (frames +
+  subframes/100) / fps` — drop-frame uses the same 30 Hz divisor
+  since the counter compensates for the 29.97 Hz playback, so the
+  helper stays rate-independent across the four MTC types (callers
+  needing strict NTSC-accurate timing should re-derive from the
+  tempo map).
+- Out-of-range values (hours > 23, minutes > 59, seconds > 59,
+  frames above the rate's nominal count, subframes > 99) are
+  preserved as-is rather than clamped — the helper surfaces the
+  raw counter so callers can inspect malformed files.
+- Only `FF 54` is selected; the rhythmic / text meta events stay
+  uncontaminated (asserted by a dedicated cross-kind filter test).
+- Lifts the SMF meta-event iterator family from 10 to **11** total
+  (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
+  lyrics,cue_points,track_names,instrument_names,texts,copyrights,
+  smpte_offsets}`), covering every rhythmic + text + SMPTE-cueing
+  meta event the spec defines a per-event "when it fires" lens for.
+- 10 new dedicated tests: empty, single event with 24 fps decode,
+  all-four-frame-rates decode at hours=1, multi-track merge sorted
+  by tick, stable sort track-0-before-track-1 at same tick,
+  filter excludes other rhythmic + text meta kinds (with
+  sibling-helper uncontamination check), `seconds_total()` at 24
+  fps with non-zero sub-frames, `seconds_total()` at 30-non-drop
+  origin, absolute-tick accounting through running-status channel
+  events, and `FrameRate::from_hours_byte()` bit-mask coverage
+  (bit 7 reserved, bits 5-6 select the rate, bits 0-4 don't leak
+  into the rate decode).
+
 ### Round 202 — `SmfFile::texts()` + `SmfFile::copyrights()` iteration helpers (`FF 01` + `FF 02`)
 
 - New `smf::TextEvent { tick, track, text }` plus

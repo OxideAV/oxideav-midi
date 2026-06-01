@@ -149,6 +149,28 @@ framework but usable standalone.
   lyrics,cue_points,track_names,instrument_names,texts,copyrights}`
   ), covering every `FF 01..=07` text-flavour meta event the spec
   defines.
+  Round 208 adds the SMPTE wall-clock companion
+  `SmfFile::smpte_offsets()` — every `FF 54 05 hr mn se fr ff`
+  SMPTE Offset meta event as an `SmpteOffsetEvent { tick, track,
+  hours_raw, minutes, seconds, frames, subframes }` with the
+  absolute tick on the parent track, stably merged across tracks
+  (track 0 before track 1 at the same tick) under the same merge
+  rule as the ten text-meta / rhythmic helpers and the scheduler.
+  The `hr` byte packs the SMPTE frame rate in bits 5-6 per the
+  MIDI Time Code spec (RP-004/008 §"HOURS COUNT"): `00=24fps`,
+  `01=25fps`, `10=30fps drop-frame`, `11=30fps non-drop`. A new
+  `FrameRate` enum (`Fps24` / `Fps25` / `Fps30DropFrame` /
+  `Fps30NonDrop`) plus `FrameRate::from_hours_byte(hr)` decodes
+  the packed bits; `SmpteOffsetEvent::frame_rate()` /
+  `hours_count()` (bits 0-4) / `seconds_total()` (wall-clock
+  seconds: `h*3600 + m*60 + s + (frames + subframes/100)/fps`)
+  surface the SMPTE-cueing semantics without forcing callers to
+  re-mask the byte themselves. Lifts the SMF meta-event iterator
+  family from 10 to **11** total
+  (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
+  lyrics,cue_points,track_names,instrument_names,texts,copyrights,
+  smpte_offsets}`), covering every rhythmic + text + cueing meta
+  event the spec defines a per-event "when it fires" lens for.
 - `paths` — per-OS SoundFont/SFZ/DLS search paths plus the
   `OXIDEAV_SOUNDFONT_PATH` env-var override.
 - `instruments::sf2` — full SoundFont 2 RIFF reader and voice

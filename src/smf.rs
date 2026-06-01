@@ -834,6 +834,154 @@ impl CopyrightEvent {
     }
 }
 
+/// Decoded SMPTE frame-rate enumeration. The MIDI Time Code spec
+/// (RP-004/008 §"HOURS COUNT") packs the rate into bits 5-6 of the
+/// `hr` byte used by both the `FF 54` SMPTE Offset meta event and the
+/// MTC Full / Quarter-Frame messages:
+///
+/// | `yy` | rate                                |
+/// |------|-------------------------------------|
+/// | `0`  | [`FrameRate::Fps24`]                |
+/// | `1`  | [`FrameRate::Fps25`]                |
+/// | `2`  | [`FrameRate::Fps30DropFrame`]       |
+/// | `3`  | [`FrameRate::Fps30NonDrop`]         |
+///
+/// Returned by [`SmpteOffsetEvent::frame_rate`] / decoded directly via
+/// [`FrameRate::from_hours_byte`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameRate {
+    /// 24 frames per second — classic film rate.
+    Fps24,
+    /// 25 frames per second — PAL/SECAM video rate.
+    Fps25,
+    /// 30 frames per second, drop-frame — NTSC compensation that drops
+    /// two frame numbers each minute (except every tenth minute) to
+    /// keep the time-of-day clock aligned with 29.97-Hz playback.
+    Fps30DropFrame,
+    /// 30 frames per second, non-drop — strict 30-Hz numbering.
+    Fps30NonDrop,
+}
+
+impl FrameRate {
+    /// Decode the rate from a raw `hr` byte (bits 5-6 hold the type
+    /// per RP-004/008). The hours value itself lives in bits 0-4 and
+    /// is exposed via [`SmpteOffsetEvent::hours_count`].
+    pub fn from_hours_byte(hr: u8) -> Self {
+        match (hr >> 5) & 0b11 {
+            0 => FrameRate::Fps24,
+            1 => FrameRate::Fps25,
+            2 => FrameRate::Fps30DropFrame,
+            _ => FrameRate::Fps30NonDrop,
+        }
+    }
+
+    /// Nominal frame count per second. For drop-frame this is the
+    /// 30-Hz frame-numbering rate (the underlying playback runs at
+    /// 29.97 Hz, but the SMPTE counter still labels 30 frames per
+    /// second of wall time, skipping two numbers per minute to stay
+    /// aligned).
+    pub fn frames_per_second(&self) -> u32 {
+        match self {
+            FrameRate::Fps24 => 24,
+            FrameRate::Fps25 => 25,
+            FrameRate::Fps30DropFrame | FrameRate::Fps30NonDrop => 30,
+        }
+    }
+
+    /// Whether this rate uses drop-frame numbering.
+    pub fn is_drop_frame(&self) -> bool {
+        matches!(self, FrameRate::Fps30DropFrame)
+    }
+}
+
+/// One SMPTE Offset meta event pinned to the absolute tick (relative
+/// to the start of its parent track) at which the
+/// [`FF 54 05 hr mn se fr ff`](MetaEvent::SmpteOffset) meta event
+/// fires.
+///
+/// Returned by [`SmfFile::smpte_offsets`] — see that method for the
+/// merge semantics across multiple tracks.
+///
+/// `FF 54` declares the SMPTE wall-clock time at which the *parent
+/// track's first event* is meant to fire. The Standard MIDI File
+/// specification places the event at the start of the track (tick 0)
+/// so a sequencer cueing to SMPTE can autolocate without reading the
+/// rest of the track; later placement is uncommon but not forbidden,
+/// so this helper surfaces every occurrence in time order.
+///
+/// The `hr` byte packs the SMPTE frame rate in bits 5-6 (per the
+/// MIDI Time Code spec, RP-004/008 §"HOURS COUNT"). The raw byte is
+/// preserved in [`hours_raw`](Self::hours_raw); the decoded rate is
+/// available via [`frame_rate`](Self::frame_rate) and the hours
+/// value via [`hours_count`](Self::hours_count). `minutes`,
+/// `seconds`, `frames` are the plain counter values; `subframes`
+/// counts 1/100 of a frame (the conventional MTC encoding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SmpteOffsetEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase. Typically `0`
+    /// since the SMPTE offset conventionally lands at the head of the
+    /// track, but the spec permits later placement.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). The SMF spec applies the offset to the
+    /// parent track's first event; this helper preserves which track
+    /// each offset belongs to so format-2 multi-pattern files can be
+    /// scheduled independently.
+    pub track: usize,
+    /// Raw `hr` byte from the meta event payload. Bits 5-6 hold the
+    /// frame-rate type (`yy`); bits 0-4 hold the hours count
+    /// (`0..=23`). Bit 7 is reserved per RP-004/008 and ignored by
+    /// receivers.
+    pub hours_raw: u8,
+    /// Minutes count (`0..=59` per spec; preserved as-is from the
+    /// stream — pathological out-of-range values stay visible to the
+    /// caller).
+    pub minutes: u8,
+    /// Seconds count (`0..=59` per spec).
+    pub seconds: u8,
+    /// Frames count (`0..=29` for 30 Hz; `0..=24` for 25 Hz;
+    /// `0..=23` for 24 Hz — preserved as-is).
+    pub frames: u8,
+    /// Sub-frames — fractional frames in 1/100 units (`0..=99` per
+    /// the SMF spec, matching the MTC cueing "ff" field).
+    pub subframes: u8,
+}
+
+impl SmpteOffsetEvent {
+    /// Decoded frame rate from the packed `hr` byte (bits 5-6).
+    pub fn frame_rate(&self) -> FrameRate {
+        FrameRate::from_hours_byte(self.hours_raw)
+    }
+
+    /// Decoded hours count from the `hr` byte (bits 0-4). The SMPTE
+    /// spec bounds this to `0..=23`; values above 23 indicate a
+    /// malformed file and are returned as-is so the caller can
+    /// inspect them (no clamp, no panic).
+    pub fn hours_count(&self) -> u8 {
+        self.hours_raw & 0b0001_1111
+    }
+
+    /// Total wall-clock offset in seconds, computed from the hours,
+    /// minutes, seconds counts plus the fractional contribution of
+    /// `frames + subframes/100` divided by the decoded
+    /// frames-per-second. Returns the same `f64` regardless of
+    /// drop-frame status — drop-frame numbering compensates the
+    /// counter, not the wall clock, so a counter reading of
+    /// `01:00:00:00` at 30-drop still corresponds to ~3600 s of real
+    /// time. Callers that need exact NTSC-accurate timing should
+    /// re-derive the seconds from the underlying tempo map.
+    pub fn seconds_total(&self) -> f64 {
+        let rate = self.frame_rate().frames_per_second() as f64;
+        let frame_frac = self.frames as f64 + (self.subframes as f64) / 100.0;
+        (self.hours_count() as f64) * 3600.0
+            + (self.minutes as f64) * 60.0
+            + (self.seconds as f64)
+            + frame_frac / rate
+    }
+}
+
 impl SmfFile {
     /// Collect every [`MetaEvent::Tempo`] from every track, pinned to
     /// the absolute tick at which it fires, in time order.
@@ -1414,6 +1562,74 @@ impl SmfFile {
                         tick: abs,
                         track: track_idx,
                         text: text.clone(),
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every [`MetaEvent::SmpteOffset`] (`FF 54 05 hr mn se
+    /// fr ff`) from every track, pinned to the absolute tick at which
+    /// it fires, in time order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two offsets at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::tempo_map`] /
+    /// [`SmfFile::time_signatures`] / [`SmfFile::key_signatures`] /
+    /// [`SmfFile::markers`] / [`SmfFile::lyrics`] /
+    /// [`SmfFile::cue_points`] / [`SmfFile::track_names`] /
+    /// [`SmfFile::instrument_names`] / [`SmfFile::texts`] /
+    /// [`SmfFile::copyrights`] and the scheduler use (`scheduler.rs`
+    /// §"merged event list, sorted by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries an SMPTE Offset
+    /// meta event — the spec doesn't require one, and a sequencer
+    /// that needs a default cue should treat absence as
+    /// `00:00:00:00:00` at the file's nominal frame rate.
+    ///
+    /// `FF 54` declares the SMPTE wall-clock position at which the
+    /// *parent track's first event* is meant to fire — the offset is
+    /// rate-typed via the bits-5-6 packing on the `hr` byte (see
+    /// [`FrameRate`] and the MIDI Time Code spec, RP-004/008
+    /// §"HOURS COUNT"). The SMF specification places the event at
+    /// the head of the track so a sequencer can autolocate without
+    /// reading the rest of the track; later placement is uncommon
+    /// but not forbidden, so this helper surfaces every occurrence.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn smpte_offsets(&self) -> Vec<SmpteOffsetEvent> {
+        let mut out: Vec<SmpteOffsetEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::SmpteOffset {
+                    hours,
+                    minutes,
+                    seconds,
+                    frames,
+                    subframes,
+                }) = &ev.kind
+                {
+                    out.push(SmpteOffsetEvent {
+                        tick: abs,
+                        track: track_idx,
+                        hours_raw: *hours,
+                        minutes: *minutes,
+                        seconds: *seconds,
+                        frames: *frames,
+                        subframes: *subframes,
                     });
                 }
             }
@@ -4182,5 +4398,234 @@ mod tests {
         assert_eq!(tx[0].text_bytes(), b"note");
         assert_eq!(cp.len(), 1);
         assert_eq!(cp[0].text_bytes(), b"(c)KL");
+    }
+
+    // ───────── SmpteOffsetEvent / SmfFile::smpte_offsets (FF 54) ─────────
+
+    #[test]
+    fn smpte_offsets_empty_when_no_meta_event_present() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.smpte_offsets().is_empty());
+    }
+
+    #[test]
+    fn smpte_offsets_single_event_at_tick_zero_24fps() {
+        // delta=0 FF 54 05 hr mn se fr ff
+        // hr = 0x01 → yy=0 (24 fps), hours=1
+        let events: Vec<u8> = vec![
+            0x00, 0xFF, 0x54, 0x05, 0x01, 0x20, 0x10, 0x05, 0x32, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let so = smf.smpte_offsets();
+        assert_eq!(so.len(), 1);
+        assert_eq!(so[0].tick, 0);
+        assert_eq!(so[0].track, 0);
+        assert_eq!(so[0].hours_raw, 0x01);
+        assert_eq!(so[0].hours_count(), 1);
+        assert_eq!(so[0].frame_rate(), FrameRate::Fps24);
+        assert_eq!(so[0].minutes, 0x20);
+        assert_eq!(so[0].seconds, 0x10);
+        assert_eq!(so[0].frames, 0x05);
+        assert_eq!(so[0].subframes, 0x32);
+    }
+
+    #[test]
+    fn smpte_offsets_decodes_all_four_frame_rates() {
+        // Build four tracks, each carrying one FF 54 with a different
+        // yy bit pattern in bits 5-6 of the hr byte. Hours stays 1 so
+        // hours_count() is rate-independent.
+        let mk_track = |hr: u8| -> Vec<u8> {
+            vec![
+                0x00, 0xFF, 0x54, 0x05, hr, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+            ]
+        };
+        let mut blob = header_chunk(2, 4, 96);
+        blob.extend(track_chunk(&mk_track(0b0000_0001))); // yy=0 → 24 fps, hr=1
+        blob.extend(track_chunk(&mk_track(0b0010_0001))); // yy=1 → 25 fps, hr=1
+        blob.extend(track_chunk(&mk_track(0b0100_0001))); // yy=2 → 30 drop, hr=1
+        blob.extend(track_chunk(&mk_track(0b0110_0001))); // yy=3 → 30 non-drop, hr=1
+        let smf = parse(&blob).unwrap();
+        let so = smf.smpte_offsets();
+        assert_eq!(so.len(), 4);
+        // All four pinned to tick 0 → stable-sort preserves track
+        // order: track 0 first, then 1, 2, 3.
+        assert_eq!(so[0].track, 0);
+        assert_eq!(so[0].frame_rate(), FrameRate::Fps24);
+        assert_eq!(so[0].hours_count(), 1);
+        assert_eq!(so[1].track, 1);
+        assert_eq!(so[1].frame_rate(), FrameRate::Fps25);
+        assert_eq!(so[1].hours_count(), 1);
+        assert_eq!(so[2].track, 2);
+        assert_eq!(so[2].frame_rate(), FrameRate::Fps30DropFrame);
+        assert!(so[2].frame_rate().is_drop_frame());
+        assert_eq!(so[2].hours_count(), 1);
+        assert_eq!(so[3].track, 3);
+        assert_eq!(so[3].frame_rate(), FrameRate::Fps30NonDrop);
+        assert!(!so[3].frame_rate().is_drop_frame());
+        assert_eq!(so[3].hours_count(), 1);
+        // frames_per_second() reports the nominal rate.
+        assert_eq!(so[0].frame_rate().frames_per_second(), 24);
+        assert_eq!(so[1].frame_rate().frames_per_second(), 25);
+        assert_eq!(so[2].frame_rate().frames_per_second(), 30);
+        assert_eq!(so[3].frame_rate().frames_per_second(), 30);
+    }
+
+    #[test]
+    fn smpte_offsets_merge_across_tracks_sorted_by_tick() {
+        // track 0: delta=240 FF 54 05 ...
+        // track 1: delta=120 FF 54 05 ...
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x54, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(120));
+        t1.extend_from_slice(&[0xFF, 0x54, 0x05, 0x02, 0x00, 0x00, 0x00, 0x00]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let so = smf.smpte_offsets();
+        assert_eq!(so.len(), 2);
+        assert_eq!(so[0].tick, 120);
+        assert_eq!(so[0].track, 1);
+        assert_eq!(so[0].hours_raw, 0x02);
+        assert_eq!(so[1].tick, 240);
+        assert_eq!(so[1].track, 0);
+        assert_eq!(so[1].hours_raw, 0x01);
+    }
+
+    #[test]
+    fn smpte_offsets_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x54, 0x05, 0x0A, 0x00, 0x00, 0x00, 0x00]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x54, 0x05, 0x0B, 0x00, 0x00, 0x00, 0x00]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let so = smf.smpte_offsets();
+        assert_eq!(so.len(), 2);
+        assert_eq!(so[0].track, 0);
+        assert_eq!(so[0].hours_raw, 0x0A);
+        assert_eq!(so[1].track, 1);
+        assert_eq!(so[1].hours_raw, 0x0B);
+    }
+
+    #[test]
+    fn smpte_offsets_filter_excludes_other_meta_kinds() {
+        // FF 54 picked up; other meta events filtered out.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]); // tempo
+        events.extend_from_slice(&[0x00, 0xFF, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08]); // time sig
+        events.extend_from_slice(&[0x00, 0xFF, 0x59, 0x02, 0x00, 0x00]); // key sig
+        events.extend_from_slice(&[0x00, 0xFF, 0x54, 0x05, 0x21, 0x1E, 0x2D, 0x10, 0x32]); // SMPTE: yy=1, hr=1
+        events.extend_from_slice(&[0x00, 0xFF, 0x01, 0x04]);
+        events.extend_from_slice(b"note");
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let so = smf.smpte_offsets();
+        assert_eq!(so.len(), 1);
+        assert_eq!(so[0].hours_raw, 0x21);
+        assert_eq!(so[0].hours_count(), 1);
+        assert_eq!(so[0].frame_rate(), FrameRate::Fps25);
+        assert_eq!(so[0].minutes, 0x1E);
+        assert_eq!(so[0].seconds, 0x2D);
+        assert_eq!(so[0].frames, 0x10);
+        assert_eq!(so[0].subframes, 0x32);
+        // Sibling helpers stay uncontaminated.
+        assert_eq!(smf.tempo_map().len(), 1);
+        assert_eq!(smf.time_signatures().len(), 1);
+        assert_eq!(smf.key_signatures().len(), 1);
+        assert_eq!(smf.texts().len(), 1);
+    }
+
+    #[test]
+    fn smpte_offsets_seconds_total_24fps() {
+        // hr=0x01 (yy=0, hours=1), 30 min, 15 sec, 12 frames, 50 sub
+        // → 3600 + 1800 + 15 + (12 + 0.50)/24 = 5415 + 12.5/24 = 5415.5208333…
+        let ev = SmpteOffsetEvent {
+            tick: 0,
+            track: 0,
+            hours_raw: 0x01,
+            minutes: 30,
+            seconds: 15,
+            frames: 12,
+            subframes: 50,
+        };
+        assert_eq!(ev.frame_rate(), FrameRate::Fps24);
+        let expected = 1.0 * 3600.0 + 30.0 * 60.0 + 15.0 + 12.5 / 24.0;
+        assert!((ev.seconds_total() - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn smpte_offsets_seconds_total_30fps_non_drop_at_origin() {
+        // hr=0x60 (yy=3 non-drop, hours=0), all-zero rest → 0.0 s.
+        let ev = SmpteOffsetEvent {
+            tick: 0,
+            track: 0,
+            hours_raw: 0x60,
+            minutes: 0,
+            seconds: 0,
+            frames: 0,
+            subframes: 0,
+        };
+        assert_eq!(ev.frame_rate(), FrameRate::Fps30NonDrop);
+        assert_eq!(ev.hours_count(), 0);
+        assert_eq!(ev.seconds_total(), 0.0);
+    }
+
+    #[test]
+    fn smpte_offsets_after_channel_events_tracks_absolute_tick() {
+        // Running-status note-ons followed by a late-positioned FF 54.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x40, 0x50]);
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0xFF, 0x54, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let so = smf.smpte_offsets();
+        assert_eq!(so.len(), 1);
+        assert_eq!(so[0].tick, 240);
+        assert_eq!(so[0].frame_rate(), FrameRate::Fps24);
+        assert_eq!(so[0].hours_count(), 0);
+    }
+
+    #[test]
+    fn frame_rate_from_hours_byte_only_uses_bits_5_and_6() {
+        // Bit 7 is reserved per RP-004/008; bits 0-4 are hours. Only
+        // bits 5-6 contribute to the rate decode.
+        assert_eq!(FrameRate::from_hours_byte(0b0000_0000), FrameRate::Fps24);
+        assert_eq!(FrameRate::from_hours_byte(0b1001_1111), FrameRate::Fps24); // bit 7 set + hours=31
+        assert_eq!(FrameRate::from_hours_byte(0b0010_0000), FrameRate::Fps25);
+        assert_eq!(
+            FrameRate::from_hours_byte(0b0100_0000),
+            FrameRate::Fps30DropFrame
+        );
+        assert_eq!(
+            FrameRate::from_hours_byte(0b0110_0000),
+            FrameRate::Fps30NonDrop
+        );
     }
 }
