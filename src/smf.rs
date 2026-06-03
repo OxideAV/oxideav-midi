@@ -982,6 +982,56 @@ impl SmpteOffsetEvent {
     }
 }
 
+/// One sequencer-specific meta event pinned to the absolute tick
+/// (relative to the start of its parent track) at which the
+/// [`FF 7F len data`](MetaEvent::SequencerSpecific) meta event fires.
+///
+/// Returned by [`SmfFile::sequencer_specifics`] — see that method for
+/// the merge semantics across multiple tracks.
+///
+/// `FF 7F` is the SMF escape hatch for sequencer-private or
+/// manufacturer-private payloads carried inline with the music data.
+/// The payload bytes are opaque to the SMF reader: by convention the
+/// first byte (or first three bytes, when the first byte is `0x00`)
+/// hold the SysEx-style manufacturer ID, and the rest is whatever the
+/// originating sequencer chose to embed (project markers, plugin
+/// state, automation hooks, …). The reader does not interpret the
+/// payload — the raw bytes are surfaced verbatim so a caller that
+/// knows the originating sequencer can decode them, while a generic
+/// player can ignore them per spec.
+///
+/// This helper isolates the `FF 7F` stream so callers driving DAW
+/// round-trip workflows (preserving the embedded blobs through a
+/// load → save cycle) get a clean time-ordered list independent of
+/// the surrounding text / rhythmic / cueing meta events.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequencerSpecificEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). Format-1 files may place sequencer
+    /// blobs on any track (typically the conductor / track 0 for
+    /// project-wide metadata, or the affected music track for
+    /// per-instrument state); format-2 files keep them per-track.
+    pub track: usize,
+    /// Raw payload bytes (the `data` portion of `FF 7F len data`).
+    /// The SMF spec defines no further structure — by SysEx
+    /// convention bytes `[0]` (or `[0..=2]` when `[0] == 0x00`) hold
+    /// the manufacturer ID, but the parser does not interpret them.
+    /// Stored as `Vec<u8>` so the caller can route by ID or treat
+    /// the payload as opaque per the spec's ignore-if-unknown rule.
+    pub data: Vec<u8>,
+}
+
+impl SequencerSpecificEvent {
+    /// Borrow the raw payload bytes.
+    pub fn data_bytes(&self) -> &[u8] {
+        &self.data
+    }
+}
+
 impl SmfFile {
     /// Collect every [`MetaEvent::Tempo`] from every track, pinned to
     /// the absolute tick at which it fires, in time order.
@@ -1630,6 +1680,71 @@ impl SmfFile {
                         seconds: *seconds,
                         frames: *frames,
                         subframes: *subframes,
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every [`MetaEvent::SequencerSpecific`] (`FF 7F len
+    /// data`) from every track, pinned to the absolute tick at which
+    /// it fires, in time order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two payloads at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::tempo_map`] /
+    /// [`SmfFile::time_signatures`] / [`SmfFile::key_signatures`] /
+    /// [`SmfFile::markers`] / [`SmfFile::lyrics`] /
+    /// [`SmfFile::cue_points`] / [`SmfFile::track_names`] /
+    /// [`SmfFile::instrument_names`] / [`SmfFile::texts`] /
+    /// [`SmfFile::copyrights`] / [`SmfFile::smpte_offsets`] and the
+    /// scheduler use (`scheduler.rs` §"merged event list, sorted by
+    /// absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries an `FF 7F` meta
+    /// event — every file is free of sequencer-private payloads
+    /// unless the originating tool chose to embed one.
+    ///
+    /// Only `FF 7F` is selected — channel-message `F0` / `F7` SysEx
+    /// events (which travel as [`Event::SysEx`]) are *not* surfaced
+    /// here; those are part of the wire-event stream rather than the
+    /// meta-event family, and downstream consumers route them through
+    /// the scheduler's SysEx pump rather than reading them out as a
+    /// list. The two channels coexist: a file may carry both an
+    /// `F0 … F7` Universal Real-Time Master Volume on the conductor
+    /// track and a private `FF 7F` plugin-state blob alongside it.
+    ///
+    /// The payload bytes are surfaced verbatim — the parser does not
+    /// interpret the manufacturer-ID convention, so a caller routing
+    /// by manufacturer should inspect [`SequencerSpecificEvent::data`]
+    /// directly (typically `data[0]`, or `data[0..=2]` when
+    /// `data[0] == 0x00`). Empty payloads (`FF 7F 00`) are surfaced
+    /// as `data.is_empty()` rather than filtered out — the spec
+    /// permits a zero-length blob.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn sequencer_specifics(&self) -> Vec<SequencerSpecificEvent> {
+        let mut out: Vec<SequencerSpecificEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::SequencerSpecific(data)) = &ev.kind {
+                    out.push(SequencerSpecificEvent {
+                        tick: abs,
+                        track: track_idx,
+                        data: data.clone(),
                     });
                 }
             }
@@ -4866,6 +4981,176 @@ mod tests {
             FrameRate::from_hours_byte(0b0110_0000),
             FrameRate::Fps30NonDrop
         );
+    }
+
+    // ───────── SequencerSpecificEvent / SmfFile::sequencer_specifics (FF 7F) ─────────
+
+    #[test]
+    fn sequencer_specifics_empty_when_no_meta_event_present() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.sequencer_specifics().is_empty());
+    }
+
+    #[test]
+    fn sequencer_specifics_single_event_at_tick_zero() {
+        // delta=0 FF 7F 04 41 00 01 02   (Roland-style: ID 0x41 + 3 bytes)
+        // delta=0 FF 2F 00
+        let events: Vec<u8> = vec![
+            0x00, 0xFF, 0x7F, 0x04, 0x41, 0x00, 0x01, 0x02, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sequencer_specifics();
+        assert_eq!(sx.len(), 1);
+        assert_eq!(sx[0].tick, 0);
+        assert_eq!(sx[0].track, 0);
+        assert_eq!(sx[0].data_bytes(), &[0x41, 0x00, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn sequencer_specifics_empty_payload_is_surfaced() {
+        // FF 7F 00 — zero-length blob is legal per spec.
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x7F, 0x00, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sequencer_specifics();
+        assert_eq!(sx.len(), 1);
+        assert!(sx[0].data_bytes().is_empty());
+    }
+
+    #[test]
+    fn sequencer_specifics_multiple_within_one_track_are_in_order() {
+        // delta=0   FF 7F 02 41 10
+        // delta=480 FF 7F 02 41 11
+        // delta=0   FF 2F 00
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x7F, 0x02, 0x41, 0x10]);
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0xFF, 0x7F, 0x02, 0x41, 0x11]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sequencer_specifics();
+        assert_eq!(sx.len(), 2);
+        assert_eq!(sx[0].tick, 0);
+        assert_eq!(sx[0].data_bytes(), &[0x41, 0x10]);
+        assert_eq!(sx[1].tick, 480);
+        assert_eq!(sx[1].data_bytes(), &[0x41, 0x11]);
+    }
+
+    #[test]
+    fn sequencer_specifics_merge_across_tracks_sorted_by_tick() {
+        // track 0: delta=240 FF 7F 01 AA
+        // track 1: delta=120 FF 7F 01 BB; delta=240 FF 7F 01 CC
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x7F, 0x01, 0xAA]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(120));
+        t1.extend_from_slice(&[0xFF, 0x7F, 0x01, 0xBB]);
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x7F, 0x01, 0xCC]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sequencer_specifics();
+        assert_eq!(sx.len(), 3);
+        assert_eq!(sx[0].tick, 120);
+        assert_eq!(sx[0].track, 1);
+        assert_eq!(sx[0].data_bytes(), &[0xBB]);
+        assert_eq!(sx[1].tick, 240);
+        assert_eq!(sx[1].track, 0);
+        assert_eq!(sx[1].data_bytes(), &[0xAA]);
+        assert_eq!(sx[2].tick, 360);
+        assert_eq!(sx[2].track, 1);
+        assert_eq!(sx[2].data_bytes(), &[0xCC]);
+    }
+
+    #[test]
+    fn sequencer_specifics_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x7F, 0x01, 0x00]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x7F, 0x01, 0x01]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sequencer_specifics();
+        assert_eq!(sx.len(), 2);
+        assert_eq!(sx[0].track, 0);
+        assert_eq!(sx[0].data_bytes(), &[0x00]);
+        assert_eq!(sx[1].track, 1);
+        assert_eq!(sx[1].data_bytes(), &[0x01]);
+    }
+
+    #[test]
+    fn sequencer_specifics_filter_excludes_other_meta_kinds() {
+        // FF 7F payload picked up; text + smpte + tempo + key/time
+        // signatures all filtered out.
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x7F, 0x03, 0x41, 0x10, 0x42];
+        events.extend_from_slice(&[0x00, 0xFF, 0x01, 0x04]);
+        events.extend_from_slice(b"Note");
+        events.extend_from_slice(&[0x00, 0xFF, 0x03, 0x04]);
+        events.extend_from_slice(b"Lead");
+        events.extend_from_slice(&[0x00, 0xFF, 0x05, 0x02]);
+        events.extend_from_slice(b"la");
+        events.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x54, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x59, 0x02, 0x00, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sequencer_specifics();
+        assert_eq!(sx.len(), 1);
+        assert_eq!(sx[0].data_bytes(), &[0x41, 0x10, 0x42]);
+        // Sibling helpers stay uncontaminated.
+        assert_eq!(smf.texts().len(), 1);
+        assert_eq!(smf.track_names().len(), 1);
+        assert_eq!(smf.lyrics().len(), 1);
+        assert_eq!(smf.tempo_map().len(), 1);
+        assert_eq!(smf.smpte_offsets().len(), 1);
+        assert_eq!(smf.time_signatures().len(), 1);
+        assert_eq!(smf.key_signatures().len(), 1);
+    }
+
+    #[test]
+    fn sequencer_specifics_after_channel_events_track_absolute_tick() {
+        // Running-status note-ons followed by a late-positioned FF 7F.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x40, 0x50]);
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0xFF, 0x7F, 0x02, 0x7D, 0x01]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sequencer_specifics();
+        assert_eq!(sx.len(), 1);
+        assert_eq!(sx[0].tick, 240);
+        assert_eq!(sx[0].data_bytes(), &[0x7D, 0x01]);
     }
 
     // ───────── SmfChannelSnapshot / SmfFile::channel_snapshot_at ─────────

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 219 — `SmfFile::sequencer_specifics()` (FF 7F)
+
+- New `smf::SequencerSpecificEvent { tick, track, data }` value type
+  pinned to the absolute tick at which an `FF 7F len data`
+  Sequencer-Specific Meta-Event fires on its parent track.
+  `SequencerSpecificEvent::data_bytes()` borrows the raw payload.
+- New `SmfFile::sequencer_specifics() -> Vec<SequencerSpecificEvent>`
+  iterator helper that walks every track, sums the per-track
+  cumulative deltas, and stably merges the matching `FF 7F` events
+  across tracks (track 0 before track 1 at the same tick) under the
+  same merge rule the other 11 meta-event helpers and `scheduler.rs`
+  §"merged event list, sorted by absolute tick" already use. Only
+  `FF 7F` is selected — channel-message `F0` / `F7` SysEx events
+  (which travel through the scheduler's SysEx pump rather than the
+  meta-event family) stay out of the list.
+- `FF 7F` payloads are surfaced verbatim: the parser does not
+  interpret the SysEx-style manufacturer-ID convention (where
+  `data[0]`, or `data[0..=2]` when `data[0] == 0x00`, holds the ID),
+  so a caller routing by manufacturer can inspect
+  `SequencerSpecificEvent::data` directly while a generic player can
+  ignore per the SMF spec's "unknown meta events SHOULD be ignored"
+  rule. Empty payloads (`FF 7F 00`) are surfaced as
+  `data.is_empty()` rather than filtered out — the spec permits a
+  zero-length blob.
+- Lifts the SMF meta-event iterator family from 11 to **12** total
+  (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
+  lyrics,cue_points,track_names,instrument_names,texts,copyrights,
+  smpte_offsets,sequencer_specifics}`).
+- 8 new unit tests covering: empty case, single event at tick 0,
+  zero-length payload, multiple within one track, cross-track merge
+  sorted by tick, same-tick stable sort (track 0 before track 1),
+  filter excluding text / tempo / SMPTE / time / key meta kinds,
+  and absolute-tick tracking after channel-voice events.
+
 ### Round 213 — `SmfFile::channel_snapshot_at` / `channel_snapshots_at` (channel-state seek primitive)
 
 - New `smf::SmfChannelSnapshot { program, bank_msb, bank_lsb, volume,

@@ -171,6 +171,33 @@ framework but usable standalone.
   lyrics,cue_points,track_names,instrument_names,texts,copyrights,
   smpte_offsets}`), covering every rhythmic + text + cueing meta
   event the spec defines a per-event "when it fires" lens for.
+  Round 219 closes the meta-event helper family with the
+  sequencer-private companion `SmfFile::sequencer_specifics()` —
+  every `FF 7F len data` Sequencer-Specific Meta-Event as a
+  `SequencerSpecificEvent { tick, track, data }` with the absolute
+  tick on the parent track, stably merged across tracks (track 0
+  before track 1 at the same tick) under the same merge rule as
+  every existing iteration helper and the scheduler. `FF 7F` is the
+  SMF escape hatch for sequencer-private or manufacturer-private
+  payloads carried inline with the music data: the spec leaves the
+  payload bytes opaque (by SysEx convention `data[0]` — or
+  `data[0..=2]` when `data[0] == 0x00` — holds the manufacturer
+  ID), and the parser preserves them verbatim so a caller routing
+  by ID can decode while a generic player can ignore per the spec's
+  "unknown meta events SHOULD be ignored" rule. Only `FF 7F` is
+  selected — channel-message `F0` / `F7` SysEx events travel through
+  the scheduler's SysEx pump rather than the meta-event family, so
+  a DAW round-trip workflow (load → save) can preserve every private
+  blob without re-reading the wire-event stream. Empty payloads
+  (`FF 7F 00`) are surfaced as `data.is_empty()` rather than
+  filtered out — the spec permits a zero-length blob.
+  `SequencerSpecificEvent::data_bytes()` borrows the raw payload.
+  Lifts the SMF meta-event iterator family from 11 to **12** total
+  (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
+  lyrics,cue_points,track_names,instrument_names,texts,copyrights,
+  smpte_offsets,sequencer_specifics}`), covering every rhythmic +
+  text + cueing + sequencer-private meta event the spec defines a
+  per-event "when it fires" lens for.
   Round 213 lifts the SMF-file accessor surface beyond the
   "iterate every meta event" lens with a **channel-state
   snapshot** primitive for seeking: `SmfChannelSnapshot { program,
