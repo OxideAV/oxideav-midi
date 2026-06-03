@@ -171,6 +171,38 @@ framework but usable standalone.
   lyrics,cue_points,track_names,instrument_names,texts,copyrights,
   smpte_offsets}`), covering every rhythmic + text + cueing meta
   event the spec defines a per-event "when it fires" lens for.
+  Round 213 lifts the SMF-file accessor surface beyond the
+  "iterate every meta event" lens with a **channel-state
+  snapshot** primitive for seeking: `SmfChannelSnapshot { program,
+  bank_msb, bank_lsb, volume, pan, expression, modulation,
+  sustain, pitch_bend }` plus
+  `SmfFile::channel_snapshot_at(channel, tick)` /
+  `SmfFile::channel_snapshots_at(tick) -> [SmfChannelSnapshot; 16]`.
+  Each method replays every channel-voice event from every track
+  up to and including the requested tick — in scheduler order (a
+  stable merge by `(tick, track, in-track)`, track 0 winning over
+  track 1 at the same tick, the same convention as every existing
+  iteration helper and `scheduler.rs` §"merged event list, sorted
+  by absolute tick") — and folds each Program Change, Pitch Bend,
+  and CC 0 / 1 / 7 / 10 / 11 / 32 / 64 into the snapshot. Fields
+  that no matching event has touched stay at the SMF + GM 1
+  (RP-003) recommended defaults: volume 100, pan 64, expression
+  127, modulation 0, sustain off, pitch_bend `0x2000`; program /
+  bank stay `None` so a seek-time initialiser can skip emitting
+  CCs the file never wrote. Notes / aftertouch are ignored — they
+  affect voice state, not channel state — so the snapshot is
+  cheap to compute for any tick without enumerating sounding
+  notes. Events at exactly `tick` are *included* (the snapshot
+  reflects state immediately after that tick fires). Channels
+  `>= 16` fall through to the default snapshot rather than panic.
+  Sustain pedal decodes the CC 64 value with the spec threshold
+  (`value >= 64` = on). The fold operation is also exposed
+  publicly as `SmfChannelSnapshot::apply(&ChannelBody)` so callers
+  running custom replay (e.g. against a custom track ordering)
+  can reuse the same wire semantics. The bulk accessor pools
+  events into one pass so initialising every channel at a seek
+  target is single-pass rather than 16-pass — the natural primitive
+  for a DAW seeking into the middle of a file.
 - `paths` — per-OS SoundFont/SFZ/DLS search paths plus the
   `OXIDEAV_SOUNDFONT_PATH` env-var override.
 - `instruments::sf2` — full SoundFont 2 RIFF reader and voice

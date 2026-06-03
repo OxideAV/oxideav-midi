@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 213 — `SmfFile::channel_snapshot_at` / `channel_snapshots_at` (channel-state seek primitive)
+
+- New `smf::SmfChannelSnapshot { program, bank_msb, bank_lsb, volume,
+  pan, expression, modulation, sustain, pitch_bend }` capturing the
+  on-the-wire channel state of one MIDI channel at one absolute SMF
+  tick. Fields that no event has touched stay at the SMF + GM 1
+  (RP-003) recommended defaults: `volume = 100`, `pan = 64`,
+  `expression = 127`, `modulation = 0`, `sustain = false`,
+  `pitch_bend = 0x2000`; `program` / `bank_msb` / `bank_lsb` stay
+  `None` so a seek-time initialiser can skip emitting CCs the file
+  never wrote.
+- New `SmfFile::channel_snapshot_at(channel, tick) ->
+  SmfChannelSnapshot` and `SmfFile::channel_snapshots_at(tick) ->
+  [SmfChannelSnapshot; 16]`. Each replays every channel-voice event
+  from every track up to and including the requested tick, in
+  scheduler order — a stable merge by `(tick, track, in-track)`,
+  track 0 winning over track 1 at the same tick, the same
+  convention `tempo_map` / `time_signatures` / `key_signatures` /
+  the eight text-meta helpers / `smpte_offsets` and `scheduler.rs`
+  §"merged event list, sorted by absolute tick" use.
+- The fold updates the snapshot for Program Change, Pitch Bend,
+  and Control Change on the seven channel-state CCs (CC 0 Bank
+  Select MSB, CC 1 Modulation Wheel, CC 7 Channel Volume, CC 10
+  Pan, CC 11 Expression, CC 32 Bank Select LSB, CC 64 Sustain
+  Pedal). Notes / poly + channel aftertouch are ignored — they
+  affect voice state, not channel state — so the snapshot is
+  cheap to compute for any tick without enumerating sounding
+  notes. Sustain pedal decodes the CC 64 value with the spec
+  threshold (`value >= 64` = on, `< 64` = off).
+- Events at exactly `tick` are *included* in the replay — the
+  snapshot reflects state immediately after that tick fires.
+  Channels `>= 16` (not a legal MIDI channel) fall through to the
+  default snapshot rather than panic / index-out.
+- Bulk accessor `channel_snapshots_at` pools every track's events
+  into a single merge + replay pass so initialising all 16
+  channels at a seek target is single-pass rather than 16-pass —
+  the natural primitive for a DAW or player seeking into the
+  middle of a file.
+- `SmfChannelSnapshot::apply(&ChannelBody)` is also exposed
+  publicly so callers running custom replay (e.g. against a
+  custom track ordering or a filtered event set) can reuse the
+  same wire semantics.
+- This is the first SMF-file accessor that moves beyond the
+  "iterate every meta event" lens introduced by `tempo_map` /
+  `time_signatures` / `key_signatures` / the eight text-meta
+  helpers / `smpte_offsets`. The iteration helpers answer "when
+  does X fire?"; the snapshot answers "what is the wire state at
+  T?" — the two are complementary primitives for SMF seeking and
+  inspection.
+- 15 new dedicated tests: default snapshot when no events,
+  Program Change at tick 0, the four CC dimensions
+  (volume / pan / expression / modulation), CC 64 threshold at 63
+  vs. 64, Bank Select MSB + LSB independence, 14-bit Pitch Bend
+  decode, tick-filter inclusion of events at exact tick (90 →
+  100 → 199 → 200 → ∞ walk), running-status Program Change
+  series replayed, multi-channel independence, notes /
+  aftertouch leave the snapshot at defaults, unknown CCs
+  (`CC 99` / `CC 100`) ignored, invalid channel returns default,
+  bulk `channel_snapshots_at` returns 16 independent states
+  consistent with per-channel calls, multi-track merge at same
+  tick honours track 0 → track 1 stable order (last-writer-wins
+  on the wire), public `SmfChannelSnapshot::apply` round-trips
+  every event-kind.
+
 ### Round 208 — `SmfFile::smpte_offsets()` iteration helper + `FrameRate` decoder (`FF 54`)
 
 - New `smf::SmpteOffsetEvent { tick, track, hours_raw, minutes,

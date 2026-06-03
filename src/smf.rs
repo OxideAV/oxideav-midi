@@ -1641,6 +1641,245 @@ impl SmfFile {
         out.sort_by_key(|c| c.tick);
         out
     }
+
+    /// Reconstruct the **on-the-wire channel state** for `channel`
+    /// (0..=15) at absolute `tick`, by replaying every channel-voice
+    /// event up to and including `tick` against the SMF spec's
+    /// well-defined CC and program / pitch-bend defaults.
+    ///
+    /// Returns an [`SmfChannelSnapshot`] capturing the "what would a
+    /// receiver be set to at this point" view of the channel: last
+    /// Program Change, Bank Select MSB / LSB (CC 0 / CC 32), Channel
+    /// Volume (CC 7), Pan (CC 10), Expression (CC 11), Modulation
+    /// Wheel (CC 1), Sustain Pedal (CC 64, decoded as `value >= 64`),
+    /// and the current 14-bit Pitch Bend value.
+    ///
+    /// This is the seek primitive: a player that wants to start
+    /// playback at tick `T` calls
+    /// `channel_snapshots_at(T)` once, pushes each non-default field
+    /// into its synth as if a CC / Program Change / Pitch Bend had
+    /// just arrived, and then begins emitting events at or after `T`.
+    /// Without this initialisation the synth would render every note
+    /// after `T` against GM defaults (volume 100, pan centre, modwheel
+    /// 0, ...) rather than the state the file's earlier events had
+    /// established.
+    ///
+    /// Events are replayed in scheduler order — every track is
+    /// time-merged with a stable sort by absolute tick, track 0
+    /// winning over track 1 at the same tick — exactly the merge
+    /// rule used by [`SmfFile::tempo_map`] / `time_signatures` /
+    /// `key_signatures` / the eight text-meta helpers /
+    /// `smpte_offsets` and by `scheduler.rs` §"merged event list,
+    /// sorted by absolute tick". Events at exactly `tick` are
+    /// included in the replay — the snapshot reflects the channel
+    /// state immediately *after* that tick fires.
+    ///
+    /// Format-2 files keep tracks independent (each is a separate
+    /// pattern). The snapshot still pools every track's events into
+    /// one timeline; callers playing one format-2 track in isolation
+    /// should instead inspect [`SmfFile::tracks`] directly. (A
+    /// format-2-aware variant could be added in a later round if the
+    /// generic merge proves wrong for those callers.)
+    ///
+    /// Defaults follow the SMF spec + GM 1 *General MIDI System Level
+    /// 1 Specification* (RP-003) recommended initial values:
+    ///
+    /// | field                    | default | source                       |
+    /// |--------------------------|---------|------------------------------|
+    /// | `program`                | `None`  | spec: no implicit program    |
+    /// | `bank_msb`               | `None`  | spec: no implicit bank       |
+    /// | `bank_lsb`               | `None`  | spec: no implicit bank       |
+    /// | `volume` (CC 7)          | `100`   | GM 1 §"Default Channel Vol." |
+    /// | `pan` (CC 10)            | `64`    | GM 1 §"Default Pan = centre" |
+    /// | `expression` (CC 11)     | `127`   | GM 1 §"Default Expression"   |
+    /// | `modulation` (CC 1)      | `0`     | GM 1 §"Default Modulation"   |
+    /// | `sustain` (CC 64)        | `false` | GM 1 §"Default Sustain Off"  |
+    /// | `pitch_bend`             | `0x2000`| SMF §"En lsb msb" centre     |
+    ///
+    /// The implementation is linear in the total event count and
+    /// bounded above by [`MAX_EVENTS_PER_FILE`] — same as the
+    /// existing iteration helpers. Note-on / note-off / aftertouch
+    /// events are *not* replayed — they affect voice state, not
+    /// channel state — so the snapshot is independent of the
+    /// note timeline.
+    pub fn channel_snapshot_at(&self, channel: u8, tick: u64) -> SmfChannelSnapshot {
+        let mut snap = SmfChannelSnapshot::default();
+        if channel >= 16 {
+            return snap;
+        }
+        // Build a (abs_tick, track_idx, in_track_idx) ordering across
+        // every channel-voice event on `channel`, then replay them
+        // in (tick, track, in-track) order — stable sort preserves
+        // the scheduler's merge convention.
+        let mut events: Vec<(u64, usize, usize, ChannelBody)> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for (in_track_idx, ev) in track.events.iter().enumerate() {
+                abs = abs.saturating_add(ev.delta as u64);
+                if abs > tick {
+                    break;
+                }
+                if let Event::Channel(ChannelMessage { channel: ch, body }) = &ev.kind {
+                    if *ch == channel {
+                        events.push((abs, track_idx, in_track_idx, *body));
+                    }
+                }
+            }
+        }
+        events.sort_by_key(|(t, tr, ix, _)| (*t, *tr, *ix));
+        for (_, _, _, body) in events {
+            snap.apply(&body);
+        }
+        snap
+    }
+
+    /// Reconstruct an [`SmfChannelSnapshot`] for **every** MIDI
+    /// channel (0..=15) at absolute `tick`. Equivalent to calling
+    /// [`channel_snapshot_at`](Self::channel_snapshot_at) sixteen
+    /// times, but walks the tracks only once — useful when seeking
+    /// since a player typically initialises every channel at the
+    /// seek target.
+    ///
+    /// Returns a `[SmfChannelSnapshot; 16]` indexed by channel: index
+    /// 9 is the drum channel ("MIDI channel 10" in human-facing
+    /// tools); index 0 is the first programmable channel ("MIDI
+    /// channel 1"). All sixteen entries start from the SMF / GM 1
+    /// defaults documented on
+    /// [`channel_snapshot_at`](Self::channel_snapshot_at#defaults).
+    pub fn channel_snapshots_at(&self, tick: u64) -> [SmfChannelSnapshot; 16] {
+        let mut snaps: [SmfChannelSnapshot; 16] =
+            std::array::from_fn(|_| SmfChannelSnapshot::default());
+        // Walk every track once and dispatch each channel-voice event
+        // into the matching snapshot in (tick, track, in-track) order.
+        // We need a stable order, so accumulate into a single Vec
+        // and sort, mirroring the merge convention the per-helper
+        // accessors use.
+        let mut events: Vec<(u64, usize, usize, u8, ChannelBody)> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for (in_track_idx, ev) in track.events.iter().enumerate() {
+                abs = abs.saturating_add(ev.delta as u64);
+                if abs > tick {
+                    break;
+                }
+                if let Event::Channel(ChannelMessage { channel, body }) = &ev.kind {
+                    events.push((abs, track_idx, in_track_idx, *channel, *body));
+                }
+            }
+        }
+        events.sort_by_key(|(t, tr, ix, _, _)| (*t, *tr, *ix));
+        for (_, _, _, channel, body) in events {
+            if (channel as usize) < snaps.len() {
+                snaps[channel as usize].apply(&body);
+            }
+        }
+        snaps
+    }
+}
+
+/// Channel-level state of an SMF stream at one absolute tick, as
+/// reconstructed by [`SmfFile::channel_snapshot_at`] /
+/// [`SmfFile::channel_snapshots_at`].
+///
+/// Each field reflects the *most recent* matching channel-voice event
+/// up to and including the snapshot tick. Fields that no event has
+/// touched stay at the SMF / GM 1 recommended default (see the
+/// defaults table on [`SmfFile::channel_snapshot_at`]).
+///
+/// The snapshot is intentionally a "wire-state" view: it captures
+/// what a receiver would be set to, not what the *audible* state is.
+/// Note-on / note-off / aftertouch events are not folded in (they
+/// affect voice state, not channel state), so the snapshot can be
+/// produced cheaply for any tick without enumerating sounding notes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SmfChannelSnapshot {
+    /// Last MIDI Program Change (`Cn pp`) seen on this channel before
+    /// the snapshot tick, or `None` if no Program Change has fired.
+    /// A player initialising from this snapshot at seek time should
+    /// emit a `Cn pp` to the synth before the first note when this is
+    /// `Some`, otherwise leave the program alone (it's already on
+    /// power-up patch 0 by default).
+    pub program: Option<u8>,
+    /// Bank Select MSB (CC 0), or `None` if no `Bn 00 vv` has fired.
+    /// Per the GM 2 / MMA Bank Select convention, a seek-time
+    /// initialiser should emit CC 0 + CC 32 + Program Change in that
+    /// order to switch banks. Surfacing `None` lets the caller skip
+    /// the CC 0 emission when no bank select ever happened.
+    pub bank_msb: Option<u8>,
+    /// Bank Select LSB (CC 32), or `None` if no `Bn 20 vv` has fired.
+    pub bank_lsb: Option<u8>,
+    /// Channel Volume (CC 7), 0..=127. Default 100 per GM 1 §"Default
+    /// Channel Volume".
+    pub volume: u8,
+    /// Pan (CC 10), 0..=127, 64 = centre. Default 64 per GM 1
+    /// §"Default Pan = centre".
+    pub pan: u8,
+    /// Expression Controller (CC 11), 0..=127. Default 127 — GM 1
+    /// §"Default Expression = full" specifies the controller is at
+    /// full scale on power-up so that Channel Volume drives the
+    /// final attenuation alone until an explicit `Bn 0B vv` arrives.
+    pub expression: u8,
+    /// Modulation Wheel (CC 1), 0..=127. Default 0.
+    pub modulation: u8,
+    /// Sustain Pedal (CC 64). `true` when the most recent
+    /// `Bn 40 vv` had `vv >= 64`; the spec defines `vv < 64` as
+    /// "off" and `vv >= 64` as "on". Default `false`.
+    pub sustain: bool,
+    /// Live Pitch Bend value as the raw 14-bit MIDI scalar
+    /// (`0..=16383`). Centre is `0x2000`. Default `0x2000` (no bend).
+    /// Decoded from `En lsb msb` as `(msb << 7) | lsb`.
+    pub pitch_bend: u16,
+}
+
+impl Default for SmfChannelSnapshot {
+    fn default() -> Self {
+        Self {
+            program: None,
+            bank_msb: None,
+            bank_lsb: None,
+            volume: 100,
+            pan: 64,
+            expression: 127,
+            modulation: 0,
+            sustain: false,
+            pitch_bend: 0x2000,
+        }
+    }
+}
+
+impl SmfChannelSnapshot {
+    /// Fold one channel-voice event into the snapshot. Used by
+    /// [`SmfFile::channel_snapshot_at`] /
+    /// [`SmfFile::channel_snapshots_at`] during their replay loop;
+    /// exposed publicly so callers running their own replay (e.g.
+    /// against a custom track ordering) can reuse the same wire
+    /// semantics.
+    ///
+    /// Note-on / note-off / poly-aftertouch / channel-aftertouch are
+    /// **ignored** here — they don't modify channel state. Only CC,
+    /// Program Change, and Pitch Bend update the snapshot.
+    pub fn apply(&mut self, body: &ChannelBody) {
+        match *body {
+            ChannelBody::ControlChange { controller, value } => match controller {
+                0 => self.bank_msb = Some(value),
+                1 => self.modulation = value,
+                7 => self.volume = value,
+                10 => self.pan = value,
+                11 => self.expression = value,
+                32 => self.bank_lsb = Some(value),
+                64 => self.sustain = value >= 64,
+                _ => {} // other CCs aren't yet tracked on the snapshot
+            },
+            ChannelBody::ProgramChange { program } => self.program = Some(program),
+            ChannelBody::PitchBend { value } => self.pitch_bend = value,
+            ChannelBody::NoteOn { .. }
+            | ChannelBody::NoteOff { .. }
+            | ChannelBody::PolyAftertouch { .. }
+            | ChannelBody::ChannelAftertouch { .. } => {
+                // Voice / note state, not channel state — left alone.
+            }
+        }
+    }
 }
 
 // ───────────────────────── public entry point ─────────────────────────
@@ -4627,5 +4866,311 @@ mod tests {
             FrameRate::from_hours_byte(0b0110_0000),
             FrameRate::Fps30NonDrop
         );
+    }
+
+    // ───────── SmfChannelSnapshot / SmfFile::channel_snapshot_at ─────────
+
+    #[test]
+    fn channel_snapshot_default_when_no_events() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let snap = smf.channel_snapshot_at(0, 0);
+        assert_eq!(snap, SmfChannelSnapshot::default());
+        // Spec-recommended defaults survive verbatim.
+        assert_eq!(snap.program, None);
+        assert_eq!(snap.bank_msb, None);
+        assert_eq!(snap.bank_lsb, None);
+        assert_eq!(snap.volume, 100);
+        assert_eq!(snap.pan, 64);
+        assert_eq!(snap.expression, 127);
+        assert_eq!(snap.modulation, 0);
+        assert!(!snap.sustain);
+        assert_eq!(snap.pitch_bend, 0x2000);
+    }
+
+    #[test]
+    fn channel_snapshot_program_change_at_tick_zero() {
+        // delta=0 C0 05 (channel 0, program 5)
+        let events: Vec<u8> = vec![0x00, 0xC0, 0x05, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let snap = smf.channel_snapshot_at(0, 0);
+        assert_eq!(snap.program, Some(5));
+        // Other channels stay default.
+        let other = smf.channel_snapshot_at(1, 0);
+        assert_eq!(other.program, None);
+    }
+
+    #[test]
+    fn channel_snapshot_cc_volume_pan_expression_mod() {
+        // CC 7 = 80 (volume), CC 10 = 0 (pan hard left),
+        // CC 11 = 100 (expression), CC 1 = 50 (modwheel)
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x07, 0x50, // CC 7 = 80
+            0x00, 0xB0, 0x0A, 0x00, // CC 10 = 0
+            0x00, 0xB0, 0x0B, 0x64, // CC 11 = 100
+            0x00, 0xB0, 0x01, 0x32, // CC 1 = 50
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let snap = smf.channel_snapshot_at(0, 0);
+        assert_eq!(snap.volume, 80);
+        assert_eq!(snap.pan, 0);
+        assert_eq!(snap.expression, 100);
+        assert_eq!(snap.modulation, 50);
+    }
+
+    #[test]
+    fn channel_snapshot_sustain_pedal_threshold_64() {
+        // CC 64 with value 63 → off; CC 64 with value 64 → on.
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x40, 0x3F, // CC 64 = 63 → off
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let snap = smf.channel_snapshot_at(0, 0);
+        assert!(!snap.sustain);
+
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x40, 0x40, // CC 64 = 64 → on
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let snap = smf.channel_snapshot_at(0, 0);
+        assert!(snap.sustain);
+    }
+
+    #[test]
+    fn channel_snapshot_bank_select_msb_and_lsb_independent() {
+        // CC 0 = 7 (bank MSB), CC 32 = 3 (bank LSB)
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x00, 0x07, // CC 0 = 7
+            0x00, 0xB0, 0x20, 0x03, // CC 32 = 3
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let snap = smf.channel_snapshot_at(0, 0);
+        assert_eq!(snap.bank_msb, Some(7));
+        assert_eq!(snap.bank_lsb, Some(3));
+    }
+
+    #[test]
+    fn channel_snapshot_pitch_bend_14bit_decoded() {
+        // En lsb msb. Bend = (msb << 7) | lsb. Use lsb=0x40 msb=0x20 →
+        // value = 0x1040 = 4160.
+        let events: Vec<u8> = vec![
+            0x00, 0xE0, 0x40, 0x20, // pitch bend lsb=0x40 msb=0x20
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let snap = smf.channel_snapshot_at(0, 0);
+        assert_eq!(snap.pitch_bend, 0x1040);
+        // Centre default on a channel that never bent.
+        let other = smf.channel_snapshot_at(1, 0);
+        assert_eq!(other.pitch_bend, 0x2000);
+    }
+
+    #[test]
+    fn channel_snapshot_tick_filter_includes_events_at_tick_exactly() {
+        // CC 7 = 50 at tick 100; CC 7 = 90 at tick 200.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&encode_vlq(100));
+        events.extend_from_slice(&[0xB0, 0x07, 0x32]); // CC 7 = 50 at tick 100
+        events.extend_from_slice(&encode_vlq(100));
+        events.extend_from_slice(&[0xB0, 0x07, 0x5A]); // CC 7 = 90 at tick 200
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        // At tick 0 we haven't seen either CC yet.
+        assert_eq!(smf.channel_snapshot_at(0, 0).volume, 100);
+        // At tick 99 still nothing.
+        assert_eq!(smf.channel_snapshot_at(0, 99).volume, 100);
+        // At tick 100 the first CC fires.
+        assert_eq!(smf.channel_snapshot_at(0, 100).volume, 50);
+        // At tick 199 still the first CC.
+        assert_eq!(smf.channel_snapshot_at(0, 199).volume, 50);
+        // At tick 200 the second CC fires.
+        assert_eq!(smf.channel_snapshot_at(0, 200).volume, 90);
+        // At tick 99999 same as tick 200.
+        assert_eq!(smf.channel_snapshot_at(0, 99_999).volume, 90);
+    }
+
+    #[test]
+    fn channel_snapshot_running_status_program_changes_replayed() {
+        // Three successive Program Change events (running status: C0
+        // sticks across the trio). The snapshot at the end should
+        // reflect the last program.
+        let events: Vec<u8> = vec![
+            0x00, 0xC0, 0x01, // PC 1
+            0x00, 0x02, // running status PC 2
+            0x00, 0x03, // running status PC 3
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let snap = smf.channel_snapshot_at(0, 0);
+        assert_eq!(snap.program, Some(3));
+    }
+
+    #[test]
+    fn channel_snapshot_multi_channel_independence() {
+        // Channel 0 → program 10. Channel 5 → program 50.
+        let events: Vec<u8> = vec![
+            0x00, 0xC0, 0x0A, // C0 0A
+            0x00, 0xC5, 0x32, // C5 50
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let snap0 = smf.channel_snapshot_at(0, 0);
+        let snap5 = smf.channel_snapshot_at(5, 0);
+        assert_eq!(snap0.program, Some(10));
+        assert_eq!(snap5.program, Some(50));
+        assert_eq!(smf.channel_snapshot_at(1, 0).program, None);
+    }
+
+    #[test]
+    fn channel_snapshot_notes_and_aftertouch_do_not_alter_state() {
+        // Note-on / off / poly + channel aftertouch are pure voice
+        // events. None of them should modify the snapshot.
+        let events: Vec<u8> = vec![
+            0x00, 0x90, 0x3C, 0x64, // Note on
+            0x00, 0x80, 0x3C, 0x00, // Note off
+            0x00, 0xA0, 0x3C, 0x40, // Poly aftertouch
+            0x00, 0xD0, 0x55, // Channel aftertouch
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let snap = smf.channel_snapshot_at(0, 999);
+        assert_eq!(snap, SmfChannelSnapshot::default());
+    }
+
+    #[test]
+    fn channel_snapshot_unknown_ccs_ignored() {
+        // CC 99 + CC 100 are part of the NRPN / RPN-selector
+        // machinery. We don't track them on the snapshot yet — they
+        // should be ignored, leaving the rest of the snapshot at
+        // defaults.
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x63, 0x10, // CC 99 = 16
+            0x00, 0xB0, 0x64, 0x20, // CC 100 = 32
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let snap = smf.channel_snapshot_at(0, 999);
+        assert_eq!(snap, SmfChannelSnapshot::default());
+    }
+
+    #[test]
+    fn channel_snapshot_invalid_channel_returns_default() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        // Channels >= 16 are not legal MIDI channels and the helper
+        // returns the default snapshot rather than indexing-out.
+        assert_eq!(
+            smf.channel_snapshot_at(16, 0),
+            SmfChannelSnapshot::default()
+        );
+        assert_eq!(
+            smf.channel_snapshot_at(255, 0),
+            SmfChannelSnapshot::default()
+        );
+    }
+
+    #[test]
+    fn channel_snapshots_at_returns_sixteen_independent_states() {
+        // Program change on every channel: channel N → program 2*N + 1.
+        // This validates that the bulk method walks every channel in
+        // one pass and yields a per-channel array indexed by channel.
+        let mut events: Vec<u8> = Vec::new();
+        for ch in 0u8..16 {
+            let status = 0xC0 | ch;
+            let program = 2 * ch + 1;
+            events.extend_from_slice(&[0x00, status, program]);
+        }
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let snaps = smf.channel_snapshots_at(0);
+        for (ch, snap) in snaps.iter().enumerate() {
+            assert_eq!(
+                snap.program,
+                Some((2 * ch + 1) as u8),
+                "channel {ch} expected program {}",
+                2 * ch + 1
+            );
+        }
+        // Per-channel call must agree with the bulk call.
+        for ch in 0u8..16 {
+            assert_eq!(snaps[ch as usize], smf.channel_snapshot_at(ch, 0));
+        }
+    }
+
+    #[test]
+    fn channel_snapshots_at_merge_across_tracks_track0_wins_at_same_tick() {
+        // Both tracks emit CC 7 on channel 0 at tick 0. Track 0
+        // writes 30; track 1 writes 70. Per the stable-merge rule
+        // (track 0 before track 1 at the same tick), track 1 fires
+        // last → snapshot reflects 70 (last-writer-wins is the wire
+        // semantics: the receiver overwrites volume each time).
+        let t0: Vec<u8> = vec![0x00, 0xB0, 0x07, 0x1E, 0x00, 0xFF, 0x2F, 0x00];
+        let t1: Vec<u8> = vec![0x00, 0xB0, 0x07, 0x46, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let snap = smf.channel_snapshot_at(0, 0);
+        assert_eq!(snap.volume, 70);
+    }
+
+    #[test]
+    fn channel_snapshot_apply_is_public_reusable() {
+        // The fold operation is exposed so callers running custom
+        // replay can reuse the same wire semantics.
+        let mut snap = SmfChannelSnapshot::default();
+        snap.apply(&ChannelBody::ProgramChange { program: 42 });
+        snap.apply(&ChannelBody::ControlChange {
+            controller: 7,
+            value: 10,
+        });
+        snap.apply(&ChannelBody::ControlChange {
+            controller: 64,
+            value: 80,
+        });
+        snap.apply(&ChannelBody::PitchBend { value: 12345 });
+        assert_eq!(snap.program, Some(42));
+        assert_eq!(snap.volume, 10);
+        assert!(snap.sustain);
+        assert_eq!(snap.pitch_bend, 12345);
+        // Note-on doesn't alter channel state.
+        let before = snap;
+        snap.apply(&ChannelBody::NoteOn {
+            key: 60,
+            velocity: 100,
+        });
+        assert_eq!(snap, before);
     }
 }
