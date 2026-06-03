@@ -198,6 +198,25 @@ framework but usable standalone.
   smpte_offsets,sequencer_specifics}`), covering every rhythmic +
   text + cueing + sequencer-private meta event the spec defines a
   per-event "when it fires" lens for.
+  Round 224 adds the pattern-cueing companion
+  `SmfFile::sequence_numbers()` — every `FF 00 02 ssss` Sequence
+  Number Meta-Event as a `SequenceNumberEvent { tick, track, number
+  }` with the absolute tick on the parent track, stably merged
+  across tracks (track 0 before track 1 at the same tick) under the
+  same merge rule as every existing iteration helper and the
+  scheduler. `ssss` is decoded big-endian into a `u16`. The Standard
+  MIDI File Specification 1.0 reserves the event for delta-time zero
+  (the first event of a track) — on a format-2 file it labels each
+  pattern so the sequence can be cued from a Song Select, and on a
+  format-1 / format-0 file it labels the file as a whole — but the
+  helper surfaces every occurrence rather than enforcing the
+  placement rule so files that carry the label later in a track
+  still round-trip. `SequenceNumberEvent::number()` returns the
+  decoded identifier. Lifts the SMF meta-event iterator family from
+  12 to **13** total
+  (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
+  lyrics,cue_points,track_names,instrument_names,texts,copyrights,
+  smpte_offsets,sequencer_specifics,sequence_numbers}`).
   Round 213 lifts the SMF-file accessor surface beyond the
   "iterate every meta event" lens with a **channel-state
   snapshot** primitive for seeking: `SmfChannelSnapshot { program,

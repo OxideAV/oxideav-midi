@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 224 — `SmfFile::sequence_numbers()` (FF 00)
+
+- New `smf::SequenceNumberEvent { tick, track, number }` value type
+  pinned to the absolute tick at which an `FF 00 02 ssss` Sequence
+  Number Meta-Event fires on its parent track.
+  `SequenceNumberEvent::number()` returns the 16-bit identifier (the
+  `ssss` payload is decoded big-endian).
+- New `SmfFile::sequence_numbers() -> Vec<SequenceNumberEvent>`
+  iterator helper that walks every track, sums the per-track
+  cumulative deltas, and stably merges the matching `FF 00` events
+  across tracks (track 0 before track 1 at the same tick) under the
+  same merge rule the other 12 meta-event helpers and `scheduler.rs`
+  §"merged event list, sorted by absolute tick" already use.
+- The Standard MIDI File Specification 1.0 reserves the event for
+  delta-time zero (the first event of a track) and uses it to label
+  a format-2 pattern so it can be cued from a Song Select, but the
+  helper surfaces every occurrence rather than enforcing the
+  placement rule so files that carry the label later in a track
+  still round-trip. Format-1 / format-0 files conventionally place
+  the event on track 0 to label the file as a whole.
+- Lifts the SMF meta-event iterator family from 12 to **13** total
+  (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
+  lyrics,cue_points,track_names,instrument_names,texts,copyrights,
+  smpte_offsets,sequencer_specifics,sequence_numbers}`).
+- 8 new unit tests covering: empty case, single label at tick 0,
+  big-endian decode (`0x1234`), full `0xFFFF` round-trip, format-2
+  per-pattern labels, same-tick stable sort (track 0 before track
+  1), late-position absolute-tick tracking, and filter exclusion
+  against the surrounding `FF 01` / `FF 03` / `FF 05` / `FF 51` /
+  `FF 54` / `FF 58` / `FF 59` / `FF 7F` events.
+
 ### Round 219 — `SmfFile::sequencer_specifics()` (FF 7F)
 
 - New `smf::SequencerSpecificEvent { tick, track, data }` value type

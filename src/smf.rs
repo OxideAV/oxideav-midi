@@ -1032,6 +1032,56 @@ impl SequencerSpecificEvent {
     }
 }
 
+/// One sequence-number meta event pinned to the absolute tick
+/// (relative to the start of its parent track) at which the
+/// [`FF 00 02 ssss`](MetaEvent::SequenceNumber) meta event fires.
+///
+/// Returned by [`SmfFile::sequence_numbers`] — see that method for
+/// the merge semantics across multiple tracks.
+///
+/// `FF 00 02 ssss` declares a 16-bit identifier for the sequence the
+/// track belongs to. The Standard MIDI File Specification 1.0 reserves
+/// the event for the very first event of a track (delta time zero); on
+/// a format-2 file it labels each pattern so the sequence can be cued
+/// from a Song Select / MIDI Cue message, and on a format-0 / format-1
+/// file it labels the file as a whole (the spec recommends placing it
+/// on the conductor / track-0). The parser surfaces every occurrence
+/// in time order so callers can recover labels from files that place
+/// the event off the recommended tick or carry one per track.
+///
+/// This helper isolates the `FF 00` stream so callers cueing pattern
+/// playback or building DAW track lists keyed on the sequence ID get
+/// a clean time-ordered list independent of the surrounding text /
+/// rhythmic / cueing / sequencer-private meta events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SequenceNumberEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase. The Standard
+    /// MIDI File Specification 1.0 reserves the event for delta-time
+    /// zero (the first event of a track); the parser surfaces every
+    /// occurrence rather than enforcing the placement rule so files
+    /// that carry the event later in a track still round-trip.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). Format-1 files conventionally place the
+    /// label on track 0 (conductor); format-2 files carry one per
+    /// pattern track so each pattern has its own identifier.
+    pub track: usize,
+    /// The 16-bit sequence identifier (`ssss` from the `FF 00 02 ssss`
+    /// byte sequence, big-endian). The Standard MIDI File
+    /// Specification 1.0 leaves the value space unconstrained — any
+    /// `0..=65535` is legal and round-tripped verbatim.
+    pub number: u16,
+}
+
+impl SequenceNumberEvent {
+    /// The 16-bit sequence identifier.
+    pub fn number(&self) -> u16 {
+        self.number
+    }
+}
+
 impl SmfFile {
     /// Collect every [`MetaEvent::Tempo`] from every track, pinned to
     /// the absolute tick at which it fires, in time order.
@@ -1745,6 +1795,66 @@ impl SmfFile {
                         tick: abs,
                         track: track_idx,
                         data: data.clone(),
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every [`MetaEvent::SequenceNumber`] (`FF 00 02 ssss`)
+    /// from every track, pinned to the absolute tick at which it
+    /// fires, in time order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two labels at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::tempo_map`] /
+    /// [`SmfFile::time_signatures`] / [`SmfFile::key_signatures`] /
+    /// [`SmfFile::markers`] / [`SmfFile::lyrics`] /
+    /// [`SmfFile::cue_points`] / [`SmfFile::track_names`] /
+    /// [`SmfFile::instrument_names`] / [`SmfFile::texts`] /
+    /// [`SmfFile::copyrights`] / [`SmfFile::smpte_offsets`] /
+    /// [`SmfFile::sequencer_specifics`] and the scheduler use
+    /// (`scheduler.rs` §"merged event list, sorted by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries an `FF 00` meta
+    /// event. A file without explicit sequence numbers is legal; the
+    /// Standard MIDI File Specification 1.0 leaves the identifier
+    /// optional.
+    ///
+    /// Only `FF 00` is selected — neighbouring rhythmic, text, cueing,
+    /// and sequencer-private meta events stay on their own helpers so
+    /// callers cueing pattern playback from the sequence ID get a clean
+    /// time-ordered list independent of the surrounding meta streams.
+    ///
+    /// Lifts the SMF meta-event iterator family from 12 to **13**
+    /// total: `tempo_map`, `time_signatures`, `key_signatures`,
+    /// `markers`, `lyrics`, `cue_points`, `track_names`,
+    /// `instrument_names`, `texts`, `copyrights`, `smpte_offsets`,
+    /// `sequencer_specifics`, and `sequence_numbers`.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn sequence_numbers(&self) -> Vec<SequenceNumberEvent> {
+        let mut out: Vec<SequenceNumberEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::SequenceNumber(number)) = &ev.kind {
+                    out.push(SequenceNumberEvent {
+                        tick: abs,
+                        track: track_idx,
+                        number: *number,
                     });
                 }
             }
@@ -5151,6 +5261,155 @@ mod tests {
         assert_eq!(sx.len(), 1);
         assert_eq!(sx[0].tick, 240);
         assert_eq!(sx[0].data_bytes(), &[0x7D, 0x01]);
+    }
+
+    // ───────── SequenceNumberEvent / SmfFile::sequence_numbers (FF 00) ─────────
+
+    #[test]
+    fn sequence_numbers_empty_when_no_meta_event_present() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.sequence_numbers().is_empty());
+    }
+
+    #[test]
+    fn sequence_numbers_single_label_at_tick_zero() {
+        // delta=0 FF 00 02 00 2A   (sequence ID = 42)
+        // delta=0 FF 2F 00
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x00, 0x02, 0x00, 0x2A, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sn = smf.sequence_numbers();
+        assert_eq!(sn.len(), 1);
+        assert_eq!(sn[0].tick, 0);
+        assert_eq!(sn[0].track, 0);
+        assert_eq!(sn[0].number(), 42);
+    }
+
+    #[test]
+    fn sequence_numbers_big_endian_decode() {
+        // FF 00 02 12 34 → 0x1234
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x00, 0x02, 0x12, 0x34, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sn = smf.sequence_numbers();
+        assert_eq!(sn.len(), 1);
+        assert_eq!(sn[0].number, 0x1234);
+    }
+
+    #[test]
+    fn sequence_numbers_full_u16_range_round_trips() {
+        // FF 00 02 FF FF → 0xFFFF
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x00, 0x02, 0xFF, 0xFF, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sn = smf.sequence_numbers();
+        assert_eq!(sn.len(), 1);
+        assert_eq!(sn[0].number, 0xFFFF);
+    }
+
+    #[test]
+    fn sequence_numbers_format_2_per_pattern_labels() {
+        // Format 2: one sequence number per track, each labelling its
+        // pattern. The helper surfaces both in track order at tick 0.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xFF, 0x00, 0x02, 0x00, 0x01]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&[0x00, 0xFF, 0x00, 0x02, 0x00, 0x02]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(2, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let sn = smf.sequence_numbers();
+        assert_eq!(sn.len(), 2);
+        assert_eq!(sn[0].tick, 0);
+        assert_eq!(sn[0].track, 0);
+        assert_eq!(sn[0].number, 1);
+        assert_eq!(sn[1].tick, 0);
+        assert_eq!(sn[1].track, 1);
+        assert_eq!(sn[1].number, 2);
+    }
+
+    #[test]
+    fn sequence_numbers_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        // Two format-1 tracks both labelled at tick 0 — the stable
+        // sort keeps track 0 before track 1.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xFF, 0x00, 0x02, 0x00, 0x10]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&[0x00, 0xFF, 0x00, 0x02, 0x00, 0x11]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let sn = smf.sequence_numbers();
+        assert_eq!(sn.len(), 2);
+        assert_eq!(sn[0].track, 0);
+        assert_eq!(sn[0].number, 0x10);
+        assert_eq!(sn[1].track, 1);
+        assert_eq!(sn[1].number, 0x11);
+    }
+
+    #[test]
+    fn sequence_numbers_late_position_tracks_absolute_tick() {
+        // FF 00 is conventionally placed at delta-time zero, but the
+        // helper surfaces every occurrence in time order so files
+        // that place it later in a track still round-trip the label.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&encode_vlq(240));
+        events.extend_from_slice(&[0xFF, 0x00, 0x02, 0x07, 0xD0]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sn = smf.sequence_numbers();
+        assert_eq!(sn.len(), 1);
+        assert_eq!(sn[0].tick, 240);
+        assert_eq!(sn[0].number, 2000);
+    }
+
+    #[test]
+    fn sequence_numbers_filter_excludes_other_meta_kinds() {
+        // FF 00 02 ssss picked up; text + smpte + tempo + key/time
+        // signatures + sequencer-private all filtered out.
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x00, 0x02, 0x00, 0x05];
+        events.extend_from_slice(&[0x00, 0xFF, 0x01, 0x04]);
+        events.extend_from_slice(b"Note");
+        events.extend_from_slice(&[0x00, 0xFF, 0x03, 0x04]);
+        events.extend_from_slice(b"Lead");
+        events.extend_from_slice(&[0x00, 0xFF, 0x05, 0x02]);
+        events.extend_from_slice(b"la");
+        events.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x54, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x59, 0x02, 0x00, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x7F, 0x02, 0x41, 0x10]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sn = smf.sequence_numbers();
+        assert_eq!(sn.len(), 1);
+        assert_eq!(sn[0].number, 5);
+        // Sibling helpers stay uncontaminated.
+        assert_eq!(smf.texts().len(), 1);
+        assert_eq!(smf.track_names().len(), 1);
+        assert_eq!(smf.lyrics().len(), 1);
+        assert_eq!(smf.tempo_map().len(), 1);
+        assert_eq!(smf.smpte_offsets().len(), 1);
+        assert_eq!(smf.time_signatures().len(), 1);
+        assert_eq!(smf.key_signatures().len(), 1);
+        assert_eq!(smf.sequencer_specifics().len(), 1);
     }
 
     // ───────── SmfChannelSnapshot / SmfFile::channel_snapshot_at ─────────
