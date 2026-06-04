@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 230 — `SmfFile::midi_ports()` (FF 21)
+
+- New `smf::MidiPortEvent { tick, track, port }` value type pinned to
+  the absolute tick at which an `FF 21 01 pp` MIDI Port Meta-Event
+  fires on its parent track. `MidiPortEvent::port()` returns the
+  physical port byte (`0..=127`).
+- New `SmfFile::midi_ports() -> Vec<MidiPortEvent>` iterator helper
+  that walks every track, sums the per-track cumulative deltas, and
+  stably merges the matching `FF 21` events across tracks (track 0
+  before track 1 at the same tick) under the same merge rule the
+  other 13 meta-event helpers and `scheduler.rs` §"merged event
+  list, sorted by absolute tick" already use.
+- The `FF 21` Meta-Event carries an unofficial routing hint: the
+  single payload byte names the physical output port the
+  surrounding channel-voice messages on this track should be
+  dispatched through. The Standard MIDI File Specification 1.0 caps
+  a single channel-voice stream at 16 channels (the four status
+  nibbles `8x..Ex` combined with the four channel bits `x0..xF`);
+  the port hint lets a multi-port DAW back-end multiply that ceiling
+  by however many physical outputs it wires up, by labelling each
+  track with the port it routes to. The convention is one `FF 21`
+  near the start of a track (delta zero, before the first
+  channel-voice event), but the helper surfaces every occurrence
+  rather than enforcing the placement rule so files that re-route
+  mid-track still round-trip the hint.
+- Only `FF 21` is selected — the neighbouring `FF 20` channel-prefix
+  hint (different routing semantics: per-message channel override
+  versus per-track physical port assignment) stays on its own so the
+  port-routing layer gets a clean time-ordered list independent of
+  the surrounding meta streams.
+- Lifts the SMF meta-event iterator family from 13 to **14** total
+  (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
+  lyrics,cue_points,track_names,instrument_names,texts,copyrights,
+  smpte_offsets,sequencer_specifics,sequence_numbers,midi_ports}`).
+- 8 new unit tests covering: empty case, single hint at tick 0, full
+  7-bit range (`0x7F`) round-trip, per-track routing in a format-1
+  multi-port file, same-tick stable sort (track 0 before track 1),
+  cross-track merge sorted by tick, late-position absolute-tick
+  tracking after a channel-voice event, and filter exclusion against
+  the surrounding `FF 00` / `FF 01` / `FF 03` / `FF 05` / `FF 20` /
+  `FF 51` / `FF 54` / `FF 58` / `FF 59` / `FF 7F` events (the
+  `FF 20` sibling test pins the channel-prefix-vs-port distinction).
+
 ### Round 224 — `SmfFile::sequence_numbers()` (FF 00)
 
 - New `smf::SequenceNumberEvent { tick, track, number }` value type

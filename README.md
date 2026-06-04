@@ -217,6 +217,31 @@ framework but usable standalone.
   (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
   lyrics,cue_points,track_names,instrument_names,texts,copyrights,
   smpte_offsets,sequencer_specifics,sequence_numbers}`).
+  Round 230 adds the multi-port-routing companion
+  `SmfFile::midi_ports()` — every `FF 21 01 pp` MIDI Port Meta-Event
+  as a `MidiPortEvent { tick, track, port }` with the absolute tick
+  on the parent track, stably merged across tracks (track 0 before
+  track 1 at the same tick) under the same merge rule as every
+  existing iteration helper and the scheduler. `pp` is the physical
+  port byte (`0..=127`); the Standard MIDI File Specification 1.0
+  leaves the mapping from port index to physical output up to the
+  receiving application — typically `0` is the first output port,
+  `1` the second, and so on. The pre-multi-port convention places
+  one `FF 21` near the start of a track (delta zero, before the
+  first channel-voice event) so a multi-port back-end can dispatch
+  each track's channel stream through 16 × N channels, but the
+  helper surfaces every occurrence rather than enforcing the
+  placement rule so files that re-route mid-track still round-trip.
+  `MidiPortEvent::port()` returns the decoded byte. Only `FF 21` is
+  selected — the neighbouring `FF 20` channel-prefix hint stays on
+  its own (different routing semantics: per-message channel
+  override versus per-track physical port assignment) so the
+  port-routing layer gets a clean time-ordered list independent of
+  the surrounding meta streams. Lifts the SMF meta-event iterator
+  family from 13 to **14** total
+  (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
+  lyrics,cue_points,track_names,instrument_names,texts,copyrights,
+  smpte_offsets,sequencer_specifics,sequence_numbers,midi_ports}`).
   Round 213 lifts the SMF-file accessor surface beyond the
   "iterate every meta event" lens with a **channel-state
   snapshot** primitive for seeking: `SmfChannelSnapshot { program,

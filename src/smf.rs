@@ -1082,6 +1082,68 @@ impl SequenceNumberEvent {
     }
 }
 
+/// One MIDI Port meta event pinned to the absolute tick (relative to
+/// the start of its parent track) at which the
+/// [`FF 21 01 pp`](MetaEvent::Port) meta event fires.
+///
+/// Returned by [`SmfFile::midi_ports`] — see that method for the merge
+/// semantics across multiple tracks.
+///
+/// `FF 21 01 pp` carries an unofficial routing hint that was added to
+/// the SMF spec ahead of the multi-port era: the single payload byte
+/// names the **physical port** (`0..=127`) the surrounding channel
+/// messages on this track should be dispatched through. The Standard
+/// MIDI File Specification 1.0 keeps four channel-message status
+/// nibbles (`8x..Ex` for `Note Off..Pitch Bend`) and four channel bits
+/// (`x0..xF`), which caps a single output stream at 16 channels; the
+/// `FF 21` hint multiplies that ceiling by however many physical ports
+/// the receiving sequencer wires up, by labelling each track with the
+/// port it routes to. The convention is one `FF 21` near the start of
+/// the track (delta-time zero, before the first channel-voice event)
+/// and at most one per track, but the parser surfaces every occurrence
+/// in time order so files that re-route mid-track still round-trip.
+///
+/// This helper isolates the `FF 21` stream so callers driving a
+/// multi-port DAW back-end (16 channels × N ports) get a clean
+/// time-ordered list independent of the surrounding meta streams. The
+/// payload byte is surfaced verbatim — values `> 127` cannot occur (the
+/// parser rejects them at the `data.len() == 1` precondition) and the
+/// spec leaves the mapping from port index to physical destination up
+/// to the receiving application.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MidiPortEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase. The
+    /// pre-multi-port convention places the routing hint at delta-time
+    /// zero; the parser surfaces every occurrence rather than enforcing
+    /// the placement rule so files that re-route mid-track still
+    /// round-trip.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). The port-routing convention pairs one
+    /// `FF 21` with the channel-voice stream on that track, so this
+    /// field tells a multi-port back-end which track's channel
+    /// messages the port assignment applies to.
+    pub track: usize,
+    /// The physical port byte (the `pp` payload of `FF 21 01 pp`,
+    /// `0..=127`). The Standard MIDI File Specification 1.0 leaves the
+    /// mapping from this index to a physical 5-pin DIN output up to
+    /// the receiving application — typically `0` is the first output
+    /// port, `1` the second, and so on. Values `> 127` cannot occur:
+    /// the spec reserves the high bit for status / running-status use
+    /// and the parser rejects `FF 21` payloads that aren't exactly one
+    /// byte.
+    pub port: u8,
+}
+
+impl MidiPortEvent {
+    /// The physical port index (`0..=127`).
+    pub fn port(&self) -> u8 {
+        self.port
+    }
+}
+
 impl SmfFile {
     /// Collect every [`MetaEvent::Tempo`] from every track, pinned to
     /// the absolute tick at which it fires, in time order.
@@ -1855,6 +1917,87 @@ impl SmfFile {
                         tick: abs,
                         track: track_idx,
                         number: *number,
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every [`MetaEvent::Port`] (`FF 21 01 pp`) from every
+    /// track, pinned to the absolute tick at which it fires, in time
+    /// order.
+    ///
+    /// `FF 21 01 pp` carries an unofficial routing hint: the single
+    /// payload byte (`pp`, `0..=127`) names the physical port the
+    /// surrounding channel messages on this track should be dispatched
+    /// through. The Standard MIDI File Specification 1.0 caps a single
+    /// channel-voice stream at 16 channels (the four status nibbles
+    /// `8x..Ex` combined with the four channel bits `x0..xF`); the
+    /// port hint lets a multi-port DAW back-end multiply that ceiling
+    /// by however many physical outputs it wires up, by labelling each
+    /// track with the port it routes to.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two hints at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::tempo_map`] /
+    /// [`SmfFile::time_signatures`] / [`SmfFile::key_signatures`] /
+    /// [`SmfFile::markers`] / [`SmfFile::lyrics`] /
+    /// [`SmfFile::cue_points`] / [`SmfFile::track_names`] /
+    /// [`SmfFile::instrument_names`] / [`SmfFile::texts`] /
+    /// [`SmfFile::copyrights`] / [`SmfFile::smpte_offsets`] /
+    /// [`SmfFile::sequencer_specifics`] / [`SmfFile::sequence_numbers`]
+    /// and the scheduler use (`scheduler.rs` §"merged event list,
+    /// sorted by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries an `FF 21` meta
+    /// event. A file without explicit port hints is legal; the
+    /// pre-multi-port convention is one output port, so a receiver
+    /// that finds no `FF 21` should dispatch every channel-voice
+    /// event through port `0` (or whatever the application's default
+    /// is).
+    ///
+    /// Only `FF 21` is selected — the neighbouring `FF 20`
+    /// channel-prefix hint (deprecated, but seen in the wild) /
+    /// rhythmic, text, cueing, and sequencer-private meta events stay
+    /// on their own helpers so callers driving a port-routing layer
+    /// get a clean time-ordered list independent of the surrounding
+    /// meta streams.
+    ///
+    /// The convention is one `FF 21` near the start of a track (delta
+    /// zero, before the first channel-voice event) and at most one
+    /// per track, but the helper surfaces every occurrence rather
+    /// than enforcing the placement rule so files that re-route
+    /// mid-track still round-trip.
+    ///
+    /// Lifts the SMF meta-event iterator family from 13 to **14**
+    /// total: `tempo_map`, `time_signatures`, `key_signatures`,
+    /// `markers`, `lyrics`, `cue_points`, `track_names`,
+    /// `instrument_names`, `texts`, `copyrights`, `smpte_offsets`,
+    /// `sequencer_specifics`, `sequence_numbers`, and `midi_ports`.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn midi_ports(&self) -> Vec<MidiPortEvent> {
+        let mut out: Vec<MidiPortEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::Port(port)) = &ev.kind {
+                    out.push(MidiPortEvent {
+                        tick: abs,
+                        track: track_idx,
+                        port: *port,
                     });
                 }
             }
@@ -5410,6 +5553,187 @@ mod tests {
         assert_eq!(smf.time_signatures().len(), 1);
         assert_eq!(smf.key_signatures().len(), 1);
         assert_eq!(smf.sequencer_specifics().len(), 1);
+    }
+
+    // ───────── MidiPortEvent / SmfFile::midi_ports (FF 21) ─────────
+
+    #[test]
+    fn midi_ports_empty_when_no_meta_event_present() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.midi_ports().is_empty());
+    }
+
+    #[test]
+    fn midi_ports_single_hint_at_tick_zero() {
+        // delta=0 FF 21 01 02   (route this track through port 2)
+        // delta=0 FF 2F 00
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x21, 0x01, 0x02, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ports = smf.midi_ports();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].tick, 0);
+        assert_eq!(ports[0].track, 0);
+        assert_eq!(ports[0].port(), 2);
+    }
+
+    #[test]
+    fn midi_ports_full_seven_bit_range_round_trips() {
+        // FF 21 01 7F → port 127 (max legal value, the high bit is
+        // reserved for status / running-status use)
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x21, 0x01, 0x7F, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ports = smf.midi_ports();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port, 0x7F);
+    }
+
+    #[test]
+    fn midi_ports_per_track_routing_in_format_1() {
+        // Multi-port format-1 file: each track names its own output
+        // port at delta zero so the back-end can dispatch the
+        // surrounding channel-voice stream through 16 × N channels.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xFF, 0x21, 0x01, 0x00]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&[0x00, 0xFF, 0x21, 0x01, 0x01]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t2: Vec<u8> = Vec::new();
+        t2.extend_from_slice(&[0x00, 0xFF, 0x21, 0x01, 0x02]);
+        t2.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 3, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        blob.extend(track_chunk(&t2));
+        let smf = parse(&blob).unwrap();
+        let ports = smf.midi_ports();
+        assert_eq!(ports.len(), 3);
+        assert_eq!(ports[0].track, 0);
+        assert_eq!(ports[0].port, 0);
+        assert_eq!(ports[1].track, 1);
+        assert_eq!(ports[1].port, 1);
+        assert_eq!(ports[2].track, 2);
+        assert_eq!(ports[2].port, 2);
+    }
+
+    #[test]
+    fn midi_ports_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x21, 0x01, 0x05]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x21, 0x01, 0x06]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let ports = smf.midi_ports();
+        assert_eq!(ports.len(), 2);
+        assert_eq!(ports[0].track, 0);
+        assert_eq!(ports[0].port, 5);
+        assert_eq!(ports[1].track, 1);
+        assert_eq!(ports[1].port, 6);
+    }
+
+    #[test]
+    fn midi_ports_merge_across_tracks_sorted_by_tick() {
+        // track 0: delta=240 FF 21 01 0A
+        // track 1: delta=120 FF 21 01 0B; delta=240 FF 21 01 0C
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x21, 0x01, 0x0A]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(120));
+        t1.extend_from_slice(&[0xFF, 0x21, 0x01, 0x0B]);
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x21, 0x01, 0x0C]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let ports = smf.midi_ports();
+        assert_eq!(ports.len(), 3);
+        assert_eq!(ports[0].tick, 120);
+        assert_eq!(ports[0].track, 1);
+        assert_eq!(ports[0].port, 0x0B);
+        assert_eq!(ports[1].tick, 240);
+        assert_eq!(ports[1].track, 0);
+        assert_eq!(ports[1].port, 0x0A);
+        assert_eq!(ports[2].tick, 360);
+        assert_eq!(ports[2].track, 1);
+        assert_eq!(ports[2].port, 0x0C);
+    }
+
+    #[test]
+    fn midi_ports_late_position_tracks_absolute_tick() {
+        // The convention places FF 21 at delta-time zero, but the
+        // helper surfaces every occurrence in time order so files
+        // that re-route mid-track still round-trip the hint.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&encode_vlq(240));
+        events.extend_from_slice(&[0xFF, 0x21, 0x01, 0x03]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ports = smf.midi_ports();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].tick, 240);
+        assert_eq!(ports[0].port, 3);
+    }
+
+    #[test]
+    fn midi_ports_filter_excludes_channel_prefix_and_other_meta_kinds() {
+        // FF 21 picked up; FF 20 channel-prefix sibling stays
+        // filtered out (different meta kind, different routing
+        // semantics); text + smpte + tempo + key/time signatures +
+        // sequencer-private + sequence-number all filtered out.
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x21, 0x01, 0x04];
+        events.extend_from_slice(&[0x00, 0xFF, 0x20, 0x01, 0x05]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x00, 0x02, 0x00, 0x42]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x01, 0x04]);
+        events.extend_from_slice(b"Note");
+        events.extend_from_slice(&[0x00, 0xFF, 0x03, 0x04]);
+        events.extend_from_slice(b"Lead");
+        events.extend_from_slice(&[0x00, 0xFF, 0x05, 0x02]);
+        events.extend_from_slice(b"la");
+        events.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x54, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x59, 0x02, 0x00, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x7F, 0x02, 0x41, 0x10]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ports = smf.midi_ports();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port, 4);
+        // Sibling helpers stay uncontaminated.
+        assert_eq!(smf.texts().len(), 1);
+        assert_eq!(smf.track_names().len(), 1);
+        assert_eq!(smf.lyrics().len(), 1);
+        assert_eq!(smf.tempo_map().len(), 1);
+        assert_eq!(smf.smpte_offsets().len(), 1);
+        assert_eq!(smf.time_signatures().len(), 1);
+        assert_eq!(smf.key_signatures().len(), 1);
+        assert_eq!(smf.sequencer_specifics().len(), 1);
+        assert_eq!(smf.sequence_numbers().len(), 1);
     }
 
     // ───────── SmfChannelSnapshot / SmfFile::channel_snapshot_at ─────────
