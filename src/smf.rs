@@ -2632,6 +2632,389 @@ fn fmt_tag(tag: &[u8]) -> String {
     String::from_utf8_lossy(tag).into_owned()
 }
 
+// ───────────────────────── writer ─────────────────────────
+
+/// Largest VLQ-encodable value (the 4-byte cap from the SMF spec).
+/// Anything above this cannot be serialised as a delta-time, meta
+/// payload length, or sysex payload length.
+pub const MAX_VLQ_VALUE: u32 = 0x0FFF_FFFF;
+
+impl SmfFile {
+    /// Serialise this [`SmfFile`] to a complete SMF byte stream
+    /// (`MThd` header + one `MTrk` chunk per [`Track`]), suitable to
+    /// hand to [`parse`] for a structural round-trip.
+    ///
+    /// The emitted stream uses explicit status bytes throughout — the
+    /// spec permits but does not require running-status compression on
+    /// the wire, and the explicit form keeps the writer's output
+    /// bit-identical regardless of the track's internal ordering. A
+    /// reader that does not honour running status (very few do, the
+    /// rule is conventional) can still consume the output unchanged.
+    ///
+    /// Each track must end with [`MetaEvent::EndOfTrack`]; the writer
+    /// returns an error rather than auto-appending one so callers
+    /// stay in control of which tick the end marker lands on (the
+    /// scheduler keys final-tempo / final-CC events off the EOT tick,
+    /// so silently moving it would change semantics). The header
+    /// `ntrks` field must match `tracks.len()` for the same reason —
+    /// the wire format pins the two together and a mismatch should
+    /// surface at encode time rather than silently produce a file
+    /// disagreeing with itself.
+    ///
+    /// Validation is strict so the producer fails fast on values that
+    /// cannot fit the wire format:
+    ///
+    /// * VLQ-encoded values (delta-times, meta lengths, sysex lengths)
+    ///   must be `<=` [`MAX_VLQ_VALUE`] (`0x0FFF_FFFF`, the 4-byte cap
+    ///   from the SMF spec).
+    /// * Channel-voice data bytes (`key`, `velocity`, `controller`,
+    ///   `value`, `program`, `pressure`) must have the high bit clear
+    ///   (`<= 0x7F`).
+    /// * Pitch-bend values must fit in 14 bits (`<= 0x3FFF`).
+    /// * The header division must be in legal range — `TicksPerQuarter`
+    ///   is `1..=0x7FFF` (the high bit selects SMPTE), `Smpte`
+    ///   `frames_per_second` must be one of `{24, 25, 29, 30}`.
+    /// * Meta-event payload shapes that the parser fixed (e.g. the
+    ///   2-byte SequenceNumber payload, the 3-byte Tempo payload, the
+    ///   1-byte Port payload) are emitted at exactly the spec-mandated
+    ///   length; the parser would reject any other shape on re-read.
+    ///
+    /// The output is a `Vec<u8>` rather than a `Write` sink so the
+    /// writer can size each chunk in two passes (write the body, then
+    /// patch the four-byte length prefix in place) without imposing a
+    /// `Seek` bound on callers. SMF files are tiny by audio-codec
+    /// standards (a megabyte is unusual) so a heap-resident buffer is
+    /// the right shape.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        if self.header.ntrks as usize != self.tracks.len() {
+            return Err(Error::invalid(format!(
+                "SMF: header.ntrks ({}) does not match tracks.len() ({}) — \
+                 fix one side before encode so the wire format stays consistent",
+                self.header.ntrks,
+                self.tracks.len(),
+            )));
+        }
+        let mut out: Vec<u8> = Vec::new();
+        write_header_chunk(&mut out, &self.header)?;
+        for (i, track) in self.tracks.iter().enumerate() {
+            write_track_chunk(&mut out, track)
+                .map_err(|e| Error::invalid(format!("SMF: track {i}: {e}", e = err_msg(&e))))?;
+        }
+        Ok(out)
+    }
+}
+
+impl Track {
+    /// Serialise this [`Track`] as a complete `MTrk` chunk (the `MTrk`
+    /// FourCC, the four-byte big-endian chunk length, and the encoded
+    /// event body). The track must end with
+    /// [`MetaEvent::EndOfTrack`] — see [`SmfFile::to_bytes`] for the
+    /// rationale on not auto-appending.
+    pub fn to_bytes_chunk(&self) -> Result<Vec<u8>> {
+        let mut out: Vec<u8> = Vec::new();
+        write_track_chunk(&mut out, self)?;
+        Ok(out)
+    }
+}
+
+fn err_msg(e: &Error) -> String {
+    match e {
+        Error::InvalidData(s) => s.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn write_header_chunk(out: &mut Vec<u8>, header: &SmfHeader) -> Result<()> {
+    out.extend_from_slice(b"MThd");
+    out.extend_from_slice(&6u32.to_be_bytes());
+    let format_code: u16 = match header.format {
+        SmfFormat::SingleTrack => 0,
+        SmfFormat::MultiTrackSimultaneous => 1,
+        SmfFormat::MultiTrackIndependent => 2,
+    };
+    out.extend_from_slice(&format_code.to_be_bytes());
+    out.extend_from_slice(&header.ntrks.to_be_bytes());
+    let division_word: u16 = match header.division {
+        Division::TicksPerQuarter(t) => {
+            if t == 0 || t & 0x8000 != 0 {
+                return Err(Error::invalid(format!(
+                    "SMF: TicksPerQuarter division {t} out of range (1..=0x7FFF)",
+                )));
+            }
+            t
+        }
+        Division::Smpte {
+            frames_per_second,
+            ticks_per_frame,
+        } => {
+            if !matches!(frames_per_second, 24 | 25 | 29 | 30) {
+                return Err(Error::invalid(format!(
+                    "SMF: SMPTE frame rate {frames_per_second} not in {{24, 25, 29, 30}}",
+                )));
+            }
+            // The wire format stores `-fps` in the upper byte as i8.
+            let upper = (-(frames_per_second as i16)) as i8 as u8;
+            (u16::from(upper) << 8) | u16::from(ticks_per_frame)
+        }
+    };
+    out.extend_from_slice(&division_word.to_be_bytes());
+    Ok(())
+}
+
+fn write_track_chunk(out: &mut Vec<u8>, track: &Track) -> Result<()> {
+    // Validate end-of-track placement: must be the final event.
+    let eot_count = track
+        .events
+        .iter()
+        .filter(|ev| matches!(&ev.kind, Event::Meta(MetaEvent::EndOfTrack)))
+        .count();
+    match eot_count {
+        0 => {
+            return Err(Error::invalid(
+                "SMF: track has no MetaEvent::EndOfTrack — append one before encode",
+            ));
+        }
+        1 => {
+            if !matches!(
+                track.events.last().map(|ev| &ev.kind),
+                Some(Event::Meta(MetaEvent::EndOfTrack)),
+            ) {
+                return Err(Error::invalid(
+                    "SMF: MetaEvent::EndOfTrack must be the last event in the track",
+                ));
+            }
+        }
+        n => {
+            return Err(Error::invalid(format!(
+                "SMF: track has {n} MetaEvent::EndOfTrack entries — exactly 1 (at the tail) is legal",
+            )));
+        }
+    }
+
+    out.extend_from_slice(b"MTrk");
+    let len_pos = out.len();
+    out.extend_from_slice(&[0u8; 4]); // placeholder; patched after body emit
+    let body_start = out.len();
+    for (i, ev) in track.events.iter().enumerate() {
+        write_event(out, ev)
+            .map_err(|e| Error::invalid(format!("SMF: event {i}: {msg}", msg = err_msg(&e))))?;
+    }
+    let body_len = out.len() - body_start;
+    let len_be = (body_len as u32).to_be_bytes();
+    out[len_pos..len_pos + 4].copy_from_slice(&len_be);
+    Ok(())
+}
+
+fn write_event(out: &mut Vec<u8>, ev: &TrackEvent) -> Result<()> {
+    write_vlq(out, ev.delta)?;
+    match &ev.kind {
+        Event::Channel(msg) => write_channel(out, msg),
+        Event::Sysex { escape, data } => {
+            out.push(if *escape { 0xF7 } else { 0xF0 });
+            write_vlq(out, u32_len(data.len(), "sysex payload")?)?;
+            out.extend_from_slice(data);
+            Ok(())
+        }
+        Event::Meta(meta) => write_meta(out, meta),
+    }
+}
+
+fn write_channel(out: &mut Vec<u8>, msg: &ChannelMessage) -> Result<()> {
+    if msg.channel > 0x0F {
+        return Err(Error::invalid(format!(
+            "SMF: channel {} out of range 0..=15",
+            msg.channel,
+        )));
+    }
+    let chan = msg.channel & 0x0F;
+    match msg.body {
+        ChannelBody::NoteOff { key, velocity } => {
+            check_data_byte(key, "NoteOff.key")?;
+            check_data_byte(velocity, "NoteOff.velocity")?;
+            out.extend_from_slice(&[0x80 | chan, key, velocity]);
+        }
+        ChannelBody::NoteOn { key, velocity } => {
+            check_data_byte(key, "NoteOn.key")?;
+            check_data_byte(velocity, "NoteOn.velocity")?;
+            out.extend_from_slice(&[0x90 | chan, key, velocity]);
+        }
+        ChannelBody::PolyAftertouch { key, pressure } => {
+            check_data_byte(key, "PolyAftertouch.key")?;
+            check_data_byte(pressure, "PolyAftertouch.pressure")?;
+            out.extend_from_slice(&[0xA0 | chan, key, pressure]);
+        }
+        ChannelBody::ControlChange { controller, value } => {
+            check_data_byte(controller, "ControlChange.controller")?;
+            check_data_byte(value, "ControlChange.value")?;
+            out.extend_from_slice(&[0xB0 | chan, controller, value]);
+        }
+        ChannelBody::ProgramChange { program } => {
+            check_data_byte(program, "ProgramChange.program")?;
+            out.extend_from_slice(&[0xC0 | chan, program]);
+        }
+        ChannelBody::ChannelAftertouch { pressure } => {
+            check_data_byte(pressure, "ChannelAftertouch.pressure")?;
+            out.extend_from_slice(&[0xD0 | chan, pressure]);
+        }
+        ChannelBody::PitchBend { value } => {
+            if value > 0x3FFF {
+                return Err(Error::invalid(format!(
+                    "SMF: PitchBend value {value:#06X} exceeds 14-bit range 0..=0x3FFF",
+                )));
+            }
+            let lsb = (value & 0x7F) as u8;
+            let msb = ((value >> 7) & 0x7F) as u8;
+            out.extend_from_slice(&[0xE0 | chan, lsb, msb]);
+        }
+    }
+    Ok(())
+}
+
+fn write_meta(out: &mut Vec<u8>, meta: &MetaEvent) -> Result<()> {
+    out.push(0xFF);
+    match meta {
+        MetaEvent::SequenceNumber(n) => {
+            out.push(0x00);
+            out.push(0x02);
+            out.extend_from_slice(&n.to_be_bytes());
+        }
+        MetaEvent::Text { kind, text } => {
+            if !(0x01..=0x0F).contains(kind) {
+                return Err(Error::invalid(format!(
+                    "SMF: Text.kind 0x{kind:02X} out of range 0x01..=0x0F",
+                )));
+            }
+            out.push(*kind);
+            write_vlq(out, u32_len(text.len(), "Text payload")?)?;
+            out.extend_from_slice(text);
+        }
+        MetaEvent::ChannelPrefix(c) => {
+            check_data_byte(*c, "ChannelPrefix")?;
+            out.extend_from_slice(&[0x20, 0x01, *c]);
+        }
+        MetaEvent::Port(p) => {
+            check_data_byte(*p, "Port")?;
+            out.extend_from_slice(&[0x21, 0x01, *p]);
+        }
+        MetaEvent::EndOfTrack => {
+            out.extend_from_slice(&[0x2F, 0x00]);
+        }
+        MetaEvent::Tempo(us_per_qn) => {
+            if *us_per_qn > 0x00FF_FFFF {
+                return Err(Error::invalid(format!(
+                    "SMF: Tempo {us_per_qn} exceeds 24-bit range",
+                )));
+            }
+            out.push(0x51);
+            out.push(0x03);
+            out.push(((us_per_qn >> 16) & 0xFF) as u8);
+            out.push(((us_per_qn >> 8) & 0xFF) as u8);
+            out.push((us_per_qn & 0xFF) as u8);
+        }
+        MetaEvent::SmpteOffset {
+            hours,
+            minutes,
+            seconds,
+            frames,
+            subframes,
+        } => {
+            out.push(0x54);
+            out.push(0x05);
+            out.extend_from_slice(&[*hours, *minutes, *seconds, *frames, *subframes]);
+        }
+        MetaEvent::TimeSignature {
+            numerator,
+            denominator_pow2,
+            clocks_per_click,
+            notated_32nd_per_quarter,
+        } => {
+            out.push(0x58);
+            out.push(0x04);
+            out.extend_from_slice(&[
+                *numerator,
+                *denominator_pow2,
+                *clocks_per_click,
+                *notated_32nd_per_quarter,
+            ]);
+        }
+        MetaEvent::KeySignature { sharps_flats, mode } => {
+            if !matches!(mode, 0 | 1) {
+                return Err(Error::invalid(format!(
+                    "SMF: KeySignature.mode {mode} not in {{0, 1}}",
+                )));
+            }
+            out.push(0x59);
+            out.push(0x02);
+            out.push(*sharps_flats as u8);
+            out.push(*mode);
+        }
+        MetaEvent::SequencerSpecific(data) => {
+            out.push(0x7F);
+            write_vlq(out, u32_len(data.len(), "SequencerSpecific payload")?)?;
+            out.extend_from_slice(data);
+        }
+        MetaEvent::Unknown { type_byte, data } => {
+            if *type_byte == 0x2F {
+                return Err(Error::invalid(
+                    "SMF: cannot emit Unknown { type_byte: 0x2F } — use MetaEvent::EndOfTrack",
+                ));
+            }
+            out.push(*type_byte);
+            write_vlq(out, u32_len(data.len(), "Unknown meta payload")?)?;
+            out.extend_from_slice(data);
+        }
+    }
+    Ok(())
+}
+
+fn check_data_byte(b: u8, field: &str) -> Result<()> {
+    if b & 0x80 != 0 {
+        return Err(Error::invalid(format!(
+            "SMF: {field} value 0x{b:02X} has the MIDI status bit set (must be 0..=0x7F)",
+        )));
+    }
+    Ok(())
+}
+
+fn u32_len(n: usize, what: &str) -> Result<u32> {
+    if n > MAX_VLQ_VALUE as usize {
+        return Err(Error::invalid(format!(
+            "SMF: {what} length {n} exceeds VLQ cap {MAX_VLQ_VALUE}",
+        )));
+    }
+    Ok(n as u32)
+}
+
+/// Append the SMF variable-length quantity for `value` to `out`. Bounded
+/// to [`MAX_VLQ_VALUE`] (the 4-byte cap from the SMF spec); returns
+/// [`Error::InvalidData`] for any larger value.
+fn write_vlq(out: &mut Vec<u8>, value: u32) -> Result<()> {
+    if value > MAX_VLQ_VALUE {
+        return Err(Error::invalid(format!(
+            "SMF: VLQ value {value:#X} exceeds 4-byte cap {MAX_VLQ_VALUE:#X}",
+        )));
+    }
+    // Collect 7-bit groups LSB-first, then emit MSB-first with the
+    // continuation bit set on every byte but the last.
+    let mut groups: [u8; 4] = [0; 4];
+    let mut n = 0usize;
+    let mut v = value;
+    loop {
+        groups[n] = (v & 0x7F) as u8;
+        n += 1;
+        v >>= 7;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in (0..n).rev() {
+        let last = i == 0;
+        let byte = groups[i] | if last { 0x00 } else { 0x80 };
+        out.push(byte);
+    }
+    Ok(())
+}
+
 // ───────────────────────── tests ─────────────────────────
 
 #[cfg(test)]
@@ -6040,5 +6423,608 @@ mod tests {
             velocity: 100,
         });
         assert_eq!(snap, before);
+    }
+
+    // ─────────────────── writer tests ───────────────────
+
+    #[test]
+    fn write_vlq_matches_test_helper_across_spec_examples() {
+        // The SMF spec lists worked VLQ examples (see `vlq_multi_byte`
+        // above); the writer must produce the same byte sequences.
+        let cases: &[(u32, &[u8])] = &[
+            (0, &[0x00]),
+            (0x40, &[0x40]),
+            (0x7F, &[0x7F]),
+            (0x80, &[0x81, 0x00]),
+            (0x2000, &[0xC0, 0x00]),
+            (0x3FFF, &[0xFF, 0x7F]),
+            (0x10_0000, &[0xC0, 0x80, 0x00]),
+            (0x1F_FFFF, &[0xFF, 0xFF, 0x7F]),
+            (0x20_0000, &[0x81, 0x80, 0x80, 0x00]),
+            (0x0FFF_FFFF, &[0xFF, 0xFF, 0xFF, 0x7F]),
+        ];
+        for (v, bytes) in cases {
+            let mut buf = Vec::new();
+            write_vlq(&mut buf, *v).unwrap();
+            assert_eq!(buf, bytes.to_vec(), "encode VLQ {v:#x}");
+            // Round-trip back through read_vlq.
+            let mut c = Cursor::new(&buf);
+            assert_eq!(read_vlq(&mut c).unwrap(), *v);
+        }
+    }
+
+    #[test]
+    fn write_vlq_rejects_over_cap() {
+        let mut buf = Vec::new();
+        let err = write_vlq(&mut buf, MAX_VLQ_VALUE + 1).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn header_round_trip_format_0_tpqn() {
+        let header = SmfHeader {
+            format: SmfFormat::SingleTrack,
+            ntrks: 1,
+            division: Division::TicksPerQuarter(480),
+        };
+        let track = Track {
+            events: vec![TrackEvent {
+                delta: 0,
+                kind: Event::Meta(MetaEvent::EndOfTrack),
+            }],
+        };
+        let smf = SmfFile {
+            header,
+            tracks: vec![track],
+        };
+        let bytes = smf.to_bytes().unwrap();
+        // Header is exactly 14 bytes; the EOT track is `MTrk` + 4-byte
+        // length + 4-byte body (`00 FF 2F 00`) = 12 bytes.
+        assert_eq!(bytes.len(), 14 + 12);
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed, smf);
+    }
+
+    #[test]
+    fn header_round_trip_smpte_minus_25_fps() {
+        let header = SmfHeader {
+            format: SmfFormat::MultiTrackSimultaneous,
+            ntrks: 1,
+            division: Division::Smpte {
+                frames_per_second: 25,
+                ticks_per_frame: 40,
+            },
+        };
+        let track = Track {
+            events: vec![TrackEvent {
+                delta: 0,
+                kind: Event::Meta(MetaEvent::EndOfTrack),
+            }],
+        };
+        let smf = SmfFile {
+            header,
+            tracks: vec![track],
+        };
+        let bytes = smf.to_bytes().unwrap();
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed, smf);
+    }
+
+    #[test]
+    fn round_trip_type_0_full_track() {
+        // The fixture from `type_0_single_track_with_note_pair_and_tempo`,
+        // but driven through `to_bytes` -> `parse` instead of a hand-built
+        // byte blob.
+        let track = Track {
+            events: vec![
+                TrackEvent {
+                    delta: 0,
+                    kind: Event::Meta(MetaEvent::Tempo(500_000)),
+                },
+                TrackEvent {
+                    delta: 0,
+                    kind: Event::Meta(MetaEvent::TimeSignature {
+                        numerator: 4,
+                        denominator_pow2: 2,
+                        clocks_per_click: 24,
+                        notated_32nd_per_quarter: 8,
+                    }),
+                },
+                TrackEvent {
+                    delta: 0,
+                    kind: Event::Channel(ChannelMessage {
+                        channel: 0,
+                        body: ChannelBody::NoteOn {
+                            key: 60,
+                            velocity: 100,
+                        },
+                    }),
+                },
+                TrackEvent {
+                    delta: 480,
+                    kind: Event::Channel(ChannelMessage {
+                        channel: 0,
+                        body: ChannelBody::NoteOff {
+                            key: 60,
+                            velocity: 0x40,
+                        },
+                    }),
+                },
+                TrackEvent {
+                    delta: 0,
+                    kind: Event::Meta(MetaEvent::EndOfTrack),
+                },
+            ],
+        };
+        let smf = SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::SingleTrack,
+                ntrks: 1,
+                division: Division::TicksPerQuarter(480),
+            },
+            tracks: vec![track],
+        };
+        let bytes = smf.to_bytes().unwrap();
+
+        // First 14 bytes must be a well-formed MThd / format 0 / ntrks 1
+        // / division 480.
+        assert_eq!(&bytes[..4], b"MThd");
+        assert_eq!(&bytes[4..8], &6u32.to_be_bytes());
+        assert_eq!(&bytes[8..10], &0u16.to_be_bytes());
+        assert_eq!(&bytes[10..12], &1u16.to_be_bytes());
+        assert_eq!(&bytes[12..14], &480u16.to_be_bytes());
+
+        // Re-parse and compare.
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed, smf);
+    }
+
+    #[test]
+    fn round_trip_all_meta_event_kinds() {
+        // Cover every concrete meta variant the writer special-cases,
+        // plus an `Unknown` passthrough.
+        let metas = vec![
+            MetaEvent::SequenceNumber(0xBEEF),
+            MetaEvent::Text {
+                kind: 0x01,
+                text: b"hello".to_vec(),
+            },
+            MetaEvent::Text {
+                kind: 0x05,
+                text: b"la".to_vec(),
+            },
+            MetaEvent::ChannelPrefix(3),
+            MetaEvent::Port(7),
+            MetaEvent::Tempo(500_000),
+            MetaEvent::SmpteOffset {
+                hours: 0x21,
+                minutes: 12,
+                seconds: 34,
+                frames: 5,
+                subframes: 50,
+            },
+            MetaEvent::TimeSignature {
+                numerator: 6,
+                denominator_pow2: 3,
+                clocks_per_click: 36,
+                notated_32nd_per_quarter: 8,
+            },
+            MetaEvent::KeySignature {
+                sharps_flats: -3,
+                mode: 1,
+            },
+            MetaEvent::SequencerSpecific(vec![0x41, 0x10, 0x42]),
+            MetaEvent::Unknown {
+                type_byte: 0x60,
+                data: vec![0xDE, 0xAD],
+            },
+        ];
+        let mut events: Vec<TrackEvent> = metas
+            .into_iter()
+            .map(|m| TrackEvent {
+                delta: 0,
+                kind: Event::Meta(m),
+            })
+            .collect();
+        events.push(TrackEvent {
+            delta: 0,
+            kind: Event::Meta(MetaEvent::EndOfTrack),
+        });
+        let smf = SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::SingleTrack,
+                ntrks: 1,
+                division: Division::TicksPerQuarter(96),
+            },
+            tracks: vec![Track { events }],
+        };
+        let bytes = smf.to_bytes().unwrap();
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed, smf);
+    }
+
+    #[test]
+    fn round_trip_all_channel_voice_kinds() {
+        let bodies = vec![
+            ChannelBody::NoteOn {
+                key: 60,
+                velocity: 100,
+            },
+            ChannelBody::NoteOff {
+                key: 60,
+                velocity: 64,
+            },
+            ChannelBody::PolyAftertouch {
+                key: 60,
+                pressure: 80,
+            },
+            ChannelBody::ControlChange {
+                controller: 7,
+                value: 100,
+            },
+            ChannelBody::ProgramChange { program: 32 },
+            ChannelBody::ChannelAftertouch { pressure: 90 },
+            ChannelBody::PitchBend { value: 0x2000 },
+            ChannelBody::PitchBend { value: 0x3FFF },
+            ChannelBody::PitchBend { value: 0 },
+        ];
+        let mut events: Vec<TrackEvent> = bodies
+            .into_iter()
+            .map(|b| TrackEvent {
+                delta: 10,
+                kind: Event::Channel(ChannelMessage {
+                    channel: 5,
+                    body: b,
+                }),
+            })
+            .collect();
+        events.push(TrackEvent {
+            delta: 0,
+            kind: Event::Meta(MetaEvent::EndOfTrack),
+        });
+        let smf = SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::SingleTrack,
+                ntrks: 1,
+                division: Division::TicksPerQuarter(480),
+            },
+            tracks: vec![Track { events }],
+        };
+        let bytes = smf.to_bytes().unwrap();
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed, smf);
+    }
+
+    #[test]
+    fn round_trip_sysex_f0_and_f7() {
+        let events = vec![
+            TrackEvent {
+                delta: 0,
+                kind: Event::Sysex {
+                    escape: false,
+                    data: vec![0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7],
+                },
+            },
+            TrackEvent {
+                delta: 20,
+                kind: Event::Sysex {
+                    escape: true,
+                    data: vec![0xFE], // active sensing escape, e.g.
+                },
+            },
+            TrackEvent {
+                delta: 0,
+                kind: Event::Meta(MetaEvent::EndOfTrack),
+            },
+        ];
+        let smf = SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::SingleTrack,
+                ntrks: 1,
+                division: Division::TicksPerQuarter(96),
+            },
+            tracks: vec![Track { events }],
+        };
+        let bytes = smf.to_bytes().unwrap();
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed, smf);
+    }
+
+    #[test]
+    fn round_trip_format_1_multi_track() {
+        // Two-track format-1 file: tempo on track 0, a note on track 1.
+        let t0 = Track {
+            events: vec![
+                TrackEvent {
+                    delta: 0,
+                    kind: Event::Meta(MetaEvent::Tempo(400_000)),
+                },
+                TrackEvent {
+                    delta: 0,
+                    kind: Event::Meta(MetaEvent::EndOfTrack),
+                },
+            ],
+        };
+        let t1 = Track {
+            events: vec![
+                TrackEvent {
+                    delta: 0,
+                    kind: Event::Channel(ChannelMessage {
+                        channel: 0,
+                        body: ChannelBody::NoteOn {
+                            key: 72,
+                            velocity: 110,
+                        },
+                    }),
+                },
+                TrackEvent {
+                    delta: 240,
+                    kind: Event::Channel(ChannelMessage {
+                        channel: 0,
+                        body: ChannelBody::NoteOff {
+                            key: 72,
+                            velocity: 0,
+                        },
+                    }),
+                },
+                TrackEvent {
+                    delta: 0,
+                    kind: Event::Meta(MetaEvent::EndOfTrack),
+                },
+            ],
+        };
+        let smf = SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::MultiTrackSimultaneous,
+                ntrks: 2,
+                division: Division::TicksPerQuarter(96),
+            },
+            tracks: vec![t0, t1],
+        };
+        let bytes = smf.to_bytes().unwrap();
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed, smf);
+    }
+
+    #[test]
+    fn write_rejects_track_missing_end_of_track() {
+        let smf = SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::SingleTrack,
+                ntrks: 1,
+                division: Division::TicksPerQuarter(96),
+            },
+            tracks: vec![Track {
+                events: vec![TrackEvent {
+                    delta: 0,
+                    kind: Event::Channel(ChannelMessage {
+                        channel: 0,
+                        body: ChannelBody::NoteOn {
+                            key: 60,
+                            velocity: 100,
+                        },
+                    }),
+                }],
+            }],
+        };
+        let err = smf.to_bytes().unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn write_rejects_eot_not_last() {
+        let smf = SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::SingleTrack,
+                ntrks: 1,
+                division: Division::TicksPerQuarter(96),
+            },
+            tracks: vec![Track {
+                events: vec![
+                    TrackEvent {
+                        delta: 0,
+                        kind: Event::Meta(MetaEvent::EndOfTrack),
+                    },
+                    TrackEvent {
+                        delta: 0,
+                        kind: Event::Channel(ChannelMessage {
+                            channel: 0,
+                            body: ChannelBody::NoteOn {
+                                key: 60,
+                                velocity: 100,
+                            },
+                        }),
+                    },
+                ],
+            }],
+        };
+        let err = smf.to_bytes().unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn write_rejects_ntrks_mismatch() {
+        let smf = SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::MultiTrackSimultaneous,
+                ntrks: 3,
+                division: Division::TicksPerQuarter(96),
+            },
+            tracks: vec![Track {
+                events: vec![TrackEvent {
+                    delta: 0,
+                    kind: Event::Meta(MetaEvent::EndOfTrack),
+                }],
+            }],
+        };
+        let err = smf.to_bytes().unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn write_rejects_pitch_bend_out_of_range() {
+        let smf = SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::SingleTrack,
+                ntrks: 1,
+                division: Division::TicksPerQuarter(96),
+            },
+            tracks: vec![Track {
+                events: vec![
+                    TrackEvent {
+                        delta: 0,
+                        kind: Event::Channel(ChannelMessage {
+                            channel: 0,
+                            body: ChannelBody::PitchBend { value: 0x4000 },
+                        }),
+                    },
+                    TrackEvent {
+                        delta: 0,
+                        kind: Event::Meta(MetaEvent::EndOfTrack),
+                    },
+                ],
+            }],
+        };
+        let err = smf.to_bytes().unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn write_rejects_data_byte_with_status_bit() {
+        let smf = SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::SingleTrack,
+                ntrks: 1,
+                division: Division::TicksPerQuarter(96),
+            },
+            tracks: vec![Track {
+                events: vec![
+                    TrackEvent {
+                        delta: 0,
+                        kind: Event::Channel(ChannelMessage {
+                            channel: 0,
+                            body: ChannelBody::NoteOn {
+                                key: 0x80,
+                                velocity: 100,
+                            },
+                        }),
+                    },
+                    TrackEvent {
+                        delta: 0,
+                        kind: Event::Meta(MetaEvent::EndOfTrack),
+                    },
+                ],
+            }],
+        };
+        let err = smf.to_bytes().unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn write_rejects_invalid_smpte_fps() {
+        let smf = SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::SingleTrack,
+                ntrks: 1,
+                division: Division::Smpte {
+                    frames_per_second: 60,
+                    ticks_per_frame: 40,
+                },
+            },
+            tracks: vec![Track {
+                events: vec![TrackEvent {
+                    delta: 0,
+                    kind: Event::Meta(MetaEvent::EndOfTrack),
+                }],
+            }],
+        };
+        let err = smf.to_bytes().unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn round_trip_large_delta_uses_multi_byte_vlq() {
+        // 0x200000 takes 4 bytes to encode — exercise the long-VLQ
+        // branch of the writer.
+        let events = vec![
+            TrackEvent {
+                delta: 0,
+                kind: Event::Channel(ChannelMessage {
+                    channel: 0,
+                    body: ChannelBody::NoteOn {
+                        key: 60,
+                        velocity: 100,
+                    },
+                }),
+            },
+            TrackEvent {
+                delta: 0x20_0000,
+                kind: Event::Channel(ChannelMessage {
+                    channel: 0,
+                    body: ChannelBody::NoteOff {
+                        key: 60,
+                        velocity: 64,
+                    },
+                }),
+            },
+            TrackEvent {
+                delta: 0,
+                kind: Event::Meta(MetaEvent::EndOfTrack),
+            },
+        ];
+        let smf = SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::SingleTrack,
+                ntrks: 1,
+                division: Division::TicksPerQuarter(480),
+            },
+            tracks: vec![Track { events }],
+        };
+        let bytes = smf.to_bytes().unwrap();
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed, smf);
+    }
+
+    #[test]
+    fn track_to_bytes_chunk_round_trips_inside_outer_file() {
+        // The per-track helper should produce a self-contained MTrk
+        // chunk that drops cleanly inside a hand-built header.
+        let track = Track {
+            events: vec![
+                TrackEvent {
+                    delta: 0,
+                    kind: Event::Channel(ChannelMessage {
+                        channel: 9, // drum channel by GM convention
+                        body: ChannelBody::NoteOn {
+                            key: 36,
+                            velocity: 110,
+                        },
+                    }),
+                },
+                TrackEvent {
+                    delta: 120,
+                    kind: Event::Meta(MetaEvent::EndOfTrack),
+                },
+            ],
+        };
+        let chunk = track.to_bytes_chunk().unwrap();
+        assert_eq!(&chunk[..4], b"MTrk");
+        let body_len = u32::from_be_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as usize;
+        assert_eq!(chunk.len(), 8 + body_len);
+
+        // Sandwich into a complete file and round-trip through parse.
+        let mut bytes = Vec::new();
+        write_header_chunk(
+            &mut bytes,
+            &SmfHeader {
+                format: SmfFormat::SingleTrack,
+                ntrks: 1,
+                division: Division::TicksPerQuarter(96),
+            },
+        )
+        .unwrap();
+        bytes.extend_from_slice(&chunk);
+        let smf = parse(&bytes).unwrap();
+        assert_eq!(smf.tracks[0], track);
     }
 }

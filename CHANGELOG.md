@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 234 — `SmfFile::to_bytes()` SMF mux-side writer
+
+- New `SmfFile::to_bytes(&self) -> Result<Vec<u8>>` serialises a
+  parsed SMF back to a complete byte stream (`MThd` header + one
+  `MTrk` chunk per `Track`), suitable to hand back to `parse` for
+  a structural round-trip. Companion `Track::to_bytes_chunk(&self)
+  -> Result<Vec<u8>>` emits one self-contained `MTrk` chunk so
+  callers building a multi-track file from independent track
+  sources can splice the chunks under a single `MThd` header.
+- Every channel-voice variant (`NoteOn` / `NoteOff` /
+  `PolyAftertouch` / `ControlChange` / `ProgramChange` /
+  `ChannelAftertouch` / `PitchBend`), every concrete meta variant
+  (`SequenceNumber` / `Text` / `ChannelPrefix` / `Port` /
+  `EndOfTrack` / `Tempo` / `SmpteOffset` / `TimeSignature` /
+  `KeySignature` / `SequencerSpecific` / passthrough `Unknown`),
+  and both sysex forms (`F0` start, `F7` continuation/escape) emit
+  on the wire format the parser already accepts. `Unknown` with
+  `type_byte: 0x2F` is rejected so the End-of-Track marker cannot
+  be smuggled in past the placement check.
+- Output uses **explicit status bytes** throughout — the spec
+  permits but does not require running-status compression, and
+  the explicit form keeps the writer deterministic regardless of
+  internal track ordering. A reader that does not honour running
+  status can still consume the output unchanged.
+- New top-level `MAX_VLQ_VALUE = 0x0FFF_FFFF` constant — the
+  largest VLQ-encodable value per the SMF spec's 4-byte cap (the
+  same cap the parser's `MAX_VLQ_BYTES = 4` enforces on the read
+  side). Delta-times, meta payload lengths, and sysex payload
+  lengths must all fit; the writer surfaces `Error::InvalidData`
+  for anything larger.
+- Strict validation at encode-time, with descriptive
+  `Error::InvalidData` messages that name the offending field /
+  track / event index so caller-side debugging stays local:
+  `header.ntrks` must match `tracks.len()`; each track must end
+  with exactly one `MetaEvent::EndOfTrack` as its final event;
+  channel-voice data bytes must have the high bit clear; pitch-bend
+  values must fit 14 bits; `KeySignature.mode` must be 0 or 1;
+  `Tempo` must fit 24 bits; SMPTE `frames_per_second` must be one
+  of `{24, 25, 29, 30}`; `TicksPerQuarter` must be `1..=0x7FFF`;
+  `Text.kind` must be `0x01..=0x0F`.
+- Lifts the SMF surface from read-only to **read + write**: the
+  full event vocabulary the parser materialises (channel-voice,
+  meta, sysex) now round-trips through `to_bytes` -> `parse`
+  byte-for-byte. The 17 new writer tests cover spec-VLQ encoding
+  (10 worked examples), every meta variant, every channel-voice
+  variant, both sysex forms, a multi-track Format-1 file, the
+  long-VLQ (4-byte) delta branch, all five validation rejections,
+  and the per-track chunk helper.
+
 ### Round 230 — `SmfFile::midi_ports()` (FF 21)
 
 - New `smf::MidiPortEvent { tick, track, port }` value type pinned to

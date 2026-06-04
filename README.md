@@ -242,6 +242,43 @@ framework but usable standalone.
   (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
   lyrics,cue_points,track_names,instrument_names,texts,copyrights,
   smpte_offsets,sequencer_specifics,sequence_numbers,midi_ports}`).
+  Round 234 closes the SMF read-vs-write asymmetry: the parser
+  has always materialised the full event vocabulary (`Channel`,
+  `Sysex`, `Meta`), and round 234 adds the matching writer.
+  `SmfFile::to_bytes(&self) -> Result<Vec<u8>>` serialises a
+  parsed file back to a complete SMF byte stream (`MThd` + one
+  `MTrk` per `Track`) suitable to hand back to `parse` for a
+  structural round-trip; `Track::to_bytes_chunk(&self) ->
+  Result<Vec<u8>>` emits one self-contained `MTrk` chunk so
+  callers building a multi-track file from independent track
+  sources can splice the chunks under a single `MThd` header.
+  Output uses explicit status bytes throughout — the SMF
+  specification permits but does not require running-status
+  compression on the wire, and the explicit form keeps the writer
+  deterministic regardless of internal track ordering. Every
+  channel-voice variant, every concrete `MetaEvent` variant
+  (including passthrough `Unknown` for forward compatibility),
+  and both sysex forms (`F0` start / `F7` continuation-escape)
+  round-trip byte-for-byte through `to_bytes` -> `parse`. The
+  writer surfaces `Error::InvalidData` at encode time for any
+  value that cannot fit the wire format: a new public constant
+  `MAX_VLQ_VALUE = 0x0FFF_FFFF` matches the parser's 4-byte VLQ
+  cap (delta-times, meta payload lengths, sysex payload lengths);
+  data bytes must have the MIDI status bit clear (`<= 0x7F`);
+  pitch-bend values must fit 14 bits; tempo values must fit 24
+  bits; `KeySignature.mode` must be `0` or `1`; SMPTE
+  `frames_per_second` must be one of `{24, 25, 29, 30}`;
+  `TicksPerQuarter` must be `1..=0x7FFF`; `Text.kind` must be
+  `0x01..=0x0F`; `header.ntrks` must match `tracks.len()`; each
+  track must end with exactly one `MetaEvent::EndOfTrack` as its
+  final event (the writer never auto-appends — the scheduler keys
+  final-tempo / final-CC events off the EOT tick, so silently
+  moving it would change semantics). The 17 new writer tests
+  cover spec-VLQ encoding (10 worked examples from
+  §"Variable-Length Quantities"), every meta variant, every
+  channel-voice variant, both sysex forms, a multi-track Format-1
+  file, the long-VLQ (4-byte) delta branch, and every validation
+  rejection.
   Round 213 lifts the SMF-file accessor surface beyond the
   "iterate every meta event" lens with a **channel-state
   snapshot** primitive for seeking: `SmfChannelSnapshot { program,
