@@ -242,6 +242,35 @@ framework but usable standalone.
   (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
   lyrics,cue_points,track_names,instrument_names,texts,copyrights,
   smpte_offsets,sequencer_specifics,sequence_numbers,midi_ports}`).
+  Round 240 adds the channel-binding companion
+  `SmfFile::channel_prefixes()` — every `FF 20 01 cc` Channel Prefix
+  Meta-Event as a `ChannelPrefixEvent { tick, track, channel }` with
+  the absolute tick on the parent track, stably merged across tracks
+  (track 0 before track 1 at the same tick) under the same merge
+  rule as every existing iteration helper and the scheduler. `cc`
+  carries the channel-binding hint for non-channel events that
+  follow on the same track (text, lyric, marker, cue point, sysex
+  — until another `FF 20`, the next channel-voice event, or end of
+  track). The Standard MIDI File Specification 1.0 lists the event
+  as part of the meta-event vocabulary; modern authoring tools
+  prefer explicit per-track channel-voice streams plus `FF 21` port
+  hints, but older files still emit it and a round-trip workflow
+  must preserve it. `ChannelPrefixEvent::channel()` returns the
+  spec-clamped channel as `Option<u8>` (`Some(c)` for `c < 16`,
+  `None` for an out-of-spec high-nibble byte — a receiver should
+  fall back to the most recent channel-voice channel rather than
+  silently mask). The raw byte stays on the `channel` field so
+  files with out-of-spec values still round-trip. Only `FF 20` is
+  selected — the neighbouring `FF 21` port-hint sibling stays on
+  its own (different routing semantics: per-track physical port
+  assignment versus per-message channel override) so the
+  channel-binding layer gets a clean time-ordered list independent
+  of the surrounding meta streams. Lifts the SMF meta-event
+  iterator family from 14 to **15** total
+  (`SmfFile::{tempo_map,time_signatures,key_signatures,markers,
+  lyrics,cue_points,track_names,instrument_names,texts,copyrights,
+  smpte_offsets,sequencer_specifics,sequence_numbers,midi_ports,
+  channel_prefixes}`).
   Round 234 closes the SMF read-vs-write asymmetry: the parser
   has always materialised the full event vocabulary (`Channel`,
   `Sysex`, `Meta`), and round 234 adds the matching writer.

@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 240 — `SmfFile::channel_prefixes()` (FF 20 01 cc) iteration helper
+
+- New `SmfFile::channel_prefixes(&self) -> Vec<ChannelPrefixEvent>`
+  surfaces every `FF 20 01 cc` Channel Prefix meta event as a
+  `ChannelPrefixEvent { tick, track, channel }` with the absolute
+  tick on the parent track, stably merged across tracks (track 0
+  before track 1 at the same tick) under the same merge rule as
+  every existing iteration helper and the scheduler. `FF 20` carries
+  the channel-binding hint for non-channel events that follow on the
+  same track: the single payload byte names the MIDI channel
+  (`0..=15`) the following meta / sysex events should be associated
+  with — text, lyric, marker, cue point, sysex — until another
+  `FF 20` arrives, the next channel-voice event arrives and
+  supersedes the binding, or the track ends. The Standard MIDI File
+  Specification 1.0 lists the event as part of the meta-event
+  vocabulary; modern authoring tools prefer explicit per-track
+  channel-voice streams plus `FF 21` port hints, but older files
+  still emit it and a round-trip workflow must preserve it.
+- `ChannelPrefixEvent::channel()` returns the spec-clamped channel
+  index as `Option<u8>`: `Some(c)` when `c < 16`, `None` otherwise.
+  The raw byte stays available on the `channel` field so files with
+  out-of-spec values (a single bit set in the high nibble, etc.)
+  still round-trip; the helper returns `None` rather than mask the
+  byte because masking would silently route to an unintended channel.
+- Only `FF 20` is selected — the neighbouring `FF 21` port-hint
+  sibling (different routing semantics: per-track physical port
+  assignment versus per-message channel override) stays on its own
+  `SmfFile::midi_ports()` helper so callers reconstructing the
+  channel association of surrounding non-channel events get a clean
+  time-ordered list independent of the other meta streams.
+- 8 new unit tests cover: empty case (no `FF 20` in any track);
+  single binding at tick zero; full spec `0..=15` round trip (one
+  case per `cc`); out-of-spec `cc = 0x20` surfaces raw with
+  `channel() == None`; multi-track merge by absolute tick; stable
+  sort keeping `(track, in-track)` order at the same tick;
+  filter-purity against `FF 21 / FF 00 / FF 01 / FF 03 / FF 05 /
+  FF 51 / FF 54 / FF 58 / FF 59 / FF 7F`; and a parser → `to_bytes`
+  → parser round-trip that exercises the writer's `FF 20` path so
+  the helper can't drift out of sync with the mux.
+- Lifts the SMF meta-event iterator family from 14 to **15** total:
+  `SmfFile::{tempo_map, time_signatures, key_signatures, markers,
+  lyrics, cue_points, track_names, instrument_names, texts,
+  copyrights, smpte_offsets, sequencer_specifics, sequence_numbers,
+  midi_ports, channel_prefixes}`.
+
 ### Round 234 — `SmfFile::to_bytes()` SMF mux-side writer
 
 - New `SmfFile::to_bytes(&self) -> Result<Vec<u8>>` serialises a

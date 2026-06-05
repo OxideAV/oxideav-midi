@@ -1144,6 +1144,80 @@ impl MidiPortEvent {
     }
 }
 
+/// One Channel Prefix meta event pinned to the absolute tick (relative
+/// to the start of its parent track) at which the
+/// [`FF 20 01 cc`](MetaEvent::ChannelPrefix) meta event fires.
+///
+/// Returned by [`SmfFile::channel_prefixes`] — see that method for the
+/// merge semantics across multiple tracks.
+///
+/// `FF 20 01 cc` carries the **channel-binding hint** for meta and sysex
+/// events that follow on the same track. The single payload byte names
+/// the MIDI channel (`0..=15`) the following non-channel events should
+/// be associated with — text, lyric, marker, cue point, sysex, and the
+/// like — until either another `FF 20` arrives, the next channel-voice
+/// event arrives (and supersedes the binding), or the track ends. The
+/// Standard MIDI File Specification 1.0 lists the event as part of the
+/// meta-event vocabulary and notes the pre-multi-port usage; it is
+/// deprecated in modern authoring tools in favour of explicit per-track
+/// channel-voice streams plus [`FF 21`](MetaEvent::Port) port hints, but
+/// older files (pre-General-MIDI authoring suites, RPM/SMF converters)
+/// still emit it and a round-trip workflow must preserve it.
+///
+/// This helper isolates the `FF 20` stream so callers reconstructing the
+/// channel association of surrounding non-channel events get a clean
+/// time-ordered list independent of the other meta streams. The payload
+/// byte is surfaced verbatim — the spec scopes it at `0..=15` (one
+/// nibble) but the parser accepts the full one-byte payload as written
+/// so files with out-of-spec values still round-trip; the
+/// [`channel`](Self::channel) accessor returns `Some(c)` only when
+/// `c < 16` (an `Option` rather than a clamp because a value `>= 16`
+/// is unambiguously non-spec and the receiver should likely fall back
+/// to the most recent channel-voice channel rather than mask the byte).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelPrefixEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the meta event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase. The pre-multi-port
+    /// convention places one `FF 20` near the start of a binding block
+    /// (just before the first text / sysex it scopes), but the parser
+    /// surfaces every occurrence rather than enforcing the placement
+    /// rule so files that re-bind mid-track still round-trip.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). The channel-prefix binding scopes the
+    /// surrounding non-channel events to a specific channel on this
+    /// track; a multi-port player consults this together with the
+    /// track's [`FF 21`](MetaEvent::Port) hint to derive the full
+    /// `(port, channel)` routing for following meta / sysex events.
+    pub track: usize,
+    /// The channel byte (the `cc` payload of `FF 20 01 cc`). The
+    /// Standard MIDI File Specification 1.0 reserves a single nibble
+    /// (`0..=15`) for the channel index; the parser accepts the full
+    /// one-byte payload as written so files with out-of-spec values
+    /// (a single bit set in the high nibble, etc.) still round-trip.
+    /// Use [`channel`](Self::channel) for the spec-clamped `Option<u8>`
+    /// view, or read the raw byte directly.
+    pub channel: u8,
+}
+
+impl ChannelPrefixEvent {
+    /// The bound MIDI channel index, decoded into the spec's `0..=15`
+    /// range. Returns `None` when the payload byte is out of range —
+    /// the spec leaves the high four bits unspecified, so a value
+    /// `>= 16` is unambiguously non-spec and a receiver should likely
+    /// fall back to the channel of the most recent channel-voice event
+    /// rather than mask the byte (the latter would silently route to
+    /// an unintended channel).
+    pub fn channel(&self) -> Option<u8> {
+        if self.channel < 16 {
+            Some(self.channel)
+        } else {
+            None
+        }
+    }
+}
+
 impl SmfFile {
     /// Collect every [`MetaEvent::Tempo`] from every track, pinned to
     /// the absolute tick at which it fires, in time order.
@@ -1998,6 +2072,95 @@ impl SmfFile {
                         tick: abs,
                         track: track_idx,
                         port: *port,
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every [`MetaEvent::ChannelPrefix`] (`FF 20 01 cc`) from
+    /// every track, pinned to the absolute tick at which it fires, in
+    /// time order.
+    ///
+    /// `FF 20 01 cc` carries the **channel-binding hint** for
+    /// non-channel events that follow on the same track. The single
+    /// payload byte names the MIDI channel (`0..=15`) the following
+    /// meta / sysex events should be associated with — text, lyric,
+    /// marker, cue point, sysex — until another `FF 20` arrives, the
+    /// next channel-voice event arrives and supersedes the binding,
+    /// or the track ends. The Standard MIDI File Specification 1.0
+    /// lists the event as part of the meta-event vocabulary and notes
+    /// the pre-multi-port usage; it is deprecated in modern authoring
+    /// tools in favour of explicit per-track channel-voice streams
+    /// plus [`FF 21`](MetaEvent::Port) port hints, but older files
+    /// still emit it and a round-trip workflow must preserve it.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two hints at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::tempo_map`] /
+    /// [`SmfFile::time_signatures`] / [`SmfFile::key_signatures`] /
+    /// [`SmfFile::markers`] / [`SmfFile::lyrics`] /
+    /// [`SmfFile::cue_points`] / [`SmfFile::track_names`] /
+    /// [`SmfFile::instrument_names`] / [`SmfFile::texts`] /
+    /// [`SmfFile::copyrights`] / [`SmfFile::smpte_offsets`] /
+    /// [`SmfFile::sequencer_specifics`] /
+    /// [`SmfFile::sequence_numbers`] / [`SmfFile::midi_ports`] and
+    /// the scheduler use (`scheduler.rs` §"merged event list, sorted
+    /// by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries an `FF 20` meta
+    /// event. A file without channel-prefix hints is the common case
+    /// for modern authoring tools; a receiver that finds no `FF 20`
+    /// should bind surrounding non-channel events to the channel of
+    /// the most recent channel-voice event (or to channel 0 when no
+    /// such event has occurred yet) per the SMF spec's
+    /// channel-binding rule.
+    ///
+    /// Only `FF 20` is selected — the neighbouring
+    /// [`FF 21`](MetaEvent::Port) port hint, rhythmic, text, cueing,
+    /// and sequencer-private meta events stay on their own helpers
+    /// (different routing semantics: per-track physical port
+    /// assignment versus per-message channel override) so callers
+    /// reconstructing the channel association of surrounding
+    /// non-channel events get a clean time-ordered list independent
+    /// of the other meta streams.
+    ///
+    /// The payload byte is surfaced verbatim. The spec scopes it at
+    /// `0..=15` (one nibble) but the parser accepts the full one-byte
+    /// payload as written, so files with out-of-spec values still
+    /// round-trip; [`ChannelPrefixEvent::channel`] returns the
+    /// spec-clamped `Option<u8>` view.
+    ///
+    /// Lifts the SMF meta-event iterator family from 14 to **15**
+    /// total: `tempo_map`, `time_signatures`, `key_signatures`,
+    /// `markers`, `lyrics`, `cue_points`, `track_names`,
+    /// `instrument_names`, `texts`, `copyrights`, `smpte_offsets`,
+    /// `sequencer_specifics`, `sequence_numbers`, `midi_ports`, and
+    /// `channel_prefixes`.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn channel_prefixes(&self) -> Vec<ChannelPrefixEvent> {
+        let mut out: Vec<ChannelPrefixEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Meta(MetaEvent::ChannelPrefix(channel)) = &ev.kind {
+                    out.push(ChannelPrefixEvent {
+                        tick: abs,
+                        track: track_idx,
+                        channel: *channel,
                     });
                 }
             }
@@ -6117,6 +6280,183 @@ mod tests {
         assert_eq!(smf.key_signatures().len(), 1);
         assert_eq!(smf.sequencer_specifics().len(), 1);
         assert_eq!(smf.sequence_numbers().len(), 1);
+    }
+
+    // ───────── SmfFile::channel_prefixes (FF 20 01 cc) ─────────
+
+    #[test]
+    fn channel_prefixes_empty_when_no_meta_event_present() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.channel_prefixes().is_empty());
+    }
+
+    #[test]
+    fn channel_prefixes_single_binding_at_tick_zero() {
+        // delta=0 FF 20 01 03   (bind surrounding meta to channel 3)
+        // delta=0 FF 2F 00
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x20, 0x01, 0x03, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let cps = smf.channel_prefixes();
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].tick, 0);
+        assert_eq!(cps[0].track, 0);
+        assert_eq!(cps[0].channel, 3);
+        assert_eq!(cps[0].channel(), Some(3));
+    }
+
+    #[test]
+    fn channel_prefixes_spec_nibble_range_round_trips() {
+        // Every `cc` from 0..=15 round-trips and channel() returns Some.
+        for cc in 0u8..=15 {
+            let events: Vec<u8> = vec![0x00, 0xFF, 0x20, 0x01, cc, 0x00, 0xFF, 0x2F, 0x00];
+            let mut blob = header_chunk(0, 1, 96);
+            blob.extend(track_chunk(&events));
+            let smf = parse(&blob).unwrap();
+            let cps = smf.channel_prefixes();
+            assert_eq!(cps.len(), 1);
+            assert_eq!(cps[0].channel, cc);
+            assert_eq!(cps[0].channel(), Some(cc));
+        }
+    }
+
+    #[test]
+    fn channel_prefixes_out_of_spec_byte_surfaces_raw_and_channel_returns_none() {
+        // `cc = 0x20` is out-of-spec (high nibble set). Parser preserves
+        // the byte verbatim so the file still round-trips, but
+        // ChannelPrefixEvent::channel() declines to mask and returns
+        // None so the receiver knows to fall back rather than route to
+        // an unintended channel.
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x20, 0x01, 0x20, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let cps = smf.channel_prefixes();
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].channel, 0x20);
+        assert_eq!(cps[0].channel(), None);
+    }
+
+    #[test]
+    fn channel_prefixes_merge_across_tracks_sorted_by_tick() {
+        // track 0: delta=240 FF 20 01 02
+        // track 1: delta=120 FF 20 01 05; delta=240 FF 20 01 09
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x20, 0x01, 0x02]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(120));
+        t1.extend_from_slice(&[0xFF, 0x20, 0x01, 0x05]);
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x20, 0x01, 0x09]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let cps = smf.channel_prefixes();
+        assert_eq!(cps.len(), 3);
+        assert_eq!(cps[0].tick, 120);
+        assert_eq!(cps[0].track, 1);
+        assert_eq!(cps[0].channel, 0x05);
+        assert_eq!(cps[1].tick, 240);
+        assert_eq!(cps[1].track, 0);
+        assert_eq!(cps[1].channel, 0x02);
+        assert_eq!(cps[2].tick, 360);
+        assert_eq!(cps[2].track, 1);
+        assert_eq!(cps[2].channel, 0x09);
+    }
+
+    #[test]
+    fn channel_prefixes_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(240));
+        t0.extend_from_slice(&[0xFF, 0x20, 0x01, 0x07]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(240));
+        t1.extend_from_slice(&[0xFF, 0x20, 0x01, 0x08]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let cps = smf.channel_prefixes();
+        assert_eq!(cps.len(), 2);
+        assert_eq!(cps[0].track, 0);
+        assert_eq!(cps[0].channel, 0x07);
+        assert_eq!(cps[1].track, 1);
+        assert_eq!(cps[1].channel, 0x08);
+    }
+
+    #[test]
+    fn channel_prefixes_filter_excludes_port_and_other_meta_kinds() {
+        // FF 20 picked up; FF 21 port-hint sibling stays filtered out
+        // (different meta kind, different routing semantics); text +
+        // smpte + tempo + key/time signatures + sequencer-private +
+        // sequence-number all filtered out.
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x20, 0x01, 0x06];
+        events.extend_from_slice(&[0x00, 0xFF, 0x21, 0x01, 0x04]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x00, 0x02, 0x00, 0x42]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x01, 0x04]);
+        events.extend_from_slice(b"Note");
+        events.extend_from_slice(&[0x00, 0xFF, 0x03, 0x04]);
+        events.extend_from_slice(b"Lead");
+        events.extend_from_slice(&[0x00, 0xFF, 0x05, 0x02]);
+        events.extend_from_slice(b"la");
+        events.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x54, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x58, 0x04, 0x04, 0x02, 0x18, 0x08]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x59, 0x02, 0x00, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x7F, 0x02, 0x41, 0x10]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let cps = smf.channel_prefixes();
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].channel, 6);
+        // Sibling helpers stay uncontaminated.
+        assert_eq!(smf.midi_ports().len(), 1);
+        assert_eq!(smf.texts().len(), 1);
+        assert_eq!(smf.track_names().len(), 1);
+        assert_eq!(smf.lyrics().len(), 1);
+        assert_eq!(smf.tempo_map().len(), 1);
+        assert_eq!(smf.smpte_offsets().len(), 1);
+        assert_eq!(smf.time_signatures().len(), 1);
+        assert_eq!(smf.key_signatures().len(), 1);
+        assert_eq!(smf.sequencer_specifics().len(), 1);
+        assert_eq!(smf.sequence_numbers().len(), 1);
+    }
+
+    #[test]
+    fn channel_prefixes_to_bytes_round_trip() {
+        // Round-trip through the writer: parse → to_bytes → parse must
+        // surface the same ChannelPrefixEvent list. Exercises the
+        // writer's FF 20 path (a guard against the helper drifting
+        // out of sync with the mux).
+        let mut events: Vec<u8> = vec![0x00, 0xFF, 0x20, 0x01, 0x0B];
+        events.extend_from_slice(&encode_vlq(96));
+        events.extend_from_slice(&[0xFF, 0x20, 0x01, 0x0C]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let rewritten = smf.to_bytes().unwrap();
+        let reparsed = parse(&rewritten).unwrap();
+        let cps = reparsed.channel_prefixes();
+        assert_eq!(cps.len(), 2);
+        assert_eq!(cps[0].tick, 0);
+        assert_eq!(cps[0].channel, 0x0B);
+        assert_eq!(cps[1].tick, 96);
+        assert_eq!(cps[1].channel, 0x0C);
     }
 
     // ───────── SmfChannelSnapshot / SmfFile::channel_snapshot_at ─────────
