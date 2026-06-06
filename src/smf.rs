@@ -1218,6 +1218,124 @@ impl ChannelPrefixEvent {
     }
 }
 
+/// One System Exclusive event pinned to the absolute tick (relative
+/// to the start of its parent track) at which the [`F0`](Event::Sysex)
+/// (start) or [`F7`](Event::Sysex) (continuation / escape) wire event
+/// fires.
+///
+/// Returned by [`SmfFile::sysex_events`] — see that method for the
+/// merge semantics across multiple tracks.
+///
+/// The Standard MIDI File Specification 1.0 §"System Exclusive
+/// Events" defines two flavours:
+///
+/// * **`F0 <varlen> <payload>`** — a complete or starting SysEx
+///   message. By the spec's convention the trailing `F7` (when one
+///   is present in the wire message) is included as the final byte
+///   of `<payload>`; a payload missing the trailing `F7` indicates
+///   a multi-packet message split with one or more `F7`-continuation
+///   events following.
+/// * **`F7 <varlen> <payload>`** — a continuation packet for a
+///   previously-started `F0` message *or* an arbitrary escape
+///   sequence whose payload is shipped verbatim to the wire (the
+///   spec's "escaped" form, used for non-SysEx System messages a
+///   sequencer wants to preserve).
+///
+/// This helper isolates both wire forms so callers driving an
+/// external synthesiser or recovering manufacturer-specific payloads
+/// get a clean time-ordered list independent of the channel-voice
+/// and meta-event streams. The Universal Real-Time and Universal
+/// Non-Real-Time families (`F0 7E …` and `F0 7F …`, defined in the
+/// MIDI 1.0 *Universal System Exclusive Messages* document) travel
+/// through this list verbatim; a caller routing by the universal
+/// vocabulary should inspect [`SysExEvent::data`] directly
+/// (typically `data[0]` to distinguish `0x7E` versus `0x7F` and the
+/// SubID bytes that follow).
+///
+/// The payload bytes are surfaced verbatim — the parser does not
+/// strip a trailing `F7` from an `F0` payload, so the [`data`] field
+/// reproduces the on-the-wire bytes faithfully and a writer can
+/// round-trip the helper output through [`SmfFile::to_bytes`]
+/// without re-synthesising the SysEx framing.
+///
+/// [`data`]: SysExEvent::data
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SysExEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the SysEx event, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). Format-1 files commonly place the
+    /// universal SysEx setup payloads (GM-on, Master Volume, etc.)
+    /// on the conductor track (track 0); format-2 files keep them
+    /// per-track.
+    pub track: usize,
+    /// `true` for the [`F7`](Event::Sysex) continuation / escape
+    /// form, `false` for the [`F0`](Event::Sysex) start form. A
+    /// caller reconstructing a multi-packet SysEx assembly walks the
+    /// list with `is_escape == false` opening a fresh packet and
+    /// each subsequent `is_escape == true` appending until the
+    /// payload terminates with an `0xF7` end marker.
+    pub is_escape: bool,
+    /// The SysEx payload bytes, verbatim. For an `F0` start packet
+    /// the trailing `F7` end marker (when present in the wire
+    /// message) is included as the final byte of `data`; for a
+    /// continuation / escape packet the bytes are shipped to the
+    /// MIDI wire unchanged. Empty payloads (`F0 00` / `F7 00`) are
+    /// surfaced as `data.is_empty()` rather than filtered out — the
+    /// spec permits a zero-length packet.
+    pub data: Vec<u8>,
+}
+
+impl SysExEvent {
+    /// `true` when the payload ends with the SMF SysEx end marker
+    /// (`0xF7`). For an `F0` start packet this marks a self-contained
+    /// SysEx message; an `F0` packet whose payload does not terminate
+    /// with `0xF7` indicates a multi-packet message split that
+    /// continues in one or more following `F7`-continuation events.
+    ///
+    /// Returns `false` for an empty payload, since an empty packet
+    /// has no terminator to inspect.
+    pub fn ends_with_eox(&self) -> bool {
+        matches!(self.data.last(), Some(&0xF7))
+    }
+
+    /// `true` when this packet is an `F0` start *and* the payload
+    /// terminates with `0xF7` — a self-contained, complete SysEx
+    /// message that needs no continuation packets. Equivalent to
+    /// `!is_escape && ends_with_eox()`; sugar for the common
+    /// universal-SysEx case (GM-on `F0 7E 7F 09 01 F7`, Master
+    /// Volume, Master Tuning) where callers route the whole packet
+    /// in one step.
+    pub fn is_complete_message(&self) -> bool {
+        !self.is_escape && self.ends_with_eox()
+    }
+
+    /// Returns the manufacturer-ID byte (or the leading byte of a
+    /// universal-SysEx packet, `0x7E` non-real-time or `0x7F`
+    /// real-time) of an `F0` start packet. Returns `None` for an
+    /// `F7` continuation / escape packet (whose payload is not
+    /// manufacturer-prefixed in the SMF framing) and for an empty
+    /// payload.
+    ///
+    /// A real-world manufacturer ID is either a single byte (the
+    /// historic IDs assigned by the MMA, including the
+    /// pre-allocated Sequential / Moog / Yamaha / Roland / Korg
+    /// ranges) or a three-byte sequence starting with `0x00` (the
+    /// expanded-ID convention reserving room for new manufacturers);
+    /// this accessor returns the leading byte only, leaving the
+    /// expanded-ID disambiguation to the caller — inspect
+    /// [`SysExEvent::data`] directly to read `data[0..=2]` when
+    /// `data[0] == 0x00`.
+    pub fn manufacturer_id(&self) -> Option<u8> {
+        if self.is_escape {
+            return None;
+        }
+        self.data.first().copied()
+    }
+}
+
 impl SmfFile {
     /// Collect every [`MetaEvent::Tempo`] from every track, pinned to
     /// the absolute tick at which it fires, in time order.
@@ -2161,6 +2279,85 @@ impl SmfFile {
                         tick: abs,
                         track: track_idx,
                         channel: *channel,
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every [`Event::Sysex`] from every track — both the
+    /// `F0` start and the `F7` continuation / escape flavours —
+    /// pinned to the absolute tick at which it fires, in time order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in
+    /// the same track), then the per-track sequences are merged.
+    /// The sort is stable so two packets at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::tempo_map`] /
+    /// [`SmfFile::time_signatures`] / [`SmfFile::key_signatures`] /
+    /// [`SmfFile::markers`] / [`SmfFile::lyrics`] /
+    /// [`SmfFile::cue_points`] / [`SmfFile::track_names`] /
+    /// [`SmfFile::instrument_names`] / [`SmfFile::texts`] /
+    /// [`SmfFile::copyrights`] / [`SmfFile::smpte_offsets`] /
+    /// [`SmfFile::sequencer_specifics`] /
+    /// [`SmfFile::sequence_numbers`] / [`SmfFile::midi_ports`] /
+    /// [`SmfFile::channel_prefixes`] and the scheduler use
+    /// (`scheduler.rs` §"merged event list, sorted by absolute
+    /// tick").
+    ///
+    /// Returns an empty `Vec` when no track carries an `F0` or `F7`
+    /// event — most music-only sequences omit SysEx entirely.
+    ///
+    /// Both wire forms are surfaced. Callers reconstructing a
+    /// multi-packet SysEx assembly walk the list with
+    /// `is_escape == false` opening a fresh packet and each
+    /// subsequent `is_escape == true` appending until the payload
+    /// terminates with an `0xF7` end marker. The
+    /// [`MetaEvent::SequencerSpecific`](MetaEvent::SequencerSpecific)
+    /// channel — `FF 7F` private payloads, surfaced through
+    /// [`SmfFile::sequencer_specifics`] — is *not* selected here;
+    /// the two channels carry different semantics (SysEx travels to
+    /// the MIDI wire; `FF 7F` is file-private metadata that does not)
+    /// and a file may carry both an `F0 7E 7F 09 01 F7` Universal
+    /// Non-Real-Time GM-On packet on the conductor track and a
+    /// private `FF 7F` plugin-state blob alongside it.
+    ///
+    /// The payload bytes are surfaced verbatim — the parser does
+    /// not strip a trailing `F7` from an `F0` payload, so a writer
+    /// can round-trip the helper output through
+    /// [`SmfFile::to_bytes`] without re-synthesising the SysEx
+    /// framing.
+    ///
+    /// Lifts the SMF event iterator family by surfacing the SysEx
+    /// channel alongside the 15 meta-event helpers; the meta-event
+    /// list itself stays at 15 (`SmfFile::{tempo_map,
+    /// time_signatures, key_signatures, markers, lyrics,
+    /// cue_points, track_names, instrument_names, texts,
+    /// copyrights, smpte_offsets, sequencer_specifics,
+    /// sequence_numbers, midi_ports, channel_prefixes}`).
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn sysex_events(&self) -> Vec<SysExEvent> {
+        let mut out: Vec<SysExEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Sysex { escape, data } = &ev.kind {
+                    out.push(SysExEvent {
+                        tick: abs,
+                        track: track_idx,
+                        is_escape: *escape,
+                        data: data.clone(),
                     });
                 }
             }
@@ -6457,6 +6654,246 @@ mod tests {
         assert_eq!(cps[0].channel, 0x0B);
         assert_eq!(cps[1].tick, 96);
         assert_eq!(cps[1].channel, 0x0C);
+    }
+
+    // ───────── SysExEvent / SmfFile::sysex_events (F0 / F7) ─────────
+
+    #[test]
+    fn sysex_events_empty_when_no_sysex_present() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.sysex_events().is_empty());
+    }
+
+    #[test]
+    fn sysex_events_universal_gm_on_at_tick_zero() {
+        // delta=0 F0 05 7E 7F 09 01 F7 — Universal Non-Real-Time GM-On,
+        // self-contained: F0 start packet whose payload ends with F7.
+        let events: Vec<u8> = vec![
+            0x00, 0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7, // GM-on
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sysex_events();
+        assert_eq!(sx.len(), 1);
+        assert_eq!(sx[0].tick, 0);
+        assert_eq!(sx[0].track, 0);
+        assert!(!sx[0].is_escape);
+        assert_eq!(sx[0].data, vec![0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        assert!(sx[0].ends_with_eox());
+        assert!(sx[0].is_complete_message());
+        assert_eq!(sx[0].manufacturer_id(), Some(0x7E));
+    }
+
+    #[test]
+    fn sysex_events_f0_without_trailing_f7_marks_multipacket_start() {
+        // delta=0 F0 03 41 10 42 — Roland (0x41) Master Volume opener
+        // without the closing F7, indicating a multi-packet message.
+        let events: Vec<u8> = vec![
+            0x00, 0xF0, 0x03, 0x41, 0x10, 0x42, //
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sysex_events();
+        assert_eq!(sx.len(), 1);
+        assert!(!sx[0].is_escape);
+        assert_eq!(sx[0].data, vec![0x41, 0x10, 0x42]);
+        assert!(!sx[0].ends_with_eox());
+        assert!(!sx[0].is_complete_message());
+        assert_eq!(sx[0].manufacturer_id(), Some(0x41));
+    }
+
+    #[test]
+    fn sysex_events_f7_continuation_pairs_after_f0() {
+        // delta=0 F0 03 41 10 42 — opener (no trailing F7)
+        // delta=8 F7 02 7B F7 — closing F7 packet (continuation + EOX)
+        let mut events: Vec<u8> = vec![
+            0x00, 0xF0, 0x03, 0x41, 0x10, 0x42, //
+            0x08, 0xF7, 0x02, 0x7B, 0xF7, //
+        ];
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sysex_events();
+        assert_eq!(sx.len(), 2);
+        // Opener: F0, no EOX, manufacturer 0x41
+        assert!(!sx[0].is_escape);
+        assert_eq!(sx[0].tick, 0);
+        assert_eq!(sx[0].manufacturer_id(), Some(0x41));
+        assert!(!sx[0].is_complete_message());
+        // Continuation: F7, EOX present, no manufacturer ID (escape form)
+        assert!(sx[1].is_escape);
+        assert_eq!(sx[1].tick, 8);
+        assert_eq!(sx[1].data, vec![0x7B, 0xF7]);
+        assert!(sx[1].ends_with_eox());
+        assert!(!sx[1].is_complete_message()); // is_escape blocks "complete"
+        assert_eq!(sx[1].manufacturer_id(), None); // F7 has no manufacturer prefix
+    }
+
+    #[test]
+    fn sysex_events_empty_payload_surfaces_verbatim() {
+        // delta=0 F0 00 — zero-length SysEx packet, spec-legal.
+        let events: Vec<u8> = vec![
+            0x00, 0xF0, 0x00, //
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sysex_events();
+        assert_eq!(sx.len(), 1);
+        assert!(!sx[0].is_escape);
+        assert!(sx[0].data.is_empty());
+        assert!(!sx[0].ends_with_eox());
+        assert!(!sx[0].is_complete_message());
+        assert_eq!(sx[0].manufacturer_id(), None);
+    }
+
+    #[test]
+    fn sysex_events_merge_across_tracks_sorted_by_tick() {
+        // Track 0: tick 100 → F0 02 7E F7
+        // Track 1: tick  50 → F0 02 41 F7
+        // Merged order: track-1@50, then track-0@100.
+        let t0: Vec<u8> = {
+            let mut v: Vec<u8> = Vec::new();
+            v.extend_from_slice(&encode_vlq(100));
+            v.extend_from_slice(&[0xF0, 0x02, 0x7E, 0xF7]);
+            v.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+            v
+        };
+        let t1: Vec<u8> = {
+            let mut v: Vec<u8> = Vec::new();
+            v.extend_from_slice(&encode_vlq(50));
+            v.extend_from_slice(&[0xF0, 0x02, 0x41, 0xF7]);
+            v.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+            v
+        };
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sysex_events();
+        assert_eq!(sx.len(), 2);
+        assert_eq!(sx[0].tick, 50);
+        assert_eq!(sx[0].track, 1);
+        assert_eq!(sx[0].manufacturer_id(), Some(0x41));
+        assert_eq!(sx[1].tick, 100);
+        assert_eq!(sx[1].track, 0);
+        assert_eq!(sx[1].manufacturer_id(), Some(0x7E));
+    }
+
+    #[test]
+    fn sysex_events_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        // Both tracks fire an F0 at absolute tick 64; stable sort by
+        // tick keeps the per-track insertion order, so track 0's
+        // packet precedes track 1's. Matches the merge convention
+        // used by every existing iteration helper and the scheduler.
+        let t0: Vec<u8> = {
+            let mut v: Vec<u8> = Vec::new();
+            v.extend_from_slice(&encode_vlq(64));
+            v.extend_from_slice(&[0xF0, 0x02, 0x10, 0xF7]);
+            v.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+            v
+        };
+        let t1: Vec<u8> = {
+            let mut v: Vec<u8> = Vec::new();
+            v.extend_from_slice(&encode_vlq(64));
+            v.extend_from_slice(&[0xF0, 0x02, 0x20, 0xF7]);
+            v.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+            v
+        };
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sysex_events();
+        assert_eq!(sx.len(), 2);
+        assert_eq!(sx[0].tick, 64);
+        assert_eq!(sx[0].track, 0);
+        assert_eq!(sx[0].manufacturer_id(), Some(0x10));
+        assert_eq!(sx[1].tick, 64);
+        assert_eq!(sx[1].track, 1);
+        assert_eq!(sx[1].manufacturer_id(), Some(0x20));
+    }
+
+    #[test]
+    fn sysex_events_filter_excludes_meta_and_channel_events() {
+        // A track carrying one F0, one F7, plus several neighbouring
+        // events (FF 7F sequencer-specific, FF 03 track name, FF 01
+        // text, FF 21 port, FF 20 channel prefix, FF 51 tempo, B0 CC,
+        // 90 note-on, FF 2F end-of-track). The helper must surface
+        // exactly the F0 + F7 pair and ignore the rest. Cross-checks
+        // against sequencer_specifics() — that helper should return
+        // its single FF 7F entry unaffected by the SysEx selection.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x03, 0x02, b'A', b'B']); // FF 03 track name
+        events.extend_from_slice(&[0x00, 0xFF, 0x01, 0x01, b'X']); // FF 01 text
+        events.extend_from_slice(&[0x00, 0xFF, 0x21, 0x01, 0x02]); // FF 21 port
+        events.extend_from_slice(&[0x00, 0xFF, 0x20, 0x01, 0x03]); // FF 20 channel prefix
+        events.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]); // FF 51 tempo
+        events.extend_from_slice(&[0x00, 0xF0, 0x03, 0x7F, 0x10, 0xF7]); // F0 universal real-time
+        events.extend_from_slice(&[0x00, 0xFF, 0x7F, 0x02, 0xAA, 0xBB]); // FF 7F sequencer-specific
+        events.extend_from_slice(&[0x00, 0xF7, 0x02, 0xCC, 0xF7]); // F7 escape
+        events.extend_from_slice(&[0x00, 0xB0, 0x07, 0x64]); // CC 7 = 100
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x40]); // note on
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]); // end of track
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sysex_events();
+        assert_eq!(sx.len(), 2);
+        assert!(!sx[0].is_escape);
+        assert_eq!(sx[0].data, vec![0x7F, 0x10, 0xF7]);
+        assert!(sx[1].is_escape);
+        assert_eq!(sx[1].data, vec![0xCC, 0xF7]);
+        // Cross-check: the sequencer_specifics helper still surfaces
+        // its single FF 7F entry untouched.
+        let ss = smf.sequencer_specifics();
+        assert_eq!(ss.len(), 1);
+        assert_eq!(ss[0].data, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn sysex_events_to_bytes_round_trip() {
+        // Round-trip through the writer: parse → to_bytes → parse must
+        // surface the same SysExEvent list. Exercises the writer's
+        // F0 + F7 paths so the helper can't drift out of sync with
+        // the mux.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        events.extend_from_slice(&encode_vlq(48));
+        events.extend_from_slice(&[0xF0, 0x03, 0x41, 0x10, 0x42]); // opener
+        events.extend_from_slice(&[0x08, 0xF7, 0x02, 0x7B, 0xF7]); // continuation
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let rewritten = smf.to_bytes().unwrap();
+        let reparsed = parse(&rewritten).unwrap();
+        let sx = reparsed.sysex_events();
+        assert_eq!(sx.len(), 3);
+        // GM-on at tick 0
+        assert_eq!(sx[0].tick, 0);
+        assert!(!sx[0].is_escape);
+        assert_eq!(sx[0].data, vec![0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        assert!(sx[0].is_complete_message());
+        // Roland opener at tick 48
+        assert_eq!(sx[1].tick, 48);
+        assert!(!sx[1].is_escape);
+        assert_eq!(sx[1].data, vec![0x41, 0x10, 0x42]);
+        assert_eq!(sx[1].manufacturer_id(), Some(0x41));
+        // Continuation at tick 56
+        assert_eq!(sx[2].tick, 56);
+        assert!(sx[2].is_escape);
+        assert_eq!(sx[2].data, vec![0x7B, 0xF7]);
+        assert!(sx[2].ends_with_eox());
     }
 
     // ───────── SmfChannelSnapshot / SmfFile::channel_snapshot_at ─────────

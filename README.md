@@ -271,6 +271,36 @@ framework but usable standalone.
   lyrics,cue_points,track_names,instrument_names,texts,copyrights,
   smpte_offsets,sequencer_specifics,sequence_numbers,midi_ports,
   channel_prefixes}`).
+  Round 243 surfaces the SysEx wire-event channel alongside the
+  15-helper meta-event family with `SmfFile::sysex_events() ->
+  Vec<SysExEvent>`: every System Exclusive event — both the `F0`
+  start and the `F7` continuation / escape flavours — as a
+  `SysExEvent { tick, track, is_escape, data }` with the absolute
+  tick on the parent track, stably merged across tracks (track 0
+  before track 1 at the same tick) under the same merge rule as
+  every existing iteration helper and the scheduler. SMF spec
+  §"System Exclusive Events" defines `F0 <varlen> <payload>` (a
+  complete-or-starting message; the trailing `F7`, when present,
+  is included as the final byte of `<payload>`) and `F7 <varlen>
+  <payload>` (a continuation packet for a previously-started `F0`
+  *or* an arbitrary escape sequence shipped verbatim to the wire).
+  Both forms surface through the helper; `data` is reproduced
+  verbatim so a writer can round-trip the output through
+  `to_bytes()`. Convenience accessors: `SysExEvent::ends_with_eox()`
+  flags a payload terminating with `0xF7`; `is_complete_message()`
+  is sugar for `!is_escape && ends_with_eox()` (the common
+  universal-SysEx case — GM-on `F0 7E 7F 09 01 F7`, Master Volume,
+  Master Tuning); `manufacturer_id()` returns the leading byte of
+  an `F0` payload (`0x7E` non-real-time / `0x7F` real-time for the
+  universal vocabulary, otherwise a vendor ID — expanded `0x00`-
+  prefixed three-byte IDs surface as `Some(0x00)` and the caller
+  inspects `data[0..=2]`) and `None` for `F7` or an empty payload.
+  The `FF 7F` `SequencerSpecific` channel — surfaced through
+  `sequencer_specifics()` — is not selected here; the two carry
+  different semantics (SysEx travels to the MIDI wire; `FF 7F` is
+  file-private metadata that does not) so a file may carry both an
+  `F0 7E 7F 09 01 F7` Universal Non-Real-Time GM-On packet and a
+  private `FF 7F` plugin-state blob alongside it.
   Round 234 closes the SMF read-vs-write asymmetry: the parser
   has always materialised the full event vocabulary (`Channel`,
   `Sysex`, `Meta`), and round 234 adds the matching writer.

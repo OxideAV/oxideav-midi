@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 243 — `SmfFile::sysex_events()` (F0 / F7) iteration helper
+
+- New `SmfFile::sysex_events(&self) -> Vec<SysExEvent>` surfaces
+  every System Exclusive event — both the `F0` start and the `F7`
+  continuation / escape flavours — as a `SysExEvent { tick, track,
+  is_escape, data }` with the absolute tick on the parent track,
+  stably merged across tracks (track 0 before track 1 at the same
+  tick) under the same merge rule as every existing iteration
+  helper and the scheduler. Standard MIDI File Specification 1.0
+  §"System Exclusive Events" defines `F0 <varlen> <payload>` (a
+  complete-or-starting SysEx message; the trailing `F7` end marker,
+  when present, is included as the final byte of `<payload>`) and
+  `F7 <varlen> <payload>` (a continuation packet for a previously-
+  started `F0` message *or* an arbitrary escape sequence whose
+  payload is shipped verbatim to the wire). Both forms surface
+  through the helper; the `is_escape` flag distinguishes them and
+  the `data` payload is reproduced verbatim so a writer can
+  round-trip the helper output through `SmfFile::to_bytes` without
+  re-synthesising the SysEx framing.
+- `SysExEvent::ends_with_eox()` returns `true` when the payload
+  terminates with the `0xF7` end marker; `SysExEvent::is_complete_message()`
+  is sugar for `!is_escape && ends_with_eox()`, the common universal-
+  SysEx case (GM-on `F0 7E 7F 09 01 F7`, Master Volume, Master
+  Tuning) where a caller routes the whole packet in one step.
+  `SysExEvent::manufacturer_id()` returns the leading byte of an
+  `F0` payload (the manufacturer ID, or `0x7E` non-real-time /
+  `0x7F` real-time for universal SysEx) and `None` for an `F7`
+  packet or an empty payload; expanded three-byte IDs (`0x00`-
+  prefixed) are surfaced as `Some(0x00)` and the caller inspects
+  `data[0..=2]` for the full ID.
+- The `FF 7F` `SequencerSpecific` channel — surfaced through
+  `SmfFile::sequencer_specifics()` — is *not* selected here; the
+  two channels carry different semantics (SysEx travels to the
+  MIDI wire; `FF 7F` is file-private metadata that does not) and a
+  file may carry both an `F0 7E 7F 09 01 F7` Universal Non-Real-Time
+  GM-On packet on the conductor track and a private `FF 7F`
+  plugin-state blob alongside it. The helper surfaces empty
+  payloads (`F0 00` / `F7 00`) as `data.is_empty()` rather than
+  filtering them out — the spec permits a zero-length packet.
+- 9 new unit tests cover: empty case (no `F0` / `F7` in any track);
+  universal GM-on at tick zero (`F0 7E 7F 09 01 F7`, complete
+  message, manufacturer `0x7E`); `F0` without trailing `F7` marking
+  a multi-packet opener (Roland `0x41`); `F7` continuation pairing
+  after an `F0` opener (with EOX terminator on the continuation
+  packet); empty payload `F0 00` surfacing as `data.is_empty()`;
+  multi-track merge by absolute tick; stable sort keeping
+  `(track, in-track)` order at the same tick; filter-purity against
+  `F0` + `F7` alongside `FF 03 / FF 01 / FF 21 / FF 20 / FF 51 /
+  FF 7F / B0 / 90 / FF 2F` plus a cross-check that
+  `sequencer_specifics()` surfaces its single `FF 7F` entry
+  untouched; and a parser → `to_bytes` → parser round-trip
+  exercising the writer's `F0` + `F7` paths so the helper can't
+  drift out of sync with the mux.
+- Surfaces the SysEx channel alongside the 15-helper meta-event
+  family; the meta-event helper count itself stays at 15
+  (`SmfFile::{tempo_map, time_signatures, key_signatures, markers,
+  lyrics, cue_points, track_names, instrument_names, texts,
+  copyrights, smpte_offsets, sequencer_specifics, sequence_numbers,
+  midi_ports, channel_prefixes}`), since SysEx is a wire-event
+  family rather than a meta-event family.
+
 ### Round 240 — `SmfFile::channel_prefixes()` (FF 20 01 cc) iteration helper
 
 - New `SmfFile::channel_prefixes(&self) -> Vec<ChannelPrefixEvent>`
