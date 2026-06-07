@@ -355,6 +355,28 @@ framework but usable standalone.
   MTC Full Message's `hr / mn / se / fr` quartet, MTS Single Note
   Tuning's note + tuning triple, …) don't have to re-walk
   `sysex_events()` alongside the typed list.
+  Round 254 adds the channel-voice patch-change companion
+  `SmfFile::program_changes() -> Vec<ProgramChangeEvent>`: every
+  `Cn pp` Program Change on every track, pinned to the absolute
+  tick at which it fires, with the channel index and program byte
+  surfaced as a `ProgramChangeEvent { tick, track, channel,
+  program }`. The status nibble's low four bits decode to the
+  spec's `0..=15` channel index (channel "1" in human-facing
+  tools is index `0`); the single data byte `pp` is the
+  `0..=127` patch number. Resolution against a patch list
+  (General MIDI 1 / 2, GS, XG, …) is left to the receiving
+  application — the helper stays bank-agnostic and surfaces the
+  raw program byte so callers driving an instrument-list view
+  pick their own bank-select policy. Per-track sequences are
+  stably merged by absolute tick — track 0's events fire before
+  track 1's at the same tick — the same convention used by every
+  meta-event and SysEx helper. Companion to the wire-state
+  primitive `channel_snapshot_at` which folds the *last* Program
+  Change per channel into `SmfChannelSnapshot::program` for seek
+  initialisation: where the snapshot answers "what patch is this
+  channel on at tick T?", `program_changes()` answers "give me
+  every patch change in song order" — a DAW track-inspector view
+  highlighting the bar each instrument enters reads the latter.
   Round 234 closes the SMF read-vs-write asymmetry: the parser
   has always materialised the full event vocabulary (`Channel`,
   `Sysex`, `Meta`), and round 234 adds the matching writer.

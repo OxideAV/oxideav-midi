@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 254 — `SmfFile::program_changes()` — Cn-pp channel-voice patch-select iteration helper
+
+- New `SmfFile::program_changes(&self) -> Vec<ProgramChangeEvent>`
+  surfaces every `Cn pp` Program Change channel-voice event on every
+  track, pinned to the absolute tick at which it fires, in time order.
+  Each entry is a `ProgramChangeEvent { tick, track, channel, program }`
+  with the status nibble's low four bits decoded into the spec's
+  `0..=15` channel index and the single data byte `pp` surfaced as the
+  `0..=127` patch number.
+- The new `ProgramChangeEvent` struct carries the same `tick` / `track`
+  pair the existing iteration helpers use plus the decoded `channel` and
+  raw `program` bytes. `channel()` and `program()` accessor methods
+  return the same fields with mnemonic names so call sites driving an
+  instrument-list view read `pc.channel()` / `pc.program()` rather than
+  the bare field access.
+- Resolution against a patch list (General MIDI 1 / 2, GS, XG, …) is
+  intentionally left to the receiving application: the helper stays
+  bank-agnostic and surfaces the raw program byte so callers can pick
+  their own bank-select (CC 0 / CC 32) policy.
+- Per-track sequences are stably merged by absolute tick — track 0's
+  events fire before track 1's at the same tick — the same convention
+  used by every existing iteration helper
+  (`sysex_events()`, `universal_sysex_events()`, the meta-event family,
+  …) and the scheduler's merged event list.
+- Companion to the wire-state primitive `SmfFile::channel_snapshot_at`,
+  which folds the *last* Program Change per channel into
+  `SmfChannelSnapshot::program` for seek initialisation. Where the
+  snapshot answers "what patch is this channel on at tick T?",
+  `program_changes()` answers "give me every patch change in song
+  order" — the typed accessor a DAW track-inspector view (highlighting
+  the bar each instrument enters) reads.
+- 10 new tests cover the empty-input case, single-patch decode, the
+  full `0..=127` program range, channel-index decode across the
+  `0..=15` range, running-status reuse on the `Cn` single-data-byte
+  status, late-position absolute-tick tracking, stable-sort merge of
+  same-tick events across tracks, time-ordered merge of different-tick
+  events across tracks, filtering against the other six channel-voice
+  status kinds (`8n`, `9n`, `An`, `Bn`, `Dn`, `En`), and a cross-check
+  against `channel_snapshot_at` confirming the snapshot's `program`
+  field tracks the iterator at each change point and on the silence
+  between changes. Total lib-test count: **496** (up from 486).
+
 ### Round 251 — `SmfFile::universal_sysex_events()` — Table-4-classified file-wide iteration helper
 
 - New `SmfFile::universal_sysex_events(&self) -> Vec<UniversalSysExEvent>`

@@ -1218,6 +1218,74 @@ impl ChannelPrefixEvent {
     }
 }
 
+/// One Program Change (`Cn pp`) channel-voice event pinned to the
+/// absolute tick (relative to the start of its parent track) at which
+/// the [`ChannelBody::ProgramChange`] wire event fires.
+///
+/// Returned by [`SmfFile::program_changes`] — see that method for the
+/// merge semantics across multiple tracks.
+///
+/// `Cn pp` is the Standard MIDI File §"Channel Voice Messages" §`Cn`
+/// patch-select message: a single data byte `pp` (`0..=127`) names the
+/// MIDI program number the receiving synth should switch the channel
+/// to. In a General MIDI 1 receiver this resolves through the Bank
+/// Select pair (CC 0 / CC 32) to one of the 128 GM melodic patches —
+/// `0` Acoustic Grand Piano, `40` Violin, `73` Flute, … — but the
+/// SMF parser doesn't bind any patch-list semantics here: it surfaces
+/// the raw program byte and lets the player resolve the patch against
+/// whatever bank is active at that tick.
+///
+/// This helper isolates the patch-select stream so callers driving an
+/// instrument-list view (DAW track inspector, soft-synth voice
+/// rebuilder, song-form patch-change timeline) get a clean
+/// time-ordered list independent of the surrounding channel-voice and
+/// meta-event streams. The companion wire-state primitive
+/// [`SmfFile::channel_snapshot_at`] folds the *last* program change
+/// per channel into [`SmfChannelSnapshot::program`] for seek
+/// initialisation; this helper surfaces *every* change in chronological
+/// order so callers building the full patch-change timeline (e.g. a
+/// "song form" view that highlights the bar each instrument enters)
+/// don't have to re-walk every track event manually.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgramChangeEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the channel-voice event, in division units. For format-1 SMFs
+    /// this is also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). Format-1 files commonly place all of a
+    /// part's channel-voice events on one track; format-2 files keep
+    /// patterns separate so each pattern's Program Change appears on
+    /// its own track.
+    pub track: usize,
+    /// The MIDI channel the patch change targets, in the spec's
+    /// `0..=15` range (channel "1" in human-facing tools is index `0`).
+    /// Decoded from the low nibble of the `Cn` status byte at parse
+    /// time so the parser's running-status bookkeeping is already
+    /// resolved by the time the event reaches the helper.
+    pub channel: u8,
+    /// The program number (`pp` payload of `Cn pp`, `0..=127`). The
+    /// Standard MIDI File Specification 1.0 reserves the high bit
+    /// (`0x80`) for status / running-status framing; the parser
+    /// rejects channel-voice data bytes with the high bit set so the
+    /// value space here is always `0..=127`. Resolution against a
+    /// patch list (General MIDI 1 / 2, GS, XG, …) is left to the
+    /// receiving application.
+    pub program: u8,
+}
+
+impl ProgramChangeEvent {
+    /// The MIDI channel index in the spec's `0..=15` range.
+    pub fn channel(&self) -> u8 {
+        self.channel
+    }
+
+    /// The MIDI program number (`0..=127`).
+    pub fn program(&self) -> u8 {
+        self.program
+    }
+}
+
 /// One System Exclusive event pinned to the absolute tick (relative
 /// to the start of its parent track) at which the [`F0`](Event::Sysex)
 /// (start) or [`F7`](Event::Sysex) (continuation / escape) wire event
@@ -3056,6 +3124,83 @@ impl SmfFile {
                         tick: abs,
                         track: track_idx,
                         channel: *channel,
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every [`ChannelBody::ProgramChange`] (`Cn pp`) channel-voice
+    /// event from every track, pinned to the absolute tick at which it
+    /// fires, in time order.
+    ///
+    /// `Cn pp` selects the MIDI program (patch) on a specific channel:
+    /// the low nibble of the status byte is the channel index (`0..=15`)
+    /// and the single data byte `pp` (`0..=127`) is the program number.
+    /// In General MIDI 1 a player resolves the program against the
+    /// 128-patch GM melodic table; in GM 2 / GS / XG it resolves through
+    /// the active Bank Select pair (CC 0 / CC 32) first; this helper
+    /// stays bank-agnostic and surfaces the raw program byte alongside
+    /// the channel so the caller's patch-resolution policy stays its own.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two patch changes at the same tick keep the
+    /// `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::tempo_map`] /
+    /// [`SmfFile::time_signatures`] / [`SmfFile::key_signatures`] /
+    /// [`SmfFile::markers`] / [`SmfFile::lyrics`] /
+    /// [`SmfFile::cue_points`] / [`SmfFile::track_names`] /
+    /// [`SmfFile::instrument_names`] / [`SmfFile::texts`] /
+    /// [`SmfFile::copyrights`] / [`SmfFile::smpte_offsets`] /
+    /// [`SmfFile::sequencer_specifics`] /
+    /// [`SmfFile::sequence_numbers`] / [`SmfFile::midi_ports`] /
+    /// [`SmfFile::channel_prefixes`] and the scheduler use
+    /// (`scheduler.rs` §"merged event list, sorted by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries a `Cn` event — a
+    /// player initialising a fresh receiver should leave the channel on
+    /// power-up patch `0` (Acoustic Grand Piano under GM 1) until an
+    /// explicit Program Change arrives, per the spec convention.
+    ///
+    /// Only `Cn` is selected — neighbouring CC (`Bn`), pitch-bend
+    /// (`En`), aftertouch (`An` / `Dn`), and note (`8n` / `9n`)
+    /// channel-voice events stay on their own surfaces. Companion
+    /// primitive [`SmfFile::channel_snapshot_at`] folds the *last*
+    /// Program Change per channel into
+    /// [`SmfChannelSnapshot::program`] for seek initialisation; this
+    /// helper surfaces *every* Program Change in chronological order
+    /// so callers building a song-form patch-change timeline (e.g. a
+    /// DAW track-inspector view that highlights the bar each
+    /// instrument enters) get the full list without a manual track
+    /// walk.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`] (the same cap the parser enforces).
+    pub fn program_changes(&self) -> Vec<ProgramChangeEvent> {
+        let mut out: Vec<ProgramChangeEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Channel(ChannelMessage {
+                    channel,
+                    body: ChannelBody::ProgramChange { program },
+                }) = &ev.kind
+                {
+                    out.push(ProgramChangeEvent {
+                        tick: abs,
+                        track: track_idx,
+                        channel: *channel,
+                        program: *program,
                     });
                 }
             }
@@ -9385,5 +9530,213 @@ mod tests {
         bytes.extend_from_slice(&chunk);
         let smf = parse(&bytes).unwrap();
         assert_eq!(smf.tracks[0], track);
+    }
+
+    // ───────── ProgramChangeEvent / SmfFile::program_changes (Cn pp) ─────────
+
+    #[test]
+    fn program_changes_empty_when_no_patch_select_present() {
+        // Note On / Note Off only — no Program Change.
+        let events: Vec<u8> = vec![
+            0x00, 0x90, 0x3C, 0x64, 0x60, 0x80, 0x3C, 0x40, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.program_changes().is_empty());
+    }
+
+    #[test]
+    fn program_changes_single_patch_at_tick_zero() {
+        // delta=0 C0 28   (channel 0, program 40 = Violin under GM 1)
+        // delta=0 FF 2F 00
+        let events: Vec<u8> = vec![0x00, 0xC0, 0x28, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pcs = smf.program_changes();
+        assert_eq!(pcs.len(), 1);
+        assert_eq!(pcs[0].tick, 0);
+        assert_eq!(pcs[0].track, 0);
+        assert_eq!(pcs[0].channel(), 0);
+        assert_eq!(pcs[0].program(), 40);
+    }
+
+    #[test]
+    fn program_changes_full_seven_bit_program_range_round_trips() {
+        // C5 7F → channel 5, program 127 (max legal value).
+        let events: Vec<u8> = vec![0x00, 0xC5, 0x7F, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pcs = smf.program_changes();
+        assert_eq!(pcs.len(), 1);
+        assert_eq!(pcs[0].channel, 5);
+        assert_eq!(pcs[0].program, 127);
+    }
+
+    #[test]
+    fn program_changes_low_nibble_decodes_channel_index() {
+        // CF 01 → channel 15 (the high nibble of Cn is the status,
+        // the low nibble is the channel index 0..=15).
+        let events: Vec<u8> = vec![0x00, 0xCF, 0x01, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pcs = smf.program_changes();
+        assert_eq!(pcs.len(), 1);
+        assert_eq!(pcs[0].channel(), 15);
+        assert_eq!(pcs[0].program(), 1);
+    }
+
+    #[test]
+    fn program_changes_running_status_chain_decodes_each_change() {
+        // C0 28 followed by a running-status reuse: C0 29 (no status byte
+        // — running status repeats the previous Cn). Spec §"Running
+        // Status" says any single-data-byte status (`Cn`, `Dn`) keeps a
+        // single running-status data byte per event.
+        // delta=0 C0 28  (set status; channel 0 / program 40)
+        // delta=0   29   (running status — channel 0 / program 41)
+        // delta=0 FF 2F 00
+        let events: Vec<u8> = vec![0x00, 0xC0, 0x28, 0x00, 0x29, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pcs = smf.program_changes();
+        assert_eq!(pcs.len(), 2);
+        assert_eq!(pcs[0].channel, 0);
+        assert_eq!(pcs[0].program, 40);
+        assert_eq!(pcs[1].channel, 0);
+        assert_eq!(pcs[1].program, 41);
+    }
+
+    #[test]
+    fn program_changes_late_position_tracks_absolute_tick() {
+        // Patch change after a 240-tick rest — the helper surfaces it
+        // at tick 240, not at zero.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&encode_vlq(240));
+        events.extend_from_slice(&[0xC2, 0x49]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pcs = smf.program_changes();
+        assert_eq!(pcs.len(), 1);
+        assert_eq!(pcs[0].tick, 240);
+        assert_eq!(pcs[0].channel, 2);
+        assert_eq!(pcs[0].program, 73);
+    }
+
+    #[test]
+    fn program_changes_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        // Two format-1 tracks both with a Program Change at tick 0 —
+        // the stable sort keeps track 0 before track 1.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xC0, 0x10]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&[0x00, 0xC1, 0x11]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let pcs = smf.program_changes();
+        assert_eq!(pcs.len(), 2);
+        assert_eq!(pcs[0].track, 0);
+        assert_eq!(pcs[0].channel, 0);
+        assert_eq!(pcs[0].program, 0x10);
+        assert_eq!(pcs[1].track, 1);
+        assert_eq!(pcs[1].channel, 1);
+        assert_eq!(pcs[1].program, 0x11);
+    }
+
+    #[test]
+    fn program_changes_merge_across_tracks_sorted_by_tick() {
+        // Track 0 at tick 100, track 1 at tick 50 — sort drops the
+        // track-1 entry first.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(100));
+        t0.extend_from_slice(&[0xC0, 0x20]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(50));
+        t1.extend_from_slice(&[0xC1, 0x30]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let pcs = smf.program_changes();
+        assert_eq!(pcs.len(), 2);
+        assert_eq!(pcs[0].tick, 50);
+        assert_eq!(pcs[0].track, 1);
+        assert_eq!(pcs[0].channel, 1);
+        assert_eq!(pcs[0].program, 0x30);
+        assert_eq!(pcs[1].tick, 100);
+        assert_eq!(pcs[1].track, 0);
+        assert_eq!(pcs[1].channel, 0);
+        assert_eq!(pcs[1].program, 0x20);
+    }
+
+    #[test]
+    fn program_changes_filter_excludes_other_channel_voice_kinds() {
+        // Cn picked up; note-on / note-off / CC / pitch bend /
+        // aftertouch all filtered out. Sibling helpers stay
+        // uncontaminated.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // note on
+        events.extend_from_slice(&[0x00, 0xB0, 0x07, 0x50]); // CC vol
+        events.extend_from_slice(&[0x00, 0xC0, 0x05]); // program change
+        events.extend_from_slice(&[0x00, 0xE0, 0x00, 0x40]); // pitch bend
+        events.extend_from_slice(&[0x00, 0xA0, 0x3C, 0x20]); // poly AT
+        events.extend_from_slice(&[0x00, 0xD0, 0x40]); // channel AT
+        events.extend_from_slice(&[0x00, 0x80, 0x3C, 0x40]); // note off
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pcs = smf.program_changes();
+        assert_eq!(pcs.len(), 1);
+        assert_eq!(pcs[0].channel, 0);
+        assert_eq!(pcs[0].program, 5);
+    }
+
+    #[test]
+    fn program_changes_seek_initialisation_matches_channel_snapshot() {
+        // The snapshot folds the *last* program change before the
+        // seek tick into SmfChannelSnapshot::program; program_changes()
+        // exposes the *full* timeline. Verify the two agree on what the
+        // snapshot's program field would be at every change point.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xC0, 0x00]); // tick 0 — GM Piano
+        events.extend_from_slice(&encode_vlq(100));
+        events.extend_from_slice(&[0xC0, 0x28]); // tick 100 — Violin
+        events.extend_from_slice(&encode_vlq(100));
+        events.extend_from_slice(&[0xC0, 0x49]); // tick 200 — Flute
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pcs = smf.program_changes();
+        assert_eq!(pcs.len(), 3);
+        // Snapshot at each successive change point should match the
+        // program byte the iterator surfaces.
+        for (i, pc) in pcs.iter().enumerate() {
+            let snap = smf.channel_snapshot_at(0, pc.tick);
+            assert_eq!(
+                snap.program,
+                Some(pc.program),
+                "snapshot at change {i} (tick {}) should resolve to program {}",
+                pc.tick,
+                pc.program
+            );
+        }
+        // Mid-way between changes the snapshot still reports the most
+        // recent program selected.
+        let snap_mid = smf.channel_snapshot_at(0, 150);
+        assert_eq!(snap_mid.program, Some(40));
     }
 }
