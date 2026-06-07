@@ -333,6 +333,28 @@ framework but usable standalone.
   Table 4 vocabulary surface through `UniversalSubId1::Other(raw)`
   / `UniversalSubId2::Other(raw)` so callers with deeper or more
   recent vocabulary can route the packet through a fallback path.
+  Round 251 lifts the same Table-4 classifier to a file-wide
+  iteration helper with `SmfFile::universal_sysex_events() ->
+  Vec<UniversalSysExEvent>`: every `F0 7E …` / `F0 7F …` Universal
+  SysEx packet on every track, pinned to its absolute tick, with
+  the classification eagerly resolved into a
+  `UniversalSysExEvent { tick, track, classification, data }`.
+  Manufacturer-prefixed `F0` packets (Roland `0x41`, Yamaha `0x43`,
+  any leading byte other than `0x7E` / `0x7F`) and `F7`
+  continuation / escape packets are filtered out — callers reading
+  those route through `SmfFile::sysex_events()` and
+  `SysExEvent::manufacturer_id()` directly. `F0` packets truncated
+  before Sub-ID #1 (payload shorter than 3 bytes) are also filtered,
+  matching the underlying classifier's contract. Per-track sequences
+  are stably merged by absolute tick — track 0's universal packets
+  fire before track 1's at the same tick — the same convention used
+  by `sysex_events()` and every meta-event helper. The verbatim
+  payload bytes (leading `<realm>` byte through trailing `F7`, when
+  present) are preserved on `UniversalSysExEvent::data` so callers
+  reading Sub-ID #2-derived arguments (Master Volume's 14-bit value,
+  MTC Full Message's `hr / mn / se / fr` quartet, MTS Single Note
+  Tuning's note + tuning triple, …) don't have to re-walk
+  `sysex_events()` alongside the typed list.
   Round 234 closes the SMF read-vs-write asymmetry: the parser
   has always materialised the full event vocabulary (`Channel`,
   `Sysex`, `Meta`), and round 234 adds the matching writer.

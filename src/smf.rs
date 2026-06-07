@@ -1357,6 +1357,57 @@ pub struct UniversalSysEx {
     pub sub_id1: UniversalSubId1,
 }
 
+/// A Universal System Exclusive packet pinned to its absolute tick on
+/// the SMF timeline, returned by [`SmfFile::universal_sysex_events`].
+///
+/// This is the typed, Table-4-classified counterpart of the verbatim
+/// [`SysExEvent`] stream returned by [`SmfFile::sysex_events`]: the
+/// helper walks every `F0` SysEx packet on every track, calls
+/// [`SysExEvent::universal_classification`] on each, keeps only the
+/// packets that classify as Universal Non-Real-Time (`0x7E`) or
+/// Universal Real-Time (`0x7F`), and surfaces them with the parsed
+/// [`UniversalSysEx`] alongside the verbatim payload bytes so a
+/// caller can route by the category enum without re-classifying.
+///
+/// Manufacturer-prefixed `F0` packets (Roland `0x41`, Yamaha `0x43`,
+/// any other manufacturer-ID byte) are filtered out — callers
+/// interested in those route through [`SmfFile::sysex_events`] and
+/// [`SysExEvent::manufacturer_id`] instead. `F7` continuation /
+/// escape packets are also filtered out — they are opaque payloads
+/// shipped to the wire as part of a manufacturer-specific multi-packet
+/// assembly that the opening `F0` declared, and the universal-only
+/// view stays at one entry per logical universal message.
+///
+/// Per-track sequences are stably merged by absolute tick — track 0's
+/// universal packets fire before track 1's at the same tick — the
+/// same convention used by [`SmfFile::sysex_events`] and every meta-
+/// event iteration helper.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UniversalSysExEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the SysEx packet, in division units. For format-1 SMFs this is
+    /// also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). Format-1 files conventionally place GM-On
+    /// / Master Volume / Master Tuning on the conductor track (track 0).
+    pub track: usize,
+    /// The Table-4 classification of this packet — realm, device-id,
+    /// Sub-ID #1, and the Sub-ID #2 sub-category when one is present
+    /// in the payload.
+    pub classification: UniversalSysEx,
+    /// The verbatim SysEx payload bytes from the wire — the same
+    /// bytes [`SysExEvent::data`] would surface for this packet. The
+    /// leading `<realm>` byte (`0x7E` / `0x7F`) is included; the
+    /// trailing `0xF7` end-of-exclusive marker is included when
+    /// present in the source file. Callers reading Sub-ID #2-derived
+    /// arguments (Master Volume's 14-bit value, MTC Full Message's
+    /// `hr/mn/se/fr` quartet, MTS Single Note Tuning's note + tuning
+    /// triple, …) index into this buffer starting at the byte after
+    /// Sub-ID #2 — see Table 4 for each category's wire shape.
+    pub data: Vec<u8>,
+}
+
 /// Sub-ID #1 category of a Universal System Exclusive packet — the
 /// `<sub_id1>` byte in the `F0 <realm> <device_id> <sub_id1> …` wire
 /// shape, decoded against Table 4 of the MIDI 1.0 *Universal System
@@ -3085,6 +3136,92 @@ impl SmfFile {
                         is_escape: *escape,
                         data: data.clone(),
                     });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **Universal** System Exclusive packet from every
+    /// track — `F0 7E …` (Non-Real-Time) and `F0 7F …` (Real-Time)
+    /// only — pinned to the absolute tick at which it fires, in time
+    /// order, with the Table-4 classification eagerly resolved.
+    ///
+    /// The universal-only view is the typed counterpart of
+    /// [`SmfFile::sysex_events`]: this helper walks the same per-track
+    /// `Event::Sysex` stream, calls
+    /// [`SysExEvent::universal_classification`] on each, keeps only the
+    /// packets that classify as `Some(_)`, and returns a
+    /// [`UniversalSysExEvent`] for each. Manufacturer-prefixed `F0`
+    /// packets (Roland `0x41`, Yamaha `0x43`, any leading byte other
+    /// than `0x7E` / `0x7F`) and `F7` continuation / escape packets are
+    /// filtered out — callers interested in those route through
+    /// [`SmfFile::sysex_events`] directly. `F0` packets truncated
+    /// before the Sub-ID #1 byte (a payload shorter than 3 bytes) are
+    /// also filtered, matching the contract of the underlying
+    /// classifier.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in
+    /// the same track), then the per-track sequences are merged. The
+    /// sort is stable so two universal packets at the same tick keep
+    /// the `(track, in-track-position)` order — track 0's events fire
+    /// before track 1's at the same tick. This matches the same
+    /// stable-merge rule [`SmfFile::sysex_events`] /
+    /// [`SmfFile::tempo_map`] / [`SmfFile::time_signatures`] /
+    /// [`SmfFile::key_signatures`] / [`SmfFile::markers`] /
+    /// [`SmfFile::lyrics`] / [`SmfFile::cue_points`] /
+    /// [`SmfFile::track_names`] / [`SmfFile::instrument_names`] /
+    /// [`SmfFile::texts`] / [`SmfFile::copyrights`] /
+    /// [`SmfFile::smpte_offsets`] /
+    /// [`SmfFile::sequencer_specifics`] /
+    /// [`SmfFile::sequence_numbers`] / [`SmfFile::midi_ports`] /
+    /// [`SmfFile::channel_prefixes`] and the scheduler use
+    /// (`scheduler.rs` §"merged event list, sorted by absolute
+    /// tick").
+    ///
+    /// Returns an empty `Vec` when no track carries a universal SysEx
+    /// packet — music-only sequences without GM-On / Master Volume /
+    /// MTC / MMC produce the empty list.
+    ///
+    /// The verbatim payload bytes are surfaced on
+    /// [`UniversalSysExEvent::data`] so callers reading Sub-ID #2-
+    /// derived arguments (Master Volume LSB / MSB, MTC `hr mn se fr`,
+    /// MTS note + tuning triple, …) don't have to re-walk
+    /// [`SmfFile::sysex_events`] alongside this list.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn universal_sysex_events(&self) -> Vec<UniversalSysExEvent> {
+        let mut out: Vec<UniversalSysExEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Sysex { escape, data } = &ev.kind {
+                    // Re-use SysExEvent's classifier so the universal-
+                    // view stays in lock-step with the per-event API:
+                    // any future tweak to the Table 4 vocabulary lands
+                    // in one place.
+                    let scratch = SysExEvent {
+                        tick: abs,
+                        track: track_idx,
+                        is_escape: *escape,
+                        data: data.clone(),
+                    };
+                    if let Some(classification) = scratch.universal_classification() {
+                        out.push(UniversalSysExEvent {
+                            tick: abs,
+                            track: track_idx,
+                            classification,
+                            data: scratch.data,
+                        });
+                    }
                 }
             }
         }
@@ -7620,6 +7757,218 @@ mod tests {
         assert!(sx[2].is_escape);
         assert_eq!(sx[2].data, vec![0x7B, 0xF7]);
         assert!(sx[2].ends_with_eox());
+    }
+
+    // ───────── SmfFile::universal_sysex_events ─────────
+
+    #[test]
+    fn universal_sysex_events_empty_when_no_sysex_present() {
+        let events: Vec<u8> = vec![0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.universal_sysex_events().is_empty());
+    }
+
+    #[test]
+    fn universal_sysex_events_filters_out_manufacturer_prefixed_and_escape_packets() {
+        // delta=0 F0 06 41 10 42 01 02 F7 — Roland (0x41) manufacturer
+        //                                   packet, filtered out.
+        // delta=8 F0 05 7E 7F 09 01 F7   — Universal Non-Real-Time GM-On,
+        //                                   retained.
+        // delta=8 F7 02 CC F7            — escape / continuation packet,
+        //                                   filtered out.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xF0, 0x06, 0x41, 0x10, 0x42, 0x01, 0x02, 0xF7]);
+        events.extend_from_slice(&[0x08, 0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        events.extend_from_slice(&[0x08, 0xF7, 0x02, 0xCC, 0xF7]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        // Sanity: sysex_events still surfaces all three packets.
+        assert_eq!(smf.sysex_events().len(), 3);
+        // Universal-only view: GM-On only.
+        let u = smf.universal_sysex_events();
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].tick, 8);
+        assert_eq!(u[0].track, 0);
+        assert_eq!(u[0].classification.realm, UniversalRealm::NonRealTime);
+        assert_eq!(u[0].classification.device_id, 0x7F);
+        assert_eq!(
+            u[0].classification.sub_id1,
+            UniversalSubId1::GeneralMidiOrControllerDestination(
+                UniversalSubId2::GeneralMidi1SystemOn,
+            )
+        );
+        assert_eq!(u[0].data, vec![0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+    }
+
+    #[test]
+    fn universal_sysex_events_classifies_both_realms() {
+        // delta=0  F0 05 7E 7F 09 01 F7 — GM 1 System On (Non-RT).
+        // delta=64 F0 07 7F 7F 04 01 30 30 F7 — Master Volume (RT).
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        events.extend_from_slice(&[0x40, 0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x01, 0x30, 0x30, 0xF7]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let u = smf.universal_sysex_events();
+        assert_eq!(u.len(), 2);
+        // GM-On at tick 0
+        assert_eq!(u[0].tick, 0);
+        assert_eq!(u[0].classification.realm, UniversalRealm::NonRealTime);
+        assert_eq!(
+            u[0].classification.sub_id1,
+            UniversalSubId1::GeneralMidiOrControllerDestination(
+                UniversalSubId2::GeneralMidi1SystemOn,
+            )
+        );
+        // Master Volume at tick 64
+        assert_eq!(u[1].tick, 64);
+        assert_eq!(u[1].classification.realm, UniversalRealm::RealTime);
+        assert_eq!(u[1].classification.device_id, 0x7F);
+        assert_eq!(
+            u[1].classification.sub_id1,
+            UniversalSubId1::DeviceControl(UniversalSubId2::DeviceControlMasterVolume),
+        );
+        // Data preserves verbatim payload including realm + trailing F7.
+        assert_eq!(u[1].data, vec![0x7F, 0x7F, 0x04, 0x01, 0x30, 0x30, 0xF7]);
+    }
+
+    #[test]
+    fn universal_sysex_events_merge_across_tracks_sorted_by_tick() {
+        // Track 0: tick 100 → GM 1 System On.
+        // Track 1: tick  50 → Master Volume.
+        // Merged order: track-1@50, then track-0@100.
+        let t0: Vec<u8> = {
+            let mut v: Vec<u8> = Vec::new();
+            v.extend_from_slice(&encode_vlq(100));
+            v.extend_from_slice(&[0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+            v.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+            v
+        };
+        let t1: Vec<u8> = {
+            let mut v: Vec<u8> = Vec::new();
+            v.extend_from_slice(&encode_vlq(50));
+            v.extend_from_slice(&[0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x01, 0x30, 0x30, 0xF7]);
+            v.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+            v
+        };
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let u = smf.universal_sysex_events();
+        assert_eq!(u.len(), 2);
+        assert_eq!(u[0].tick, 50);
+        assert_eq!(u[0].track, 1);
+        assert_eq!(u[0].classification.realm, UniversalRealm::RealTime);
+        assert_eq!(u[1].tick, 100);
+        assert_eq!(u[1].track, 0);
+        assert_eq!(u[1].classification.realm, UniversalRealm::NonRealTime);
+    }
+
+    #[test]
+    fn universal_sysex_events_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        // Both tracks fire a Universal SysEx at absolute tick 64; stable
+        // sort by tick keeps the per-track insertion order so track 0
+        // precedes track 1. Matches the merge convention used by every
+        // existing iteration helper and the scheduler.
+        let t0: Vec<u8> = {
+            let mut v: Vec<u8> = Vec::new();
+            v.extend_from_slice(&encode_vlq(64));
+            v.extend_from_slice(&[0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7]); // GM-On
+            v.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+            v
+        };
+        let t1: Vec<u8> = {
+            let mut v: Vec<u8> = Vec::new();
+            v.extend_from_slice(&encode_vlq(64));
+            v.extend_from_slice(&[0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x01, 0x40, 0x40, 0xF7]); // Master Volume
+            v.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+            v
+        };
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let u = smf.universal_sysex_events();
+        assert_eq!(u.len(), 2);
+        assert_eq!(u[0].tick, 64);
+        assert_eq!(u[0].track, 0);
+        assert_eq!(u[0].classification.realm, UniversalRealm::NonRealTime);
+        assert_eq!(u[1].tick, 64);
+        assert_eq!(u[1].track, 1);
+        assert_eq!(u[1].classification.realm, UniversalRealm::RealTime);
+    }
+
+    #[test]
+    fn universal_sysex_events_drops_truncated_universal_packets() {
+        // delta=0 F0 02 7E 7F — Universal realm + device-id only,
+        //                       truncated before Sub-ID #1 (payload < 3
+        //                       bytes pre-F7). Classifier returns None;
+        //                       helper filters it out.
+        // delta=8 F0 05 7E 7F 09 01 F7 — valid GM-On, retained.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xF0, 0x02, 0x7E, 0x7F]);
+        events.extend_from_slice(&[0x08, 0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        // Sanity: sysex_events surfaces both.
+        assert_eq!(smf.sysex_events().len(), 2);
+        // Universal-only: just the GM-On.
+        let u = smf.universal_sysex_events();
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].tick, 8);
+        assert_eq!(
+            u[0].classification.sub_id1,
+            UniversalSubId1::GeneralMidiOrControllerDestination(
+                UniversalSubId2::GeneralMidi1SystemOn,
+            )
+        );
+    }
+
+    #[test]
+    fn universal_sysex_events_classification_matches_per_event_call() {
+        // The helper is a re-use of SysExEvent::universal_classification;
+        // confirm the two views agree byte-for-byte on a mixed packet
+        // mix so a future tweak to the per-event classifier can't drift
+        // out of sync with this helper without the test catching it.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7]); // GM 1 On
+        events.extend_from_slice(&[0x00, 0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x02, 0xF7]); // GM Off
+        events.extend_from_slice(&[0x00, 0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x01, 0x30, 0x30, 0xF7]); // Master Volume
+        events.extend_from_slice(&[
+            0x00, 0xF0, 0x09, 0x7F, 0x00, 0x01, 0x01, 0x10, 0x20, 0x30, 0x40, 0xF7,
+        ]); // RT MTC Full Message
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let u = smf.universal_sysex_events();
+        // Walk sysex_events() and call universal_classification() to
+        // build the parallel view, then compare.
+        let parallel: Vec<(u64, usize, UniversalSysEx, Vec<u8>)> = smf
+            .sysex_events()
+            .into_iter()
+            .filter_map(|ev| {
+                ev.universal_classification()
+                    .map(|c| (ev.tick, ev.track, c, ev.data.clone()))
+            })
+            .collect();
+        assert_eq!(u.len(), parallel.len());
+        assert_eq!(u.len(), 4);
+        for (lhs, rhs) in u.iter().zip(parallel.iter()) {
+            assert_eq!(lhs.tick, rhs.0);
+            assert_eq!(lhs.track, rhs.1);
+            assert_eq!(lhs.classification, rhs.2);
+            assert_eq!(lhs.data, rhs.3);
+        }
     }
 
     // ───────── SysExEvent::universal_classification ─────────

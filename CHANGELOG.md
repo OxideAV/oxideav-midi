@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 251 — `SmfFile::universal_sysex_events()` — Table-4-classified file-wide iteration helper
+
+- New `SmfFile::universal_sysex_events(&self) -> Vec<UniversalSysExEvent>`
+  surfaces every Universal System Exclusive packet on every track —
+  `F0 7E …` (Non-Real-Time) and `F0 7F …` (Real-Time) only — pinned
+  to the absolute tick at which it fires, in time order, with the
+  Table-4 classification already resolved. Each entry is a
+  `UniversalSysExEvent { tick, track, classification, data }`.
+- The new `UniversalSysExEvent` struct carries the same `tick` /
+  `track` pair the existing iteration helpers use, the parsed
+  `UniversalSysEx { realm, device_id, sub_id1 }` classification
+  the round-246 per-event classifier returns, and the verbatim
+  payload bytes from the wire (leading `<realm>` byte through
+  trailing `0xF7` when present) so callers reading Sub-ID #2-
+  derived arguments — Master Volume's 14-bit value, MTC Full
+  Message's `hr / mn / se / fr` quartet, MTS Single Note Tuning's
+  note + tuning triple, … — don't have to re-walk
+  `SmfFile::sysex_events()` alongside the typed list.
+- Manufacturer-prefixed `F0` packets (Roland `0x41`, Yamaha `0x43`,
+  any leading byte other than `0x7E` / `0x7F`) and `F7`
+  continuation / escape packets are filtered out — callers
+  interested in those route through `SmfFile::sysex_events()` and
+  `SysExEvent::manufacturer_id()` directly. `F0` packets truncated
+  before the Sub-ID #1 byte (payload shorter than 3 bytes) are also
+  filtered, matching the contract of the underlying
+  `SysExEvent::universal_classification()` classifier so the two
+  views agree on which packets are universal.
+- Per-track sequences are stably merged by absolute tick — track 0's
+  universal packets fire before track 1's at the same tick — the
+  same convention used by `SmfFile::sysex_events()` /
+  `tempo_map()` / `time_signatures()` / `key_signatures()` /
+  `markers()` / `lyrics()` / `cue_points()` / `track_names()` /
+  `instrument_names()` / `texts()` / `copyrights()` /
+  `smpte_offsets()` / `sequencer_specifics()` /
+  `sequence_numbers()` / `midi_ports()` / `channel_prefixes()`
+  and `scheduler.rs` §"merged event list, sorted by absolute tick".
+- The helper re-uses `SysExEvent::universal_classification()` for the
+  per-packet decode so any future tweak to the Table 4 vocabulary
+  lands in exactly one place; a regression test walks `sysex_events()`
+  in parallel and confirms the typed view stays byte-for-byte aligned
+  with the per-event classifier across a mixed packet sample.
+- 7 new unit tests cover the empty-file case, the manufacturer-
+  prefixed + escape filter, both-realm classification, cross-track
+  stable merging, same-tick stable-sort ordering (track 0 wins),
+  truncated-universal-packet drop, and the per-event classifier
+  parity check.
+
 ### Round 246 — `SysExEvent::universal_classification()` — Table 4 Universal SysEx classifier
 
 - New `SysExEvent::universal_classification(&self) -> Option<UniversalSysEx>`
