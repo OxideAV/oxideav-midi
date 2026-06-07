@@ -301,6 +301,38 @@ framework but usable standalone.
   file-private metadata that does not) so a file may carry both an
   `F0 7E 7F 09 01 F7` Universal Non-Real-Time GM-On packet and a
   private `FF 7F` plugin-state blob alongside it.
+  Round 246 adds the Table 4 vocabulary decoder atop the same
+  `SysExEvent` channel: `SysExEvent::universal_classification() ->
+  Option<UniversalSysEx>` reads the `<realm> <device_id> <sub_id1>
+  [<sub_id2>]` shape of a Universal SysEx `F0` packet against
+  Table 4 of the MIDI 1.0 *Universal System Exclusive Messages*
+  document and returns a `UniversalSysEx { realm, device_id,
+  sub_id1 }` naming the parsed category. The `realm` field
+  distinguishes Non-Real-Time (`0x7E`) versus Real-Time (`0x7F`);
+  the `sub_id1` field is a `UniversalSubId1` enum that names every
+  category in the table — Sample Dump Header / Data / Request, MIDI
+  Time Code (Non-RT Setup + RT Quarter-Frame families), Sample
+  Dump Extensions, General Information (Identity Request / Reply),
+  File Dump, MIDI Tuning Standard, General MIDI 1 / GM Off / GM 2
+  System On, Downloadable Sounds (DLS On / Off / Voice Allocation
+  On / Off), File Reference Message, MIDI Visual Control, MIDI
+  Capability Inquiry, MIDI Show Control, Notation Information (Bar
+  Number, Time Signature Immediate / Delayed), Device Control
+  (Master Volume / Balance / Fine Tuning / Coarse Tuning / Global
+  Parameter Control), Real-Time MTC Cueing, Controller Destination
+  Setting (Channel Pressure / Polyphonic Key Pressure / Control
+  Change), Key-Based Instrument Control, Scalable Polyphony MIP,
+  Mobile Phone Control — plus the five Non-Real-Time singletons
+  (End of File, Wait, Cancel, NAK, ACK). The classifier is
+  realm-aware: the same `(sub_id1, sub_id2)` byte pair names
+  different messages in the two realms (e.g. `0x09 0x01` is
+  `GeneralMidi1SystemOn` in Non-Real-Time and
+  `ControllerDestinationChannelPressure` in Real-Time, per
+  Table 4); the decoder resolves the realm-dependent semantics
+  before matching. Sub-ID #1 / Sub-ID #2 values outside the
+  Table 4 vocabulary surface through `UniversalSubId1::Other(raw)`
+  / `UniversalSubId2::Other(raw)` so callers with deeper or more
+  recent vocabulary can route the packet through a fallback path.
   Round 234 closes the SMF read-vs-write asymmetry: the parser
   has always materialised the full event vocabulary (`Channel`,
   `Sysex`, `Meta`), and round 234 adds the matching writer.

@@ -1288,6 +1288,391 @@ pub struct SysExEvent {
     pub data: Vec<u8>,
 }
 
+/// Realm bit of a Universal System Exclusive packet — Non-Real-Time
+/// (`0x7E`) or Real-Time (`0x7F`).
+///
+/// The leading payload byte of a Universal SysEx `F0` packet is one of
+/// these two reserved manufacturer-ID slots, per the MIDI 1.0
+/// *Universal System Exclusive Messages* document (Table 4). The two
+/// realms partition the universal vocabulary by whether the receiving
+/// device is expected to act *immediately* on receipt (`0x7F` —
+/// Master Volume, MTC Quarter-Frame, MMC transport, Notation
+/// Information) or whether the packet describes a *setup* / *bulk*
+/// operation the device may process at its leisure (`0x7E` — Sample
+/// Dump, General MIDI System On / Off, Identity Request, File Dump).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UniversalRealm {
+    /// `0x7E` — Universal Non-Real-Time. The MMA's Universal SysEx
+    /// document calls this realm "Non-Real Time"; the receiving device
+    /// may queue the message and process it when convenient (e.g.
+    /// finishing a sample-dump assembly).
+    NonRealTime,
+    /// `0x7F` — Universal Real-Time. The receiving device is expected
+    /// to act on the message immediately on arrival (e.g. updating
+    /// Master Volume between two consecutive note-on events).
+    RealTime,
+}
+
+/// Sub-ID #1 / Sub-ID #2 classification of a Universal System Exclusive
+/// packet — the parsed category byte pair from Table 4 of the MIDI 1.0
+/// *Universal System Exclusive Messages* document.
+///
+/// Returned by [`SysExEvent::universal_classification`] when the packet
+/// is a Universal SysEx `F0 7E …` (Non-Real-Time) or `F0 7F …` (Real-
+/// Time) message. The classification captures the realm, the Sub-ID #1
+/// category, the Sub-ID #2 sub-category (when one is present in the
+/// payload), and the device-id byte that precedes Sub-ID #1.
+///
+/// The classifier reads the well-known Sub-ID #1 values defined by the
+/// MMA at the time of the round-246 trace of the doc. Values outside
+/// the published vocabulary surface through the
+/// [`UniversalSubId1::Other`] variant carrying the raw byte so callers
+/// with deeper, more recent vocabulary can still route the packet.
+///
+/// Wire shape of a Universal SysEx `F0` packet:
+///
+/// ```text
+///   F0 <realm> <device_id> <sub_id1> [<sub_id2> [..payload..]] F7
+///   ^^                                                         ^^
+///   start byte (eaten by the SMF parser; the [`SysExEvent::data`]
+///   buffer starts at <realm>; the trailing F7 is preserved when
+///   present)
+/// ```
+///
+/// The classifier returns `None` for an `F7` continuation / escape
+/// packet, for an `F0` packet whose leading byte is neither `0x7E`
+/// nor `0x7F` (a manufacturer-prefixed packet — Roland `0x41`,
+/// Yamaha `0x43`, …), and for any Universal packet truncated before
+/// the Sub-ID #1 byte (a payload shorter than three bytes — realm,
+/// device-id, sub-id1 are the minimum).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UniversalSysEx {
+    /// Non-Real-Time (`0x7E`) versus Real-Time (`0x7F`).
+    pub realm: UniversalRealm,
+    /// The device-id byte that precedes Sub-ID #1 in the wire packet.
+    /// `0x7F` is the broadcast target (every receiver); other values
+    /// `0x00..=0x7E` address a specific device.
+    pub device_id: u8,
+    /// The parsed Sub-ID #1 category.
+    pub sub_id1: UniversalSubId1,
+}
+
+/// Sub-ID #1 category of a Universal System Exclusive packet — the
+/// `<sub_id1>` byte in the `F0 <realm> <device_id> <sub_id1> …` wire
+/// shape, decoded against Table 4 of the MIDI 1.0 *Universal System
+/// Exclusive Messages* document.
+///
+/// Each variant pairs the category name (Sub-ID #1) with the parsed
+/// sub-category (Sub-ID #2, when one is present). Categories that
+/// carry a fixed singleton message (`End of File`, `Wait`, …) are
+/// modelled as a unit variant; categories that branch on Sub-ID #2 are
+/// modelled as a variant with a [`UniversalSubId2`] field.
+///
+/// Unknown / future Sub-ID #1 values surface through the [`Other`]
+/// variant carrying the raw byte so callers can route the packet to a
+/// fallback handler.
+///
+/// [`Other`]: UniversalSubId1::Other
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UniversalSubId1 {
+    /// `0x01` — Sample Dump Header (Non-Real-Time only). Sub-ID #2 is
+    /// absent in the Table 4 listing for this category.
+    SampleDumpHeader,
+    /// `0x02` — Sample Data Packet (Non-Real-Time only).
+    SampleDataPacket,
+    /// `0x03` — Sample Dump Request (Non-Real-Time only).
+    SampleDumpRequest,
+    /// `0x04 <nn>` — MIDI Time Code. The Sub-ID #2 byte further
+    /// classifies the message; in the Non-Real-Time realm `0x04 nn`
+    /// is the MTC Setup family; in the Real-Time realm `0x04 nn` is
+    /// the MTC Quarter-Frame / Full / User Bits family. The
+    /// classifier surfaces the raw `nn` so callers can split the
+    /// realms themselves.
+    MidiTimeCode(UniversalSubId2),
+    /// `0x05 <nn>` — Sample Dump Extensions (Non-Real-Time) or
+    /// Real-Time MTC Cueing (Real-Time). See [`UniversalSubId2`] for
+    /// the per-realm Sub-ID #2 mapping.
+    SampleDumpExtensionsOrMtcCueing(UniversalSubId2),
+    /// `0x06 <nn>` — General Information (Non-Real-Time) or MMC
+    /// Commands (Real-Time).
+    GeneralInformationOrMmcCommands(UniversalSubId2),
+    /// `0x07 <nn>` — File Dump (Non-Real-Time) or MMC Responses
+    /// (Real-Time).
+    FileDumpOrMmcResponses(UniversalSubId2),
+    /// `0x08 <nn>` — MIDI Tuning Standard. The same Sub-ID #1 appears
+    /// in both realms; Sub-ID #2 distinguishes the Bulk Dump
+    /// Request / Reply / Single-Note / Scale-Octave variants per
+    /// Table 4.
+    MidiTuningStandard(UniversalSubId2),
+    /// `0x09 <nn>` — General MIDI (Non-Real-Time `01`/`02`/`03` =
+    /// GM 1 On / GM Off / GM 2 On) or Controller Destination Setting
+    /// (Real-Time `01`/`02`/`03` = Channel Pressure / Polyphonic Key
+    /// Pressure / Control Change).
+    GeneralMidiOrControllerDestination(UniversalSubId2),
+    /// `0x0A <nn>` — Downloadable Sounds (Non-Real-Time) or Key-Based
+    /// Instrument Control (Real-Time, sub-id2 `0x01`).
+    DownloadableSoundsOrKeyBasedInstrumentControl(UniversalSubId2),
+    /// `0x0B <nn>` — File Reference Message (Non-Real-Time) or
+    /// Scalable Polyphony MIP Message (Real-Time, sub-id2 `0x01`).
+    FileReferenceOrScalablePolyphonyMip(UniversalSubId2),
+    /// `0x0C <nn>` — MIDI Visual Control (Non-Real-Time) or Mobile
+    /// Phone Control Message (Real-Time, sub-id2 `0x00`).
+    MidiVisualControlOrMobilePhoneControl(UniversalSubId2),
+    /// `0x0D <nn>` — MIDI Capability Inquiry (Non-Real-Time only).
+    MidiCapabilityInquiry(UniversalSubId2),
+    /// `0x02 <nn>` Real-Time — MIDI Show Control (Real-Time only).
+    /// Distinct from the Non-Real-Time `0x02` Sample Data Packet
+    /// category; the classifier reports this variant when the realm
+    /// is Real-Time.
+    MidiShowControl(UniversalSubId2),
+    /// `0x03 <nn>` Real-Time — Notation Information (Real-Time only).
+    /// Sub-ID #2 = `0x01` Bar Number, `0x02` Time Signature
+    /// (Immediate), `0x42` Time Signature (Delayed) per Table 4.
+    NotationInformation(UniversalSubId2),
+    /// `0x04 <nn>` Real-Time — Device Control (Real-Time only).
+    /// Sub-ID #2 = `0x01` Master Volume, `0x02` Master Balance,
+    /// `0x03` Master Fine Tuning, `0x04` Master Coarse Tuning,
+    /// `0x05` Global Parameter Control per Table 4.
+    DeviceControl(UniversalSubId2),
+    /// `0x7B` — End of File. Singleton-shaped Sub-ID #1: the wire
+    /// packet terminates at the Sub-ID #1 byte (Non-Real-Time only).
+    EndOfFile,
+    /// `0x7C` — Wait. Singleton-shaped Sub-ID #1 (Non-Real-Time only).
+    Wait,
+    /// `0x7D` — Cancel. Singleton-shaped Sub-ID #1 (Non-Real-Time
+    /// only).
+    Cancel,
+    /// `0x7E` — NAK. Singleton-shaped Sub-ID #1 (Non-Real-Time only).
+    Nak,
+    /// `0x7F` — ACK. Singleton-shaped Sub-ID #1 (Non-Real-Time only).
+    Ack,
+    /// Any Sub-ID #1 value outside the Table 4 vocabulary the
+    /// classifier knows about, carrying the raw byte for caller
+    /// inspection.
+    Other(u8),
+}
+
+/// Sub-ID #2 byte of a Universal System Exclusive packet — the
+/// `<sub_id2>` byte (when present) in the
+/// `F0 <realm> <device_id> <sub_id1> <sub_id2> …` wire shape, decoded
+/// against Table 4 of the MIDI 1.0 *Universal System Exclusive
+/// Messages* document.
+///
+/// The classifier returns this variant for every Sub-ID #1 category
+/// that branches on Sub-ID #2 in Table 4. The vocabulary the
+/// classifier knows about is the union of every named Sub-ID #2 in
+/// the document; unknown / future values surface through the
+/// [`Other`] variant carrying the raw byte.
+///
+/// Some Sub-ID #2 values share a byte across realms with different
+/// semantics (e.g. `0x09 0x01` is "GM 1 System On" in Non-Real-Time
+/// and "Channel Pressure (Aftertouch)" in Real-Time); the classifier
+/// preserves the raw byte alongside the parsed name so callers can
+/// resolve the realm-dependent meaning by inspecting
+/// [`UniversalSysEx::realm`].
+///
+/// [`Other`]: UniversalSubId2::Other
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UniversalSubId2 {
+    // ---- Non-Real-Time, Sub-ID #1 = 0x04 (MIDI Time Code Setup) ----
+    /// `0x04 0x00` Non-Real-Time — Special.
+    NonRtMtcSpecial,
+    /// `0x04 0x01` Non-Real-Time — Punch In Points.
+    NonRtMtcPunchInPoints,
+    /// `0x04 0x02` Non-Real-Time — Punch Out Points.
+    NonRtMtcPunchOutPoints,
+    /// `0x04 0x03` Non-Real-Time — Delete Punch In Point.
+    NonRtMtcDeletePunchInPoint,
+    /// `0x04 0x04` Non-Real-Time — Delete Punch Out Point.
+    NonRtMtcDeletePunchOutPoint,
+    /// `0x04 0x05` Non-Real-Time — Event Start Point.
+    NonRtMtcEventStartPoint,
+    /// `0x04 0x06` Non-Real-Time — Event Stop Point.
+    NonRtMtcEventStopPoint,
+    /// `0x04 0x07` Non-Real-Time — Event Start Points with additional
+    /// info.
+    NonRtMtcEventStartPointsWithInfo,
+    /// `0x04 0x08` Non-Real-Time — Event Stop Points with additional
+    /// info.
+    NonRtMtcEventStopPointsWithInfo,
+    /// `0x04 0x09` Non-Real-Time — Delete Event Start Point.
+    NonRtMtcDeleteEventStartPoint,
+    /// `0x04 0x0A` Non-Real-Time — Delete Event Stop Point.
+    NonRtMtcDeleteEventStopPoint,
+    /// `0x04 0x0B` Non-Real-Time — Cue Points.
+    NonRtMtcCuePoints,
+    /// `0x04 0x0C` Non-Real-Time — Cue Points with additional info.
+    NonRtMtcCuePointsWithInfo,
+    /// `0x04 0x0D` Non-Real-Time — Delete Cue Point.
+    NonRtMtcDeleteCuePoint,
+    /// `0x04 0x0E` Non-Real-Time — Event Name in additional info.
+    NonRtMtcEventNameWithInfo,
+
+    // ---- Non-Real-Time, Sub-ID #1 = 0x05 (Sample Dump Extensions) ----
+    /// `0x05 0x01` Non-Real-Time — Loop Points Transmission.
+    SampleDumpLoopPointsTransmission,
+    /// `0x05 0x02` Non-Real-Time — Loop Points Request.
+    SampleDumpLoopPointsRequest,
+    /// `0x05 0x03` Non-Real-Time — Sample Name Transmission.
+    SampleDumpSampleNameTransmission,
+    /// `0x05 0x04` Non-Real-Time — Sample Name Request.
+    SampleDumpSampleNameRequest,
+    /// `0x05 0x05` Non-Real-Time — Extended Dump Header.
+    SampleDumpExtendedDumpHeader,
+    /// `0x05 0x06` Non-Real-Time — Extended Loop Points Transmission.
+    SampleDumpExtendedLoopPointsTransmission,
+    /// `0x05 0x07` Non-Real-Time — Extended Loop Points Request.
+    SampleDumpExtendedLoopPointsRequest,
+
+    // ---- Non-Real-Time, Sub-ID #1 = 0x06 (General Information) ----
+    /// `0x06 0x01` Non-Real-Time — Identity Request.
+    GeneralInformationIdentityRequest,
+    /// `0x06 0x02` Non-Real-Time — Identity Reply.
+    GeneralInformationIdentityReply,
+
+    // ---- Non-Real-Time, Sub-ID #1 = 0x07 (File Dump) ----
+    /// `0x07 0x01` Non-Real-Time — Header.
+    FileDumpHeader,
+    /// `0x07 0x02` Non-Real-Time — Data Packet.
+    FileDumpDataPacket,
+    /// `0x07 0x03` Non-Real-Time — Request.
+    FileDumpRequest,
+
+    // ---- Non-Real-Time, Sub-ID #1 = 0x08 (MIDI Tuning Standard) ----
+    /// `0x08 0x00` Non-Real-Time — Bulk Dump Request.
+    MtsBulkDumpRequest,
+    /// `0x08 0x01` Non-Real-Time — Bulk Dump Reply.
+    MtsBulkDumpReply,
+    /// `0x08 0x03` Non-Real-Time — Tuning Dump Request.
+    MtsTuningDumpRequest,
+    /// `0x08 0x04` Non-Real-Time — Key-Based Tuning Dump.
+    MtsKeyBasedTuningDump,
+    /// `0x08 0x05` Non-Real-Time — Scale/Octave Tuning Dump, 1 byte
+    /// format.
+    MtsScaleOctaveTuningDump1Byte,
+    /// `0x08 0x06` Non-Real-Time — Scale/Octave Tuning Dump, 2 byte
+    /// format.
+    MtsScaleOctaveTuningDump2Byte,
+    /// `0x08 0x07` shared — Single Note Tuning Change with Bank Select.
+    /// Listed under Non-Real-Time `0x08 0x07` in the Table 4 entry and
+    /// also under Real-Time `0x08 0x07` in the same row.
+    MtsSingleNoteTuningChangeWithBankSelect,
+    /// `0x08 0x08` shared — Scale/Octave Tuning, 1 byte format.
+    /// Appears in both realms under the same Sub-ID #1 = `0x08`.
+    MtsScaleOctaveTuning1Byte,
+    /// `0x08 0x09` shared — Scale/Octave Tuning, 2 byte format.
+    /// Appears in both realms under the same Sub-ID #1 = `0x08`.
+    MtsScaleOctaveTuning2Byte,
+    /// `0x08 0x02` Real-Time — Single Note Tuning Change. (Real-Time
+    /// realm only; the Non-Real-Time `0x08 0x02` slot is unassigned
+    /// in Table 4.)
+    MtsRtSingleNoteTuningChange,
+
+    // ---- Non-Real-Time, Sub-ID #1 = 0x09 (General MIDI) ----
+    /// `0x09 0x01` Non-Real-Time — General MIDI 1 System On.
+    GeneralMidi1SystemOn,
+    /// `0x09 0x02` Non-Real-Time — General MIDI System Off.
+    GeneralMidiSystemOff,
+    /// `0x09 0x03` Non-Real-Time — General MIDI 2 System On.
+    GeneralMidi2SystemOn,
+
+    // ---- Non-Real-Time, Sub-ID #1 = 0x0A (Downloadable Sounds) ----
+    /// `0x0A 0x01` Non-Real-Time — Turn DLS On.
+    DlsTurnOn,
+    /// `0x0A 0x02` Non-Real-Time — Turn DLS Off.
+    DlsTurnOff,
+    /// `0x0A 0x03` Non-Real-Time — Turn DLS Voice Allocation Off.
+    DlsTurnVoiceAllocationOff,
+    /// `0x0A 0x04` Non-Real-Time — Turn DLS Voice Allocation On.
+    DlsTurnVoiceAllocationOn,
+
+    // ---- Non-Real-Time, Sub-ID #1 = 0x0B (File Reference Message) ----
+    /// `0x0B 0x01` Non-Real-Time — Open File.
+    FileReferenceOpenFile,
+    /// `0x0B 0x02` Non-Real-Time — Select or Reselect Contents.
+    FileReferenceSelectOrReselectContents,
+    /// `0x0B 0x03` Non-Real-Time — Open File and Select Contents.
+    FileReferenceOpenFileAndSelectContents,
+    /// `0x0B 0x04` Non-Real-Time — Close File.
+    FileReferenceCloseFile,
+
+    // ---- Real-Time, Sub-ID #1 = 0x01 (MIDI Time Code) ----
+    /// `0x01 0x01` Real-Time — Full Message.
+    RtMtcFullMessage,
+    /// `0x01 0x02` Real-Time — User Bits.
+    RtMtcUserBits,
+
+    // ---- Real-Time, Sub-ID #1 = 0x02 (MIDI Show Control) ----
+    /// `0x02 0x00` Real-Time — MSC Extensions.
+    RtMscExtensions,
+
+    // ---- Real-Time, Sub-ID #1 = 0x03 (Notation Information) ----
+    /// `0x03 0x01` Real-Time — Bar Number.
+    RtNotationBarNumber,
+    /// `0x03 0x02` Real-Time — Time Signature (Immediate).
+    RtNotationTimeSignatureImmediate,
+    /// `0x03 0x42` Real-Time — Time Signature (Delayed).
+    RtNotationTimeSignatureDelayed,
+
+    // ---- Real-Time, Sub-ID #1 = 0x04 (Device Control) ----
+    /// `0x04 0x01` Real-Time — Master Volume.
+    DeviceControlMasterVolume,
+    /// `0x04 0x02` Real-Time — Master Balance.
+    DeviceControlMasterBalance,
+    /// `0x04 0x03` Real-Time — Master Fine Tuning.
+    DeviceControlMasterFineTuning,
+    /// `0x04 0x04` Real-Time — Master Coarse Tuning.
+    DeviceControlMasterCoarseTuning,
+    /// `0x04 0x05` Real-Time — Global Parameter Control.
+    DeviceControlGlobalParameterControl,
+
+    // ---- Real-Time, Sub-ID #1 = 0x05 (MTC Cueing) ----
+    /// `0x05 0x00` Real-Time — Special.
+    RtMtcCueingSpecial,
+    /// `0x05 0x01` Real-Time — Punch In Points.
+    RtMtcCueingPunchInPoints,
+    /// `0x05 0x02` Real-Time — Punch Out Points.
+    RtMtcCueingPunchOutPoints,
+    /// `0x05 0x05` Real-Time — Event Start Points.
+    RtMtcCueingEventStartPoints,
+    /// `0x05 0x06` Real-Time — Event Stop Points.
+    RtMtcCueingEventStopPoints,
+    /// `0x05 0x07` Real-Time — Event Start Points with additional info.
+    RtMtcCueingEventStartPointsWithInfo,
+    /// `0x05 0x08` Real-Time — Event Stop Points with additional info.
+    RtMtcCueingEventStopPointsWithInfo,
+    /// `0x05 0x0B` Real-Time — Cue Points.
+    RtMtcCueingCuePoints,
+    /// `0x05 0x0C` Real-Time — Cue Points with additional info.
+    RtMtcCueingCuePointsWithInfo,
+    /// `0x05 0x0E` Real-Time — Event Name in additional info.
+    RtMtcCueingEventNameWithInfo,
+
+    // ---- Real-Time, Sub-ID #1 = 0x09 (Controller Destination) ----
+    /// `0x09 0x01` Real-Time — Channel Pressure (Aftertouch).
+    ControllerDestinationChannelPressure,
+    /// `0x09 0x02` Real-Time — Polyphonic Key Pressure (Aftertouch).
+    ControllerDestinationPolyphonicKeyPressure,
+    /// `0x09 0x03` Real-Time — Controller (Control Change).
+    ControllerDestinationControlChange,
+
+    // ---- Real-Time, Sub-ID #1 = 0x0A (Key-Based Instrument Control) ----
+    /// `0x0A 0x01` Real-Time — Key-Based Instrument Control.
+    RtKeyBasedInstrumentControl,
+
+    // ---- Real-Time, Sub-ID #1 = 0x0B (Scalable Polyphony MIP) ----
+    /// `0x0B 0x01` Real-Time — Scalable Polyphony MIP Message.
+    RtScalablePolyphonyMipMessage,
+
+    // ---- Real-Time, Sub-ID #1 = 0x0C (Mobile Phone Control) ----
+    /// `0x0C 0x00` Real-Time — Mobile Phone Control Message.
+    RtMobilePhoneControlMessage,
+
+    /// A Sub-ID #2 byte outside the Table 4 vocabulary the classifier
+    /// knows about, surfaced for caller inspection.
+    Other(u8),
+}
+
 impl SysExEvent {
     /// `true` when the payload ends with the SMF SysEx end marker
     /// (`0xF7`). For an `F0` start packet this marks a self-contained
@@ -1333,6 +1718,347 @@ impl SysExEvent {
             return None;
         }
         self.data.first().copied()
+    }
+
+    /// Classify a Universal System Exclusive packet against Table 4 of
+    /// the MIDI 1.0 *Universal System Exclusive Messages* document.
+    ///
+    /// Returns `Some(UniversalSysEx { realm, device_id, sub_id1 })` when
+    /// the event is an `F0` start packet whose leading byte is `0x7E`
+    /// (Universal Non-Real-Time) or `0x7F` (Universal Real-Time) and the
+    /// packet is long enough to carry the realm, device-id, and
+    /// Sub-ID #1 bytes (3 bytes minimum, before any trailing `0xF7`).
+    ///
+    /// Returns `None` for:
+    /// * An `F7` continuation / escape packet — the payload of an
+    ///   `F7` packet is opaque arbitrary bytes shipped to the wire,
+    ///   not a Universal SysEx in its own right; a manufacturer-
+    ///   prefixed multi-packet message whose continuation arrives on
+    ///   `F7` carries the manufacturer-specific format the opener
+    ///   defined, not Table 4 vocabulary.
+    /// * A manufacturer-prefixed `F0` packet (the leading payload byte
+    ///   is anything other than `0x7E` / `0x7F`). The MMA assigns
+    ///   single-byte and `0x00`-prefixed three-byte manufacturer IDs
+    ///   in a separate document; the classifier reports such packets
+    ///   through [`SysExEvent::manufacturer_id`] only.
+    /// * An `F0` Universal packet truncated before Sub-ID #1 (a
+    ///   payload shorter than 3 bytes). A receiver would treat the
+    ///   packet as malformed; the classifier reports `None` rather
+    ///   than fabricate a fallback Sub-ID #1.
+    ///
+    /// Sub-ID #2 decoding is realm-aware: the same `(sub_id1, sub_id2)`
+    /// byte pair can name different messages in the two realms (e.g.
+    /// `0x09 0x01` is "General MIDI 1 System On" in Non-Real-Time and
+    /// "Channel Pressure (Aftertouch)" in Real-Time, per Table 4); the
+    /// classifier uses [`UniversalSysEx::realm`] to disambiguate before
+    /// matching. Singleton Sub-ID #1 categories (`0x7B` End of File
+    /// through `0x7F` ACK) do not carry a Sub-ID #2 byte; the
+    /// classifier reports them as unit variants of [`UniversalSubId1`]
+    /// regardless of any trailing bytes in the payload.
+    ///
+    /// Sub-ID #1 values outside the Table 4 vocabulary surface through
+    /// [`UniversalSubId1::Other`] carrying the raw byte. Sub-ID #2
+    /// values outside the per-Sub-ID #1 vocabulary surface through
+    /// [`UniversalSubId2::Other`] carrying the raw byte. The
+    /// classifier preserves unknown values rather than rejecting them
+    /// — Table 4 was last extended after the document publication date
+    /// and a forward-looking classifier needs to surface the raw bytes
+    /// for callers with deeper vocabulary.
+    pub fn universal_classification(&self) -> Option<UniversalSysEx> {
+        if self.is_escape {
+            return None;
+        }
+        // Wire layout: <realm> <device_id> <sub_id1> [<sub_id2> ...] [F7]
+        if self.data.len() < 3 {
+            return None;
+        }
+        let realm = match self.data[0] {
+            0x7E => UniversalRealm::NonRealTime,
+            0x7F => UniversalRealm::RealTime,
+            _ => return None,
+        };
+        let device_id = self.data[1];
+        let sub1_byte = self.data[2];
+        let sub2_byte = self.data.get(3).copied();
+        let sub_id1 = classify_universal_sub_id1(realm, sub1_byte, sub2_byte);
+        Some(UniversalSysEx {
+            realm,
+            device_id,
+            sub_id1,
+        })
+    }
+}
+
+/// Internal: decode the `<sub_id1>` byte into a [`UniversalSubId1`]
+/// against Table 4 of the MIDI 1.0 *Universal System Exclusive
+/// Messages* document, branching on realm where the same byte names
+/// different categories in the two realms.
+fn classify_universal_sub_id1(
+    realm: UniversalRealm,
+    sub1: u8,
+    sub2: Option<u8>,
+) -> UniversalSubId1 {
+    // Singleton-shaped Sub-ID #1 bytes (Non-Real-Time only). The wire
+    // packet terminates at the Sub-ID #1 byte; the match arm returns
+    // the unit variant regardless of any trailing payload.
+    match sub1 {
+        0x7B => return UniversalSubId1::EndOfFile,
+        0x7C => return UniversalSubId1::Wait,
+        0x7D => return UniversalSubId1::Cancel,
+        0x7E => return UniversalSubId1::Nak,
+        0x7F => return UniversalSubId1::Ack,
+        _ => {}
+    }
+    // Non-Real-Time–only Sub-ID #1 categories (Sub-ID #2 absent in
+    // Table 4's row for these): Sample Dump Header / Data / Request.
+    if matches!(realm, UniversalRealm::NonRealTime) {
+        match sub1 {
+            0x01 => return UniversalSubId1::SampleDumpHeader,
+            0x02 => return UniversalSubId1::SampleDataPacket,
+            0x03 => return UniversalSubId1::SampleDumpRequest,
+            _ => {}
+        }
+    }
+    // Branching categories — Sub-ID #2 may be present; surface it
+    // through the [`UniversalSubId2`] enum (or `Other(raw)` when the
+    // value is outside the Table 4 vocabulary the classifier knows
+    // about).
+    match (realm, sub1) {
+        (_, 0x04) => match realm {
+            UniversalRealm::NonRealTime => {
+                UniversalSubId1::MidiTimeCode(classify_nonrt_mtc_setup_sub2(sub2))
+            }
+            UniversalRealm::RealTime => {
+                UniversalSubId1::DeviceControl(classify_rt_device_control_sub2(sub2))
+            }
+        },
+        (_, 0x05) => match realm {
+            UniversalRealm::NonRealTime => UniversalSubId1::SampleDumpExtensionsOrMtcCueing(
+                classify_nonrt_sample_dump_extensions_sub2(sub2),
+            ),
+            UniversalRealm::RealTime => {
+                UniversalSubId1::SampleDumpExtensionsOrMtcCueing(classify_rt_mtc_cueing_sub2(sub2))
+            }
+        },
+        (_, 0x06) => match realm {
+            UniversalRealm::NonRealTime => UniversalSubId1::GeneralInformationOrMmcCommands(
+                classify_nonrt_general_information_sub2(sub2),
+            ),
+            UniversalRealm::RealTime => {
+                UniversalSubId1::GeneralInformationOrMmcCommands(passthrough_sub2(sub2))
+            }
+        },
+        (_, 0x07) => match realm {
+            UniversalRealm::NonRealTime => {
+                UniversalSubId1::FileDumpOrMmcResponses(classify_nonrt_file_dump_sub2(sub2))
+            }
+            UniversalRealm::RealTime => {
+                UniversalSubId1::FileDumpOrMmcResponses(passthrough_sub2(sub2))
+            }
+        },
+        (_, 0x08) => UniversalSubId1::MidiTuningStandard(classify_mts_sub2(realm, sub2)),
+        (_, 0x09) => UniversalSubId1::GeneralMidiOrControllerDestination(
+            classify_realm_sub2_for_0x09(realm, sub2),
+        ),
+        (_, 0x0A) => UniversalSubId1::DownloadableSoundsOrKeyBasedInstrumentControl(
+            classify_realm_sub2_for_0x0a(realm, sub2),
+        ),
+        (_, 0x0B) => UniversalSubId1::FileReferenceOrScalablePolyphonyMip(
+            classify_realm_sub2_for_0x0b(realm, sub2),
+        ),
+        (_, 0x0C) => UniversalSubId1::MidiVisualControlOrMobilePhoneControl(
+            classify_realm_sub2_for_0x0c(realm, sub2),
+        ),
+        (UniversalRealm::NonRealTime, 0x0D) => {
+            UniversalSubId1::MidiCapabilityInquiry(passthrough_sub2(sub2))
+        }
+        (UniversalRealm::RealTime, 0x01) => {
+            UniversalSubId1::MidiTimeCode(classify_rt_mtc_sub2(sub2))
+        }
+        (UniversalRealm::RealTime, 0x02) => {
+            UniversalSubId1::MidiShowControl(classify_rt_msc_sub2(sub2))
+        }
+        (UniversalRealm::RealTime, 0x03) => {
+            UniversalSubId1::NotationInformation(classify_rt_notation_sub2(sub2))
+        }
+        _ => UniversalSubId1::Other(sub1),
+    }
+}
+
+fn passthrough_sub2(sub2: Option<u8>) -> UniversalSubId2 {
+    UniversalSubId2::Other(sub2.unwrap_or(0))
+}
+
+fn classify_nonrt_mtc_setup_sub2(sub2: Option<u8>) -> UniversalSubId2 {
+    match sub2 {
+        Some(0x00) => UniversalSubId2::NonRtMtcSpecial,
+        Some(0x01) => UniversalSubId2::NonRtMtcPunchInPoints,
+        Some(0x02) => UniversalSubId2::NonRtMtcPunchOutPoints,
+        Some(0x03) => UniversalSubId2::NonRtMtcDeletePunchInPoint,
+        Some(0x04) => UniversalSubId2::NonRtMtcDeletePunchOutPoint,
+        Some(0x05) => UniversalSubId2::NonRtMtcEventStartPoint,
+        Some(0x06) => UniversalSubId2::NonRtMtcEventStopPoint,
+        Some(0x07) => UniversalSubId2::NonRtMtcEventStartPointsWithInfo,
+        Some(0x08) => UniversalSubId2::NonRtMtcEventStopPointsWithInfo,
+        Some(0x09) => UniversalSubId2::NonRtMtcDeleteEventStartPoint,
+        Some(0x0A) => UniversalSubId2::NonRtMtcDeleteEventStopPoint,
+        Some(0x0B) => UniversalSubId2::NonRtMtcCuePoints,
+        Some(0x0C) => UniversalSubId2::NonRtMtcCuePointsWithInfo,
+        Some(0x0D) => UniversalSubId2::NonRtMtcDeleteCuePoint,
+        Some(0x0E) => UniversalSubId2::NonRtMtcEventNameWithInfo,
+        other => UniversalSubId2::Other(other.unwrap_or(0)),
+    }
+}
+
+fn classify_nonrt_sample_dump_extensions_sub2(sub2: Option<u8>) -> UniversalSubId2 {
+    match sub2 {
+        Some(0x01) => UniversalSubId2::SampleDumpLoopPointsTransmission,
+        Some(0x02) => UniversalSubId2::SampleDumpLoopPointsRequest,
+        Some(0x03) => UniversalSubId2::SampleDumpSampleNameTransmission,
+        Some(0x04) => UniversalSubId2::SampleDumpSampleNameRequest,
+        Some(0x05) => UniversalSubId2::SampleDumpExtendedDumpHeader,
+        Some(0x06) => UniversalSubId2::SampleDumpExtendedLoopPointsTransmission,
+        Some(0x07) => UniversalSubId2::SampleDumpExtendedLoopPointsRequest,
+        other => UniversalSubId2::Other(other.unwrap_or(0)),
+    }
+}
+
+fn classify_nonrt_general_information_sub2(sub2: Option<u8>) -> UniversalSubId2 {
+    match sub2 {
+        Some(0x01) => UniversalSubId2::GeneralInformationIdentityRequest,
+        Some(0x02) => UniversalSubId2::GeneralInformationIdentityReply,
+        other => UniversalSubId2::Other(other.unwrap_or(0)),
+    }
+}
+
+fn classify_nonrt_file_dump_sub2(sub2: Option<u8>) -> UniversalSubId2 {
+    match sub2 {
+        Some(0x01) => UniversalSubId2::FileDumpHeader,
+        Some(0x02) => UniversalSubId2::FileDumpDataPacket,
+        Some(0x03) => UniversalSubId2::FileDumpRequest,
+        other => UniversalSubId2::Other(other.unwrap_or(0)),
+    }
+}
+
+fn classify_mts_sub2(realm: UniversalRealm, sub2: Option<u8>) -> UniversalSubId2 {
+    // Shared bytes (both realms): 0x07 / 0x08 / 0x09.
+    match (realm, sub2) {
+        (_, Some(0x07)) => UniversalSubId2::MtsSingleNoteTuningChangeWithBankSelect,
+        (_, Some(0x08)) => UniversalSubId2::MtsScaleOctaveTuning1Byte,
+        (_, Some(0x09)) => UniversalSubId2::MtsScaleOctaveTuning2Byte,
+        (UniversalRealm::NonRealTime, Some(0x00)) => UniversalSubId2::MtsBulkDumpRequest,
+        (UniversalRealm::NonRealTime, Some(0x01)) => UniversalSubId2::MtsBulkDumpReply,
+        (UniversalRealm::NonRealTime, Some(0x03)) => UniversalSubId2::MtsTuningDumpRequest,
+        (UniversalRealm::NonRealTime, Some(0x04)) => UniversalSubId2::MtsKeyBasedTuningDump,
+        (UniversalRealm::NonRealTime, Some(0x05)) => UniversalSubId2::MtsScaleOctaveTuningDump1Byte,
+        (UniversalRealm::NonRealTime, Some(0x06)) => UniversalSubId2::MtsScaleOctaveTuningDump2Byte,
+        (UniversalRealm::RealTime, Some(0x02)) => UniversalSubId2::MtsRtSingleNoteTuningChange,
+        (_, other) => UniversalSubId2::Other(other.unwrap_or(0)),
+    }
+}
+
+fn classify_realm_sub2_for_0x09(realm: UniversalRealm, sub2: Option<u8>) -> UniversalSubId2 {
+    match (realm, sub2) {
+        (UniversalRealm::NonRealTime, Some(0x01)) => UniversalSubId2::GeneralMidi1SystemOn,
+        (UniversalRealm::NonRealTime, Some(0x02)) => UniversalSubId2::GeneralMidiSystemOff,
+        (UniversalRealm::NonRealTime, Some(0x03)) => UniversalSubId2::GeneralMidi2SystemOn,
+        (UniversalRealm::RealTime, Some(0x01)) => {
+            UniversalSubId2::ControllerDestinationChannelPressure
+        }
+        (UniversalRealm::RealTime, Some(0x02)) => {
+            UniversalSubId2::ControllerDestinationPolyphonicKeyPressure
+        }
+        (UniversalRealm::RealTime, Some(0x03)) => {
+            UniversalSubId2::ControllerDestinationControlChange
+        }
+        (_, other) => UniversalSubId2::Other(other.unwrap_or(0)),
+    }
+}
+
+fn classify_realm_sub2_for_0x0a(realm: UniversalRealm, sub2: Option<u8>) -> UniversalSubId2 {
+    match (realm, sub2) {
+        (UniversalRealm::NonRealTime, Some(0x01)) => UniversalSubId2::DlsTurnOn,
+        (UniversalRealm::NonRealTime, Some(0x02)) => UniversalSubId2::DlsTurnOff,
+        (UniversalRealm::NonRealTime, Some(0x03)) => UniversalSubId2::DlsTurnVoiceAllocationOff,
+        (UniversalRealm::NonRealTime, Some(0x04)) => UniversalSubId2::DlsTurnVoiceAllocationOn,
+        (UniversalRealm::RealTime, Some(0x01)) => UniversalSubId2::RtKeyBasedInstrumentControl,
+        (_, other) => UniversalSubId2::Other(other.unwrap_or(0)),
+    }
+}
+
+fn classify_realm_sub2_for_0x0b(realm: UniversalRealm, sub2: Option<u8>) -> UniversalSubId2 {
+    match (realm, sub2) {
+        (UniversalRealm::NonRealTime, Some(0x01)) => UniversalSubId2::FileReferenceOpenFile,
+        (UniversalRealm::NonRealTime, Some(0x02)) => {
+            UniversalSubId2::FileReferenceSelectOrReselectContents
+        }
+        (UniversalRealm::NonRealTime, Some(0x03)) => {
+            UniversalSubId2::FileReferenceOpenFileAndSelectContents
+        }
+        (UniversalRealm::NonRealTime, Some(0x04)) => UniversalSubId2::FileReferenceCloseFile,
+        (UniversalRealm::RealTime, Some(0x01)) => UniversalSubId2::RtScalablePolyphonyMipMessage,
+        (_, other) => UniversalSubId2::Other(other.unwrap_or(0)),
+    }
+}
+
+fn classify_realm_sub2_for_0x0c(realm: UniversalRealm, sub2: Option<u8>) -> UniversalSubId2 {
+    match (realm, sub2) {
+        (UniversalRealm::RealTime, Some(0x00)) => UniversalSubId2::RtMobilePhoneControlMessage,
+        (_, other) => UniversalSubId2::Other(other.unwrap_or(0)),
+    }
+}
+
+fn classify_rt_mtc_sub2(sub2: Option<u8>) -> UniversalSubId2 {
+    match sub2 {
+        Some(0x01) => UniversalSubId2::RtMtcFullMessage,
+        Some(0x02) => UniversalSubId2::RtMtcUserBits,
+        other => UniversalSubId2::Other(other.unwrap_or(0)),
+    }
+}
+
+fn classify_rt_msc_sub2(sub2: Option<u8>) -> UniversalSubId2 {
+    match sub2 {
+        Some(0x00) => UniversalSubId2::RtMscExtensions,
+        // 0x01..=0x7F = MSC Commands per the MSC specification — surface
+        // the raw byte; callers consulting the MSC document decode the
+        // command set.
+        other => UniversalSubId2::Other(other.unwrap_or(0)),
+    }
+}
+
+fn classify_rt_notation_sub2(sub2: Option<u8>) -> UniversalSubId2 {
+    match sub2 {
+        Some(0x01) => UniversalSubId2::RtNotationBarNumber,
+        Some(0x02) => UniversalSubId2::RtNotationTimeSignatureImmediate,
+        Some(0x42) => UniversalSubId2::RtNotationTimeSignatureDelayed,
+        other => UniversalSubId2::Other(other.unwrap_or(0)),
+    }
+}
+
+fn classify_rt_device_control_sub2(sub2: Option<u8>) -> UniversalSubId2 {
+    match sub2 {
+        Some(0x01) => UniversalSubId2::DeviceControlMasterVolume,
+        Some(0x02) => UniversalSubId2::DeviceControlMasterBalance,
+        Some(0x03) => UniversalSubId2::DeviceControlMasterFineTuning,
+        Some(0x04) => UniversalSubId2::DeviceControlMasterCoarseTuning,
+        Some(0x05) => UniversalSubId2::DeviceControlGlobalParameterControl,
+        other => UniversalSubId2::Other(other.unwrap_or(0)),
+    }
+}
+
+fn classify_rt_mtc_cueing_sub2(sub2: Option<u8>) -> UniversalSubId2 {
+    match sub2 {
+        Some(0x00) => UniversalSubId2::RtMtcCueingSpecial,
+        Some(0x01) => UniversalSubId2::RtMtcCueingPunchInPoints,
+        Some(0x02) => UniversalSubId2::RtMtcCueingPunchOutPoints,
+        Some(0x05) => UniversalSubId2::RtMtcCueingEventStartPoints,
+        Some(0x06) => UniversalSubId2::RtMtcCueingEventStopPoints,
+        Some(0x07) => UniversalSubId2::RtMtcCueingEventStartPointsWithInfo,
+        Some(0x08) => UniversalSubId2::RtMtcCueingEventStopPointsWithInfo,
+        Some(0x0B) => UniversalSubId2::RtMtcCueingCuePoints,
+        Some(0x0C) => UniversalSubId2::RtMtcCueingCuePointsWithInfo,
+        Some(0x0E) => UniversalSubId2::RtMtcCueingEventNameWithInfo,
+        other => UniversalSubId2::Other(other.unwrap_or(0)),
     }
 }
 
@@ -6894,6 +7620,513 @@ mod tests {
         assert!(sx[2].is_escape);
         assert_eq!(sx[2].data, vec![0x7B, 0xF7]);
         assert!(sx[2].ends_with_eox());
+    }
+
+    // ───────── SysExEvent::universal_classification ─────────
+
+    fn make_sysex(payload: &[u8]) -> SysExEvent {
+        SysExEvent {
+            tick: 0,
+            track: 0,
+            is_escape: false,
+            data: payload.to_vec(),
+        }
+    }
+
+    fn make_sysex_escape(payload: &[u8]) -> SysExEvent {
+        SysExEvent {
+            tick: 0,
+            track: 0,
+            is_escape: true,
+            data: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn universal_classification_returns_none_for_f7_continuation_packet() {
+        let ev = make_sysex_escape(&[0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        assert!(ev.universal_classification().is_none());
+    }
+
+    #[test]
+    fn universal_classification_returns_none_for_manufacturer_prefixed_packet() {
+        // Roland (0x41) manufacturer prefix — not Universal.
+        let ev = make_sysex(&[0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7]);
+        assert!(ev.universal_classification().is_none());
+    }
+
+    #[test]
+    fn universal_classification_returns_none_for_three_byte_expanded_manufacturer_id() {
+        // 0x00 leads a 3-byte expanded manufacturer ID; not Universal.
+        let ev = make_sysex(&[0x00, 0x20, 0x33, 0x01, 0xF7]);
+        assert!(ev.universal_classification().is_none());
+    }
+
+    #[test]
+    fn universal_classification_returns_none_for_truncated_packet_below_three_bytes() {
+        let ev = make_sysex(&[0x7E, 0x7F]); // realm + device-id only
+        assert!(ev.universal_classification().is_none());
+        let ev = make_sysex(&[0x7E]); // realm only
+        assert!(ev.universal_classification().is_none());
+        let ev = make_sysex(&[]); // empty
+        assert!(ev.universal_classification().is_none());
+    }
+
+    #[test]
+    fn universal_classification_gm1_system_on() {
+        // F0 7E 7F 09 01 F7 — Universal Non-Real-Time GM 1 System On.
+        let ev = make_sysex(&[0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(u.realm, UniversalRealm::NonRealTime);
+        assert_eq!(u.device_id, 0x7F);
+        assert_eq!(
+            u.sub_id1,
+            UniversalSubId1::GeneralMidiOrControllerDestination(
+                UniversalSubId2::GeneralMidi1SystemOn,
+            )
+        );
+    }
+
+    #[test]
+    fn universal_classification_gm_system_off() {
+        let ev = make_sysex(&[0x7E, 0x7F, 0x09, 0x02, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(u.realm, UniversalRealm::NonRealTime);
+        assert_eq!(
+            u.sub_id1,
+            UniversalSubId1::GeneralMidiOrControllerDestination(
+                UniversalSubId2::GeneralMidiSystemOff
+            )
+        );
+    }
+
+    #[test]
+    fn universal_classification_gm2_system_on() {
+        let ev = make_sysex(&[0x7E, 0x7F, 0x09, 0x03, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(u.realm, UniversalRealm::NonRealTime);
+        assert_eq!(
+            u.sub_id1,
+            UniversalSubId1::GeneralMidiOrControllerDestination(
+                UniversalSubId2::GeneralMidi2SystemOn,
+            )
+        );
+    }
+
+    #[test]
+    fn universal_classification_master_volume_real_time() {
+        // F0 7F 7F 04 01 lsb msb F7 — Universal Real-Time Master Volume.
+        let ev = make_sysex(&[0x7F, 0x7F, 0x04, 0x01, 0x40, 0x60, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(u.realm, UniversalRealm::RealTime);
+        assert_eq!(u.device_id, 0x7F);
+        assert_eq!(
+            u.sub_id1,
+            UniversalSubId1::DeviceControl(UniversalSubId2::DeviceControlMasterVolume)
+        );
+    }
+
+    #[test]
+    fn universal_classification_master_balance_fine_coarse_global() {
+        let cases = [
+            (0x02u8, UniversalSubId2::DeviceControlMasterBalance),
+            (0x03, UniversalSubId2::DeviceControlMasterFineTuning),
+            (0x04, UniversalSubId2::DeviceControlMasterCoarseTuning),
+            (0x05, UniversalSubId2::DeviceControlGlobalParameterControl),
+        ];
+        for (sub2, expected) in cases {
+            let ev = make_sysex(&[0x7F, 0x7F, 0x04, sub2, 0x00, 0x40, 0xF7]);
+            let u = ev.universal_classification().unwrap();
+            assert_eq!(u.realm, UniversalRealm::RealTime);
+            assert_eq!(u.sub_id1, UniversalSubId1::DeviceControl(expected));
+        }
+    }
+
+    #[test]
+    fn universal_classification_realm_disambiguates_shared_byte_pair() {
+        // Sub-ID #1 = 0x09, Sub-ID #2 = 0x01:
+        //   Non-Real-Time → GM 1 System On
+        //   Real-Time     → Channel Pressure (Aftertouch) Destination
+        let nrt = make_sysex(&[0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        let rt = make_sysex(&[0x7F, 0x7F, 0x09, 0x01, 0xF7]);
+        let unrt = nrt.universal_classification().unwrap();
+        let urt = rt.universal_classification().unwrap();
+        assert_eq!(
+            unrt.sub_id1,
+            UniversalSubId1::GeneralMidiOrControllerDestination(
+                UniversalSubId2::GeneralMidi1SystemOn,
+            )
+        );
+        assert_eq!(
+            urt.sub_id1,
+            UniversalSubId1::GeneralMidiOrControllerDestination(
+                UniversalSubId2::ControllerDestinationChannelPressure,
+            )
+        );
+    }
+
+    #[test]
+    fn universal_classification_mtc_full_message_real_time() {
+        // F0 7F <dev> 01 01 hr mn se fr F7
+        let ev = make_sysex(&[0x7F, 0x00, 0x01, 0x01, 0x21, 0x18, 0x2D, 0x00, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(u.realm, UniversalRealm::RealTime);
+        assert_eq!(
+            u.sub_id1,
+            UniversalSubId1::MidiTimeCode(UniversalSubId2::RtMtcFullMessage)
+        );
+    }
+
+    #[test]
+    fn universal_classification_mtc_user_bits_real_time() {
+        let ev = make_sysex(&[0x7F, 0x00, 0x01, 0x02, 0x00, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(
+            u.sub_id1,
+            UniversalSubId1::MidiTimeCode(UniversalSubId2::RtMtcUserBits)
+        );
+    }
+
+    #[test]
+    fn universal_classification_nonrt_mtc_setup_punch_in_points() {
+        // F0 7E <dev> 04 01 ... F7
+        let ev = make_sysex(&[0x7E, 0x00, 0x04, 0x01, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(u.realm, UniversalRealm::NonRealTime);
+        assert_eq!(
+            u.sub_id1,
+            UniversalSubId1::MidiTimeCode(UniversalSubId2::NonRtMtcPunchInPoints)
+        );
+    }
+
+    #[test]
+    fn universal_classification_nonrt_mtc_full_setup_table() {
+        let cases = [
+            (0x00u8, UniversalSubId2::NonRtMtcSpecial),
+            (0x01, UniversalSubId2::NonRtMtcPunchInPoints),
+            (0x02, UniversalSubId2::NonRtMtcPunchOutPoints),
+            (0x03, UniversalSubId2::NonRtMtcDeletePunchInPoint),
+            (0x04, UniversalSubId2::NonRtMtcDeletePunchOutPoint),
+            (0x05, UniversalSubId2::NonRtMtcEventStartPoint),
+            (0x06, UniversalSubId2::NonRtMtcEventStopPoint),
+            (0x07, UniversalSubId2::NonRtMtcEventStartPointsWithInfo),
+            (0x08, UniversalSubId2::NonRtMtcEventStopPointsWithInfo),
+            (0x09, UniversalSubId2::NonRtMtcDeleteEventStartPoint),
+            (0x0A, UniversalSubId2::NonRtMtcDeleteEventStopPoint),
+            (0x0B, UniversalSubId2::NonRtMtcCuePoints),
+            (0x0C, UniversalSubId2::NonRtMtcCuePointsWithInfo),
+            (0x0D, UniversalSubId2::NonRtMtcDeleteCuePoint),
+            (0x0E, UniversalSubId2::NonRtMtcEventNameWithInfo),
+        ];
+        for (sub2, expected) in cases {
+            let ev = make_sysex(&[0x7E, 0x7F, 0x04, sub2, 0xF7]);
+            let u = ev.universal_classification().unwrap();
+            assert_eq!(u.sub_id1, UniversalSubId1::MidiTimeCode(expected));
+        }
+    }
+
+    #[test]
+    fn universal_classification_sample_dump_singletons_nonrt() {
+        // Sub-ID #1 = 0x01/0x02/0x03 in Non-Real-Time → Sample Dump
+        // Header / Data Packet / Request — these are Sub-ID #2-less
+        // categories per Table 4.
+        let cases = [
+            (0x01u8, UniversalSubId1::SampleDumpHeader),
+            (0x02, UniversalSubId1::SampleDataPacket),
+            (0x03, UniversalSubId1::SampleDumpRequest),
+        ];
+        for (sub1, expected) in cases {
+            let ev = make_sysex(&[0x7E, 0x00, sub1, 0xF7]);
+            let u = ev.universal_classification().unwrap();
+            assert_eq!(u.realm, UniversalRealm::NonRealTime);
+            assert_eq!(u.sub_id1, expected);
+        }
+    }
+
+    #[test]
+    fn universal_classification_general_information_identity_pair() {
+        let req = make_sysex(&[0x7E, 0x7F, 0x06, 0x01, 0xF7]);
+        let rep = make_sysex(&[0x7E, 0x00, 0x06, 0x02, 0xF7]);
+        let ureq = req.universal_classification().unwrap();
+        let urep = rep.universal_classification().unwrap();
+        assert_eq!(
+            ureq.sub_id1,
+            UniversalSubId1::GeneralInformationOrMmcCommands(
+                UniversalSubId2::GeneralInformationIdentityRequest,
+            )
+        );
+        assert_eq!(
+            urep.sub_id1,
+            UniversalSubId1::GeneralInformationOrMmcCommands(
+                UniversalSubId2::GeneralInformationIdentityReply,
+            )
+        );
+    }
+
+    #[test]
+    fn universal_classification_file_dump_header_data_request() {
+        let cases = [
+            (0x01u8, UniversalSubId2::FileDumpHeader),
+            (0x02, UniversalSubId2::FileDumpDataPacket),
+            (0x03, UniversalSubId2::FileDumpRequest),
+        ];
+        for (sub2, expected) in cases {
+            let ev = make_sysex(&[0x7E, 0x00, 0x07, sub2, 0xF7]);
+            let u = ev.universal_classification().unwrap();
+            assert_eq!(u.sub_id1, UniversalSubId1::FileDumpOrMmcResponses(expected));
+        }
+    }
+
+    #[test]
+    fn universal_classification_mts_nonrt_full_table() {
+        let cases = [
+            (0x00u8, UniversalSubId2::MtsBulkDumpRequest),
+            (0x01, UniversalSubId2::MtsBulkDumpReply),
+            (0x03, UniversalSubId2::MtsTuningDumpRequest),
+            (0x04, UniversalSubId2::MtsKeyBasedTuningDump),
+            (0x05, UniversalSubId2::MtsScaleOctaveTuningDump1Byte),
+            (0x06, UniversalSubId2::MtsScaleOctaveTuningDump2Byte),
+            (
+                0x07,
+                UniversalSubId2::MtsSingleNoteTuningChangeWithBankSelect,
+            ),
+            (0x08, UniversalSubId2::MtsScaleOctaveTuning1Byte),
+            (0x09, UniversalSubId2::MtsScaleOctaveTuning2Byte),
+        ];
+        for (sub2, expected) in cases {
+            let ev = make_sysex(&[0x7E, 0x7F, 0x08, sub2, 0xF7]);
+            let u = ev.universal_classification().unwrap();
+            assert_eq!(u.realm, UniversalRealm::NonRealTime);
+            assert_eq!(u.sub_id1, UniversalSubId1::MidiTuningStandard(expected));
+        }
+    }
+
+    #[test]
+    fn universal_classification_mts_rt_full_table() {
+        let cases = [
+            (0x02u8, UniversalSubId2::MtsRtSingleNoteTuningChange),
+            (
+                0x07,
+                UniversalSubId2::MtsSingleNoteTuningChangeWithBankSelect,
+            ),
+            (0x08, UniversalSubId2::MtsScaleOctaveTuning1Byte),
+            (0x09, UniversalSubId2::MtsScaleOctaveTuning2Byte),
+        ];
+        for (sub2, expected) in cases {
+            let ev = make_sysex(&[0x7F, 0x7F, 0x08, sub2, 0xF7]);
+            let u = ev.universal_classification().unwrap();
+            assert_eq!(u.realm, UniversalRealm::RealTime);
+            assert_eq!(u.sub_id1, UniversalSubId1::MidiTuningStandard(expected));
+        }
+    }
+
+    #[test]
+    fn universal_classification_dls_quartet_nonrt() {
+        let cases = [
+            (0x01u8, UniversalSubId2::DlsTurnOn),
+            (0x02, UniversalSubId2::DlsTurnOff),
+            (0x03, UniversalSubId2::DlsTurnVoiceAllocationOff),
+            (0x04, UniversalSubId2::DlsTurnVoiceAllocationOn),
+        ];
+        for (sub2, expected) in cases {
+            let ev = make_sysex(&[0x7E, 0x7F, 0x0A, sub2, 0xF7]);
+            let u = ev.universal_classification().unwrap();
+            assert_eq!(
+                u.sub_id1,
+                UniversalSubId1::DownloadableSoundsOrKeyBasedInstrumentControl(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn universal_classification_file_reference_quartet_nonrt() {
+        let cases = [
+            (0x01u8, UniversalSubId2::FileReferenceOpenFile),
+            (0x02, UniversalSubId2::FileReferenceSelectOrReselectContents),
+            (
+                0x03,
+                UniversalSubId2::FileReferenceOpenFileAndSelectContents,
+            ),
+            (0x04, UniversalSubId2::FileReferenceCloseFile),
+        ];
+        for (sub2, expected) in cases {
+            let ev = make_sysex(&[0x7E, 0x7F, 0x0B, sub2, 0xF7]);
+            let u = ev.universal_classification().unwrap();
+            assert_eq!(
+                u.sub_id1,
+                UniversalSubId1::FileReferenceOrScalablePolyphonyMip(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn universal_classification_mvc_and_capability_inquiry_route_through() {
+        // MIDI Visual Control 0x0C — Sub-ID #2 is opaque to the
+        // classifier; the helper surfaces the raw byte through Other.
+        let ev = make_sysex(&[0x7E, 0x7F, 0x0C, 0x12, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(
+            u.sub_id1,
+            UniversalSubId1::MidiVisualControlOrMobilePhoneControl(UniversalSubId2::Other(0x12))
+        );
+        // MIDI Capability Inquiry 0x0D — also opaque per Table 4.
+        let ev = make_sysex(&[0x7E, 0x7F, 0x0D, 0x34, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(
+            u.sub_id1,
+            UniversalSubId1::MidiCapabilityInquiry(UniversalSubId2::Other(0x34))
+        );
+    }
+
+    #[test]
+    fn universal_classification_singletons_eof_wait_cancel_nak_ack() {
+        let cases = [
+            (0x7Bu8, UniversalSubId1::EndOfFile),
+            (0x7C, UniversalSubId1::Wait),
+            (0x7D, UniversalSubId1::Cancel),
+            (0x7E, UniversalSubId1::Nak),
+            (0x7F, UniversalSubId1::Ack),
+        ];
+        for (sub1, expected) in cases {
+            let ev = make_sysex(&[0x7E, 0x00, sub1, 0xF7]);
+            let u = ev.universal_classification().unwrap();
+            assert_eq!(u.realm, UniversalRealm::NonRealTime);
+            assert_eq!(u.sub_id1, expected);
+        }
+    }
+
+    #[test]
+    fn universal_classification_realm_zero_device_id_preserved() {
+        // device-id = 0x00 (the specific-device target) is preserved,
+        // not coerced to the broadcast (0x7F) target.
+        let ev = make_sysex(&[0x7E, 0x00, 0x09, 0x01, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(u.device_id, 0x00);
+        let ev = make_sysex(&[0x7E, 0x05, 0x09, 0x01, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(u.device_id, 0x05);
+        let ev = make_sysex(&[0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(u.device_id, 0x7F);
+    }
+
+    #[test]
+    fn universal_classification_notation_information_real_time() {
+        let bar = make_sysex(&[0x7F, 0x7F, 0x03, 0x01, 0x00, 0x00, 0xF7]);
+        let imm = make_sysex(&[0x7F, 0x7F, 0x03, 0x02, 0x04, 0x02, 0xF7]);
+        let del = make_sysex(&[0x7F, 0x7F, 0x03, 0x42, 0x04, 0x02, 0xF7]);
+        assert_eq!(
+            bar.universal_classification().unwrap().sub_id1,
+            UniversalSubId1::NotationInformation(UniversalSubId2::RtNotationBarNumber)
+        );
+        assert_eq!(
+            imm.universal_classification().unwrap().sub_id1,
+            UniversalSubId1::NotationInformation(UniversalSubId2::RtNotationTimeSignatureImmediate)
+        );
+        assert_eq!(
+            del.universal_classification().unwrap().sub_id1,
+            UniversalSubId1::NotationInformation(UniversalSubId2::RtNotationTimeSignatureDelayed)
+        );
+    }
+
+    #[test]
+    fn universal_classification_msc_extensions_distinct_from_msc_commands() {
+        // MSC Extensions: F0 7F <dev> 02 00 ...
+        let ext = make_sysex(&[0x7F, 0x00, 0x02, 0x00, 0xF7]);
+        assert_eq!(
+            ext.universal_classification().unwrap().sub_id1,
+            UniversalSubId1::MidiShowControl(UniversalSubId2::RtMscExtensions)
+        );
+        // MSC Command: F0 7F <dev> 02 01 ... — opaque byte through Other.
+        let cmd = make_sysex(&[0x7F, 0x00, 0x02, 0x01, 0xF7]);
+        assert_eq!(
+            cmd.universal_classification().unwrap().sub_id1,
+            UniversalSubId1::MidiShowControl(UniversalSubId2::Other(0x01))
+        );
+    }
+
+    #[test]
+    fn universal_classification_realm_distinguishes_nonrt_02_from_rt_02() {
+        // Sub-ID #1 = 0x02 means different things in the two realms:
+        //   Non-Real-Time → Sample Data Packet (singleton-shaped Sub-ID #1)
+        //   Real-Time     → MIDI Show Control (branches on Sub-ID #2)
+        let nrt = make_sysex(&[0x7E, 0x00, 0x02, 0xF7]);
+        let rt = make_sysex(&[0x7F, 0x00, 0x02, 0x00, 0xF7]);
+        assert_eq!(
+            nrt.universal_classification().unwrap().sub_id1,
+            UniversalSubId1::SampleDataPacket
+        );
+        assert_eq!(
+            rt.universal_classification().unwrap().sub_id1,
+            UniversalSubId1::MidiShowControl(UniversalSubId2::RtMscExtensions)
+        );
+    }
+
+    #[test]
+    fn universal_classification_unknown_sub_id1_surfaces_through_other() {
+        // Sub-ID #1 = 0x40 — outside Table 4's named vocabulary at the
+        // round-246 trace of the doc. Surfaces through Other(0x40).
+        let ev = make_sysex(&[0x7E, 0x7F, 0x40, 0x01, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(u.sub_id1, UniversalSubId1::Other(0x40));
+    }
+
+    #[test]
+    fn universal_classification_unknown_sub_id2_surfaces_through_other() {
+        // Sub-ID #1 = 0x04 (Non-Real-Time MTC Setup), Sub-ID #2 = 0x77
+        // — outside Table 4's MTC Setup vocabulary. Surfaces through
+        // Other(0x77).
+        let ev = make_sysex(&[0x7E, 0x7F, 0x04, 0x77, 0xF7]);
+        let u = ev.universal_classification().unwrap();
+        assert_eq!(
+            u.sub_id1,
+            UniversalSubId1::MidiTimeCode(UniversalSubId2::Other(0x77))
+        );
+    }
+
+    #[test]
+    fn universal_classification_threaded_through_sysex_events_collection() {
+        // End-to-end: parse an SMF carrying a GM-on, a Master Volume,
+        // and a Master Fine Tuning, walk smf.sysex_events(), classify
+        // each, and confirm the classifier finds the expected family.
+        let mut events: Vec<u8> = Vec::new();
+        // F0 05 7E 7F 09 01 F7 — GM 1 System On
+        events.extend_from_slice(&[0x00, 0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        // F0 07 7F 7F 04 01 lsb msb F7 — Master Volume
+        events.extend_from_slice(&[0x00, 0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x01, 0x40, 0x60, 0xF7]);
+        // F0 0A 7F 7F 04 03 nn ll mm rr ss F7 — Master Fine Tuning (CA-25)
+        events.extend_from_slice(&[
+            0x00, 0xF0, 0x0A, 0x7F, 0x7F, 0x04, 0x03, 0x00, 0x40, 0x00, 0x00, 0x00, 0xF7,
+        ]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let sx = smf.sysex_events();
+        assert_eq!(sx.len(), 3);
+        let classes: Vec<_> = sx
+            .iter()
+            .map(|s| s.universal_classification().unwrap())
+            .collect();
+        assert_eq!(
+            classes[0].sub_id1,
+            UniversalSubId1::GeneralMidiOrControllerDestination(
+                UniversalSubId2::GeneralMidi1SystemOn,
+            )
+        );
+        assert_eq!(
+            classes[1].sub_id1,
+            UniversalSubId1::DeviceControl(UniversalSubId2::DeviceControlMasterVolume)
+        );
+        assert_eq!(
+            classes[2].sub_id1,
+            UniversalSubId1::DeviceControl(UniversalSubId2::DeviceControlMasterFineTuning)
+        );
+        // Realm split: GM-on is Non-Real-Time, the two Device Control
+        // packets are Real-Time.
+        assert_eq!(classes[0].realm, UniversalRealm::NonRealTime);
+        assert_eq!(classes[1].realm, UniversalRealm::RealTime);
+        assert_eq!(classes[2].realm, UniversalRealm::RealTime);
     }
 
     // ───────── SmfChannelSnapshot / SmfFile::channel_snapshot_at ─────────

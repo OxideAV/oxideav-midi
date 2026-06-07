@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 246 — `SysExEvent::universal_classification()` — Table 4 Universal SysEx classifier
+
+- New `SysExEvent::universal_classification(&self) -> Option<UniversalSysEx>`
+  classifies a Universal System Exclusive packet against Table 4 of the
+  MIDI 1.0 *Universal System Exclusive Messages* document, returning a
+  `UniversalSysEx { realm, device_id, sub_id1 }` for every `F0` packet
+  whose leading byte is `0x7E` (Universal Non-Real-Time) or `0x7F`
+  (Universal Real-Time). The Sub-ID #1 byte is parsed against the
+  Table 4 vocabulary into a `UniversalSubId1` enum that names every
+  category in the document; categories that branch on Sub-ID #2 carry
+  a `UniversalSubId2` payload that names every Sub-ID #2 value the
+  document defines for the category-realm pair. Sub-ID #1 / Sub-ID #2
+  bytes outside the Table 4 vocabulary the classifier knows about
+  surface through `UniversalSubId1::Other(raw)` /
+  `UniversalSubId2::Other(raw)` so callers with deeper, more recent
+  vocabulary can still route the packet.
+- The classifier is realm-aware: the same `(sub_id1, sub_id2)` byte
+  pair names different messages in the two realms (e.g. `0x09 0x01`
+  is `GeneralMidi1SystemOn` in Non-Real-Time and
+  `ControllerDestinationChannelPressure` in Real-Time, per Table 4);
+  the classifier decodes against the parsed `realm` before matching.
+  Singleton Sub-ID #1 categories (`0x7B` End of File through `0x7F`
+  ACK) are singleton-shaped and report as unit variants of
+  `UniversalSubId1`. `F7` continuation / escape packets, manufacturer-
+  prefixed `F0` packets (any leading byte other than `0x7E` / `0x7F`),
+  and `F0` packets truncated before Sub-ID #1 (fewer than 3 payload
+  bytes) return `None` so callers route them through
+  `SysExEvent::manufacturer_id` or the raw `SysExEvent::data` instead.
+- The `UniversalSubId1` enum surfaces every Sub-ID #1 byte the
+  document defines: Sample Dump Header / Data Packet / Request (the
+  three Non-Real-Time singletons at `0x01..=0x03`), MIDI Time Code
+  (Non-RT Setup at `0x04` / RT Quarter-Frame at `0x01`), Sample Dump
+  Extensions, General Information, File Dump, MIDI Tuning Standard,
+  General MIDI / Controller Destination Setting, Downloadable Sounds /
+  Key-Based Instrument Control, File Reference / Scalable Polyphony
+  MIP, MIDI Visual Control / Mobile Phone Control, MIDI Capability
+  Inquiry, MIDI Show Control, Notation Information, Device Control,
+  Real-Time MTC Cueing — plus the five Non-Real-Time singletons (End
+  of File, Wait, Cancel, NAK, ACK).
+- The `UniversalSubId2` enum surfaces every Sub-ID #2 byte the
+  document defines for those categories: 15 Non-Real-Time MTC Setup
+  sub-categories (Special, Punch In / Out Points, Delete Punch In /
+  Out Point, Event Start / Stop Point, the four "with additional
+  info" variants, Cue Points, Delete Cue Point, Event Name with
+  additional info), 7 Sample Dump Extension sub-categories (Loop
+  Points / Sample Name transmission and request, Extended Dump
+  Header, Extended Loop Points transmission and request), the
+  Identity Request / Reply pair, File Dump Header / Data Packet /
+  Request, 10 MTS sub-categories (Bulk Dump Request / Reply, Tuning
+  Dump Request, Key-Based Tuning Dump, Scale/Octave Tuning Dump in 1-
+  and 2-byte formats, Single Note Tuning Change with Bank Select,
+  Scale/Octave Tuning in 1- and 2-byte formats, RT Single Note
+  Tuning Change), GM 1 / GM Off / GM 2 System On, the DLS quartet
+  (Turn DLS On / Off / Voice Allocation Off / On), the File
+  Reference quartet (Open File, Select or Reselect Contents, Open
+  File and Select Contents, Close File), MTC Full Message / User
+  Bits, MSC Extensions, Notation Bar Number / Time Signature
+  Immediate / Time Signature Delayed, the five Device Control
+  variants (Master Volume / Balance / Fine Tuning / Coarse Tuning /
+  Global Parameter Control), 10 RT MTC Cueing sub-categories (the
+  Real-Time mirror of the Non-Real-Time MTC Setup family), the
+  Controller Destination triple (Channel Pressure, Polyphonic Key
+  Pressure, Control Change), Key-Based Instrument Control, Scalable
+  Polyphony MIP Message, Mobile Phone Control Message.
+- 30 new unit tests cover: every Sub-ID #1 vocabulary slot, every
+  Sub-ID #2 vocabulary slot across both realms, realm disambiguation
+  for the shared `0x09 0x01` / `0x02` / `0x07` / `0x08` / `0x09`
+  byte pairs, the four "this is not a Universal packet" return-`None`
+  paths (`F7` continuation, manufacturer-prefixed `F0`, expanded
+  three-byte manufacturer ID, payload shorter than 3 bytes), the
+  `device_id` byte preservation across the `0x00..=0x7F` range
+  (specific-device vs broadcast `0x7F` target), the `Other(raw)`
+  fallback paths for unknown Sub-ID #1 and Sub-ID #2 values, and an
+  end-to-end pass that parses an SMF carrying GM 1 System On +
+  Master Volume + Master Fine Tuning, walks `SmfFile::sysex_events()`,
+  classifies each entry, and confirms the realm split + Sub-ID #1 /
+  Sub-ID #2 decoding all the way through the parser → iteration
+  helper → classifier pipeline.
+- Builds on the existing `SysExEvent` surface (`tick`, `track`,
+  `is_escape`, `data`, `ends_with_eox`, `is_complete_message`,
+  `manufacturer_id`) — `universal_classification` is the realm- and
+  category-decoded view of the same payload `manufacturer_id` returns
+  the leading byte of, so a caller routing by either accessor stays
+  in sync with the verbatim `SysExEvent::data` buffer the SMF
+  parser produces.
+
 ### Round 243 — `SmfFile::sysex_events()` (F0 / F7) iteration helper
 
 - New `SmfFile::sysex_events(&self) -> Vec<SysExEvent>` surfaces
