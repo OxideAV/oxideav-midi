@@ -1286,6 +1286,120 @@ impl ProgramChangeEvent {
     }
 }
 
+/// One Control Change (`Bn cc vv`) channel-voice event pinned to the
+/// absolute tick (relative to the start of its parent track) at which
+/// the [`ChannelBody::ControlChange`] wire event fires.
+///
+/// Returned by [`SmfFile::control_changes`] — see that method for the
+/// merge semantics across multiple tracks.
+///
+/// `Bn cc vv` is the Standard MIDI File §"Channel Voice Messages" §`Bn`
+/// continuous-controller / channel-mode message: a controller-number
+/// byte `cc` (`0..=127`) selects one of the 128 indexes documented in
+/// the MIDI 1.0 *Control Change Messages — Data Bytes* table — Bank
+/// Select MSB (`0`), Modulation Wheel (`1`), Channel Volume (`7`), Pan
+/// (`10`), Expression (`11`), Bank Select LSB (`32`), Damper / Sustain
+/// (`64`), Data Entry MSB / LSB (`6` / `38`), RPN / NRPN MSB / LSB
+/// (`100` / `101` and `98` / `99`), All Sound Off (`120`), Reset All
+/// Controllers (`121`), All Notes Off (`123`), and the Channel Mode
+/// family (`120..=127`) — and a value byte `vv` (`0..=127`) carries the
+/// controller's new setting. The SMF parser surfaces both bytes raw so
+/// the helper stays controller-agnostic: callers driving an RPN / NRPN
+/// pair reassembler, a CC-7 / CC-11 volume / expression curve view, a
+/// CC-64 pedal-on / pedal-off span renderer, or a channel-mode
+/// (`120..=127`) reset-detector all read from the same `(controller,
+/// value)` pair without re-walking the channel-voice stream.
+///
+/// This helper isolates the CC channel so callers building a
+/// controller-automation view (DAW lane editor, soft-synth state
+/// rebuilder, song-form CC-7 / CC-11 curve renderer, RPN / NRPN pair
+/// joiner) get a clean time-ordered list independent of the
+/// surrounding patch-select (`Cn`), pitch-bend (`En`), aftertouch
+/// (`An` / `Dn`), note (`8n` / `9n`), and meta-event streams. The
+/// companion wire-state primitive [`SmfFile::channel_snapshot_at`]
+/// folds the *last* value of the six snapshot-tracked controllers
+/// (Bank MSB / LSB, Modulation, Volume, Pan, Expression, Sustain) into
+/// the snapshot at the seek point; this helper surfaces *every*
+/// Control Change in chronological order so callers building an
+/// automation timeline that includes every controller — not just the
+/// six the snapshot tracks — don't have to re-walk the channel-voice
+/// stream manually.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlChangeEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the channel-voice event, in division units. For format-1 SMFs
+    /// this is also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). Format-1 files commonly place the bulk of
+    /// a part's CC automation on the same track as its note-on /
+    /// note-off events; format-2 files keep patterns separate so each
+    /// pattern's CC stream appears on its own track.
+    pub track: usize,
+    /// The MIDI channel the controller change targets, in the spec's
+    /// `0..=15` range (channel "1" in human-facing tools is index `0`).
+    /// Decoded from the low nibble of the `Bn` status byte at parse
+    /// time so the parser's running-status bookkeeping is already
+    /// resolved by the time the event reaches the helper.
+    pub channel: u8,
+    /// The controller number (`cc` first data byte of `Bn cc vv`,
+    /// `0..=127`). The Standard MIDI File Specification 1.0 reserves
+    /// the high bit (`0x80`) for status / running-status framing; the
+    /// parser rejects channel-voice data bytes with the high bit set
+    /// so the value space here is always `0..=127`. The MIDI 1.0
+    /// *Control Change Messages — Data Bytes* document assigns
+    /// `120..=127` to the channel-mode family (All Sound Off, Reset
+    /// All Controllers, Local Control, All Notes Off, Omni Off, Omni
+    /// On, Mono / Poly Mode) — those values are *still* surfaced
+    /// through this helper rather than diverted to a separate channel,
+    /// so a player reset-detector can route on `controller == 123 &&
+    /// value == 0` without consulting a second iterator.
+    pub controller: u8,
+    /// The controller value (`vv` second data byte of `Bn cc vv`,
+    /// `0..=127`). Resolution against a controller-specific scale
+    /// (the spec's "MSB" / "LSB" pairing for 14-bit controllers
+    /// `0..=31` plus `32..=63`, the on-off threshold `value >= 64` for
+    /// switch controllers `64..=69`, the Data Entry pump for RPN /
+    /// NRPN parameter writes) is left to the receiving application:
+    /// the helper stays controller-agnostic and surfaces the raw
+    /// value byte so callers can pick their own controller-vocabulary
+    /// policy.
+    pub value: u8,
+}
+
+impl ControlChangeEvent {
+    /// The MIDI channel index in the spec's `0..=15` range.
+    pub fn channel(&self) -> u8 {
+        self.channel
+    }
+
+    /// The controller number (`0..=127`).
+    pub fn controller(&self) -> u8 {
+        self.controller
+    }
+
+    /// The controller value byte (`0..=127`).
+    pub fn value(&self) -> u8 {
+        self.value
+    }
+
+    /// Returns `true` when the controller number falls in the
+    /// channel-mode range (`120..=127`) defined by the MIDI 1.0
+    /// *Control Change Messages — Data Bytes* document: All Sound Off
+    /// (`120`), Reset All Controllers (`121`), Local Control (`122`),
+    /// All Notes Off (`123`), Omni Mode Off (`124`), Omni Mode On
+    /// (`125`), Mono Mode On (`126`), Poly Mode On (`127`).
+    ///
+    /// A reset-detector replaying a snapshot at a seek point can route
+    /// on this predicate without re-checking the controller-number
+    /// range manually; the spec assigns these values exclusively to
+    /// the channel-mode family and never reuses them as continuous
+    /// controllers.
+    pub fn is_channel_mode(&self) -> bool {
+        matches!(self.controller, 120..=127)
+    }
+}
+
 /// One System Exclusive event pinned to the absolute tick (relative
 /// to the start of its parent track) at which the [`F0`](Event::Sysex)
 /// (start) or [`F7`](Event::Sysex) (continuation / escape) wire event
@@ -3201,6 +3315,90 @@ impl SmfFile {
                         track: track_idx,
                         channel: *channel,
                         program: *program,
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every [`ChannelBody::ControlChange`] (`Bn cc vv`)
+    /// channel-voice event from every track, pinned to the absolute
+    /// tick at which it fires, in time order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two events at the same tick keep the `(track,
+    /// in-track-position)` order — track 0's events fire before track
+    /// 1's at the same tick. This matches the same stable-merge rule
+    /// [`SmfFile::tempo_map`] / [`SmfFile::time_signatures`] /
+    /// [`SmfFile::key_signatures`] / [`SmfFile::markers`] /
+    /// [`SmfFile::lyrics`] / [`SmfFile::cue_points`] /
+    /// [`SmfFile::track_names`] / [`SmfFile::instrument_names`] /
+    /// [`SmfFile::texts`] / [`SmfFile::copyrights`] /
+    /// [`SmfFile::smpte_offsets`] / [`SmfFile::sequencer_specifics`] /
+    /// [`SmfFile::sequence_numbers`] / [`SmfFile::midi_ports`] /
+    /// [`SmfFile::channel_prefixes`] / [`SmfFile::program_changes`]
+    /// and the scheduler use (`scheduler.rs` §"merged event list,
+    /// sorted by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries a `Bn` event — a
+    /// player initialising a fresh receiver should leave every
+    /// controller at its power-up default until an explicit Control
+    /// Change arrives, per the spec convention. The MIDI 1.0
+    /// *Control Change Messages — Data Bytes* document spells out the
+    /// defaults: Volume `100`, Pan `64`, Expression `127`, Modulation
+    /// `0`, Sustain `0`, RPN / NRPN MSB / LSB `127 / 127` (the "Null
+    /// RPN" sentinel that disables Data Entry pickup).
+    ///
+    /// Only `Bn` is selected — neighbouring Program Change (`Cn`),
+    /// pitch-bend (`En`), aftertouch (`An` / `Dn`), and note (`8n` /
+    /// `9n`) channel-voice events stay on their own surfaces. The
+    /// channel-mode family (`controller == 120..=127`) is *not*
+    /// diverted — All Sound Off (`120`), Reset All Controllers
+    /// (`121`), Local Control (`122`), All Notes Off (`123`), Omni
+    /// Mode Off (`124`), Omni Mode On (`125`), Mono Mode On (`126`),
+    /// Poly Mode On (`127`) all surface through this list with their
+    /// `value` byte preserved, and [`ControlChangeEvent::is_channel_mode`]
+    /// gives callers a one-line predicate to route them. Companion
+    /// primitive [`SmfFile::channel_snapshot_at`] folds the *last*
+    /// value of the six snapshot-tracked controllers (Bank MSB / LSB,
+    /// Modulation, Volume, Pan, Expression, Sustain) into the
+    /// snapshot for seek initialisation; this helper surfaces *every*
+    /// Control Change in chronological order so callers building a
+    /// full automation timeline — including the controllers the
+    /// snapshot doesn't track (CC-1 Modulation curves with sub-tick
+    /// granularity, the CC-6 / CC-38 Data Entry pump that drives RPN
+    /// / NRPN parameter writes, the CC-100 / CC-101 RPN pair and
+    /// CC-98 / CC-99 NRPN pair, the CC-91 / CC-93 effects-send
+    /// levels, the channel-mode reset family) — don't have to
+    /// re-walk the channel-voice stream manually.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`] (the same cap the parser enforces).
+    pub fn control_changes(&self) -> Vec<ControlChangeEvent> {
+        let mut out: Vec<ControlChangeEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Channel(ChannelMessage {
+                    channel,
+                    body: ChannelBody::ControlChange { controller, value },
+                }) = &ev.kind
+                {
+                    out.push(ControlChangeEvent {
+                        tick: abs,
+                        track: track_idx,
+                        channel: *channel,
+                        controller: *controller,
+                        value: *value,
                     });
                 }
             }
@@ -9738,5 +9936,270 @@ mod tests {
         // recent program selected.
         let snap_mid = smf.channel_snapshot_at(0, 150);
         assert_eq!(snap_mid.program, Some(40));
+    }
+
+    // ───────── ControlChangeEvent / SmfFile::control_changes (Bn cc vv) ─────────
+
+    #[test]
+    fn control_changes_empty_when_no_cc_present() {
+        // Note On / Note Off / Program Change only — no CC.
+        let events: Vec<u8> = vec![
+            0x00, 0xC0, 0x05, 0x00, 0x90, 0x3C, 0x64, 0x60, 0x80, 0x3C, 0x40, 0x00, 0xFF, 0x2F,
+            0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.control_changes().is_empty());
+    }
+
+    #[test]
+    fn control_changes_single_volume_at_tick_zero() {
+        // delta=0 B0 07 64   (channel 0, controller 7 = Volume, value 100 = power-up default)
+        // delta=0 FF 2F 00
+        let events: Vec<u8> = vec![0x00, 0xB0, 0x07, 0x64, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ccs = smf.control_changes();
+        assert_eq!(ccs.len(), 1);
+        assert_eq!(ccs[0].tick, 0);
+        assert_eq!(ccs[0].track, 0);
+        assert_eq!(ccs[0].channel(), 0);
+        assert_eq!(ccs[0].controller(), 7);
+        assert_eq!(ccs[0].value(), 100);
+        assert!(!ccs[0].is_channel_mode());
+    }
+
+    #[test]
+    fn control_changes_full_seven_bit_value_range_round_trips() {
+        // B5 0A 7F → channel 5, controller 10 (Pan), value 127 (max legal).
+        let events: Vec<u8> = vec![0x00, 0xB5, 0x0A, 0x7F, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ccs = smf.control_changes();
+        assert_eq!(ccs.len(), 1);
+        assert_eq!(ccs[0].channel, 5);
+        assert_eq!(ccs[0].controller, 10);
+        assert_eq!(ccs[0].value, 127);
+    }
+
+    #[test]
+    fn control_changes_low_nibble_decodes_channel_index() {
+        // BF 01 40 → channel 15 (the high nibble of Bn is the status,
+        // the low nibble is the channel index 0..=15).
+        let events: Vec<u8> = vec![0x00, 0xBF, 0x01, 0x40, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ccs = smf.control_changes();
+        assert_eq!(ccs.len(), 1);
+        assert_eq!(ccs[0].channel(), 15);
+        assert_eq!(ccs[0].controller(), 1);
+        assert_eq!(ccs[0].value(), 0x40);
+    }
+
+    #[test]
+    fn control_changes_running_status_chain_decodes_each_change() {
+        // Running-status reuse — Bn is a two-data-byte status so each
+        // running-status frame supplies *two* bytes (`cc` + `vv`).
+        // delta=0 B0 01 00  (set status; channel 0 / CC 1 Modulation / value 0)
+        // delta=0    01 20  (running status — channel 0 / CC 1 / value 32)
+        // delta=0    07 64  (running status — channel 0 / CC 7 Volume / value 100)
+        // delta=0 FF 2F 00
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x01, 0x00, 0x00, 0x01, 0x20, 0x00, 0x07, 0x64, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ccs = smf.control_changes();
+        assert_eq!(ccs.len(), 3);
+        assert_eq!(ccs[0].channel, 0);
+        assert_eq!(ccs[0].controller, 1);
+        assert_eq!(ccs[0].value, 0);
+        assert_eq!(ccs[1].channel, 0);
+        assert_eq!(ccs[1].controller, 1);
+        assert_eq!(ccs[1].value, 32);
+        assert_eq!(ccs[2].channel, 0);
+        assert_eq!(ccs[2].controller, 7);
+        assert_eq!(ccs[2].value, 100);
+    }
+
+    #[test]
+    fn control_changes_late_position_tracks_absolute_tick() {
+        // CC after a 240-tick rest — the helper surfaces it at tick
+        // 240, not at zero.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&encode_vlq(240));
+        events.extend_from_slice(&[0xB2, 0x0B, 0x7F]); // CC 11 Expression = 127 on ch 2
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ccs = smf.control_changes();
+        assert_eq!(ccs.len(), 1);
+        assert_eq!(ccs[0].tick, 240);
+        assert_eq!(ccs[0].channel, 2);
+        assert_eq!(ccs[0].controller, 11);
+        assert_eq!(ccs[0].value, 127);
+    }
+
+    #[test]
+    fn control_changes_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        // Two format-1 tracks both with a CC at tick 0 — the stable
+        // sort keeps track 0 before track 1.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xB0, 0x07, 0x40]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&[0x00, 0xB1, 0x07, 0x60]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let ccs = smf.control_changes();
+        assert_eq!(ccs.len(), 2);
+        assert_eq!(ccs[0].track, 0);
+        assert_eq!(ccs[0].channel, 0);
+        assert_eq!(ccs[0].value, 0x40);
+        assert_eq!(ccs[1].track, 1);
+        assert_eq!(ccs[1].channel, 1);
+        assert_eq!(ccs[1].value, 0x60);
+    }
+
+    #[test]
+    fn control_changes_merge_across_tracks_sorted_by_tick() {
+        // Track 0 at tick 100, track 1 at tick 50 — sort drops the
+        // track-1 entry first.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(100));
+        t0.extend_from_slice(&[0xB0, 0x07, 0x20]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(50));
+        t1.extend_from_slice(&[0xB1, 0x0A, 0x30]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let ccs = smf.control_changes();
+        assert_eq!(ccs.len(), 2);
+        assert_eq!(ccs[0].tick, 50);
+        assert_eq!(ccs[0].track, 1);
+        assert_eq!(ccs[0].channel, 1);
+        assert_eq!(ccs[0].controller, 10);
+        assert_eq!(ccs[0].value, 0x30);
+        assert_eq!(ccs[1].tick, 100);
+        assert_eq!(ccs[1].track, 0);
+        assert_eq!(ccs[1].channel, 0);
+        assert_eq!(ccs[1].controller, 7);
+        assert_eq!(ccs[1].value, 0x20);
+    }
+
+    #[test]
+    fn control_changes_filter_excludes_other_channel_voice_kinds() {
+        // Bn picked up; note-on / note-off / program / pitch bend /
+        // aftertouch all filtered out. Sibling helpers stay
+        // uncontaminated.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // note on
+        events.extend_from_slice(&[0x00, 0xB0, 0x07, 0x50]); // CC vol
+        events.extend_from_slice(&[0x00, 0xC0, 0x05]); // program change
+        events.extend_from_slice(&[0x00, 0xE0, 0x00, 0x40]); // pitch bend
+        events.extend_from_slice(&[0x00, 0xA0, 0x3C, 0x20]); // poly AT
+        events.extend_from_slice(&[0x00, 0xD0, 0x40]); // channel AT
+        events.extend_from_slice(&[0x00, 0x80, 0x3C, 0x40]); // note off
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ccs = smf.control_changes();
+        assert_eq!(ccs.len(), 1);
+        assert_eq!(ccs[0].channel, 0);
+        assert_eq!(ccs[0].controller, 7);
+        assert_eq!(ccs[0].value, 0x50);
+    }
+
+    #[test]
+    fn control_changes_channel_mode_family_surfaces_with_predicate_set() {
+        // Channel-mode controllers (120..=127) ride the same Bn lane
+        // as continuous CCs — the helper surfaces them and the
+        // is_channel_mode() predicate flags them.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xB0, 120, 0x00]); // All Sound Off
+        events.extend_from_slice(&[0x00, 0xB0, 121, 0x00]); // Reset All Controllers
+        events.extend_from_slice(&[0x00, 0xB0, 123, 0x00]); // All Notes Off
+        events.extend_from_slice(&[0x00, 0xB0, 127, 0x00]); // Poly Mode On
+        events.extend_from_slice(&[0x00, 0xB0, 7, 100]); // Volume — continuous, not mode
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ccs = smf.control_changes();
+        assert_eq!(ccs.len(), 5);
+        assert!(ccs[0].is_channel_mode());
+        assert!(ccs[1].is_channel_mode());
+        assert!(ccs[2].is_channel_mode());
+        assert!(ccs[3].is_channel_mode());
+        assert!(!ccs[4].is_channel_mode()); // CC 7 Volume stays continuous
+    }
+
+    #[test]
+    fn control_changes_seek_initialisation_matches_channel_snapshot() {
+        // The snapshot folds the *last* CC-7 (Volume) before the seek
+        // tick into SmfChannelSnapshot::volume; control_changes() exposes
+        // the full automation timeline. Verify the two agree at every
+        // change point and at a mid-way tick.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xB0, 0x07, 0x10]); // tick 0 — vol 16
+        events.extend_from_slice(&encode_vlq(100));
+        events.extend_from_slice(&[0xB0, 0x07, 0x40]); // tick 100 — vol 64
+        events.extend_from_slice(&encode_vlq(100));
+        events.extend_from_slice(&[0xB0, 0x07, 0x7F]); // tick 200 — vol 127
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ccs = smf.control_changes();
+        // Filter to CC-7 only (the snapshot only tracks specific CCs).
+        let vol: Vec<_> = ccs.iter().filter(|c| c.controller == 7).collect();
+        assert_eq!(vol.len(), 3);
+        for (i, cc) in vol.iter().enumerate() {
+            let snap = smf.channel_snapshot_at(0, cc.tick);
+            assert_eq!(
+                snap.volume, cc.value,
+                "snapshot at change {i} (tick {}) should resolve to volume {}",
+                cc.tick, cc.value
+            );
+        }
+        // Mid-way between changes the snapshot still reports the most
+        // recent volume selected.
+        let snap_mid = smf.channel_snapshot_at(0, 150);
+        assert_eq!(snap_mid.volume, 0x40);
+    }
+
+    #[test]
+    fn control_changes_to_bytes_round_trip() {
+        // CC stream survives a to_bytes() / parse() round trip.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xB0, 0x01, 0x10]); // Modulation
+        events.extend_from_slice(&[0x00, 0xB0, 0x07, 0x55]); // Volume
+        events.extend_from_slice(&[0x00, 0xB0, 0x0A, 0x40]); // Pan
+        events.extend_from_slice(&[0x00, 0xB0, 0x40, 0x7F]); // Sustain on
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let original = smf.control_changes();
+        assert_eq!(original.len(), 4);
+        let muxed = smf.to_bytes().unwrap();
+        let reparsed = parse(&muxed).unwrap();
+        let after = reparsed.control_changes();
+        assert_eq!(original, after);
     }
 }

@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 260 — `SmfFile::control_changes()` — Bn-cc-vv channel-voice continuous-controller / channel-mode iteration helper
+
+- New `SmfFile::control_changes(&self) -> Vec<ControlChangeEvent>`
+  surfaces every `Bn cc vv` Control Change channel-voice event on
+  every track, pinned to the absolute tick at which it fires, in time
+  order. Each entry is a `ControlChangeEvent { tick, track, channel,
+  controller, value }` with the status nibble's low four bits decoded
+  into the spec's `0..=15` channel index and both data bytes `cc` /
+  `vv` surfaced as raw `0..=127` payloads.
+- The new `ControlChangeEvent` struct carries the same `tick` /
+  `track` pair the existing iteration helpers use plus the decoded
+  `channel`, `controller`, and `value` bytes. The
+  `channel()` / `controller()` / `value()` accessor methods return the
+  same fields with mnemonic names so call sites driving a
+  controller-automation view read `cc.controller()` / `cc.value()`
+  rather than the bare field access. A `is_channel_mode()` predicate
+  flags the channel-mode family (`controller` in `120..=127`) — All
+  Sound Off (`120`), Reset All Controllers (`121`), Local Control
+  (`122`), All Notes Off (`123`), Omni Mode Off / On (`124` / `125`),
+  Mono / Poly Mode On (`126` / `127`) — so a player reset-detector
+  can route on the predicate without re-checking the controller
+  range manually.
+- Resolution against a controller vocabulary (the MIDI 1.0
+  *Control Change Messages — Data Bytes* table's 14-bit MSB / LSB
+  pairing for controllers `0..=31` plus `32..=63`, the on-off
+  threshold `value >= 64` for switch controllers `64..=69`, the
+  CC-6 / CC-38 Data Entry pump that drives RPN / NRPN parameter writes
+  selected through CC-100 / CC-101 RPN and CC-98 / CC-99 NRPN pairs)
+  is intentionally left to the receiving application: the helper
+  stays controller-agnostic and surfaces the raw value byte so
+  callers pick their own controller-vocabulary policy.
+- Per-track sequences are stably merged by absolute tick — track 0's
+  events fire before track 1's at the same tick — the same convention
+  used by every existing iteration helper (`program_changes()`,
+  `sysex_events()`, `universal_sysex_events()`, the meta-event
+  family, …) and the scheduler's merged event list.
+- Companion to the wire-state primitive `SmfFile::channel_snapshot_at`,
+  which folds the *last* value of the six snapshot-tracked
+  controllers (Bank MSB / LSB, Modulation, Volume, Pan, Expression,
+  Sustain) into the snapshot at the seek point. Where the snapshot
+  answers "what value is CC-7 / CC-10 / … at tick T?",
+  `control_changes()` answers "give me every controller change in
+  song order, including the controllers the snapshot doesn't track"
+  — the typed accessor a DAW lane-editor or a CC-1 modulation-curve
+  renderer reads.
+- 12 new tests cover the empty-input case, single-controller decode,
+  the full `0..=127` value range, channel-index decode across the
+  `0..=15` range, running-status reuse on the `Bn` two-data-byte
+  status (three chained CCs sharing one status byte), late-position
+  absolute-tick tracking, stable-sort merge of same-tick events
+  across tracks, time-ordered merge of different-tick events across
+  tracks, filtering against the other six channel-voice status kinds
+  (`8n`, `9n`, `An`, `Cn`, `Dn`, `En`), the channel-mode family
+  (`120..=127`) flagged by `is_channel_mode()` alongside a continuous
+  CC-7 surface that doesn't, a cross-check against
+  `channel_snapshot_at` confirming the snapshot's `volume` field
+  tracks the iterator at each change point and on the silence
+  between changes, and a `to_bytes()` / `parse()` round trip
+  confirming the CC stream survives the mux-side writer. Total
+  lib-test count: **508** (up from 496).
+
 ### Round 254 — `SmfFile::program_changes()` — Cn-pp channel-voice patch-select iteration helper
 
 - New `SmfFile::program_changes(&self) -> Vec<ProgramChangeEvent>`

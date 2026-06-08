@@ -377,6 +377,44 @@ framework but usable standalone.
   channel on at tick T?", `program_changes()` answers "give me
   every patch change in song order" — a DAW track-inspector view
   highlighting the bar each instrument enters reads the latter.
+  Round 260 extends the channel-voice typed-iterator family with
+  `SmfFile::control_changes() -> Vec<ControlChangeEvent>`: every
+  `Bn cc vv` Control Change on every track, pinned to the absolute
+  tick at which it fires, with the channel index plus the raw
+  `cc` / `vv` data bytes surfaced as a `ControlChangeEvent { tick,
+  track, channel, controller, value }`. The status nibble's low
+  four bits decode to the spec's `0..=15` channel index; the first
+  data byte `cc` is the controller number selected from the MIDI
+  1.0 *Control Change Messages — Data Bytes* table (Bank Select
+  MSB / LSB `0` / `32`, Modulation `1`, Volume `7`, Pan `10`,
+  Expression `11`, Data Entry `6` / `38`, RPN MSB / LSB `100` /
+  `101`, NRPN MSB / LSB `98` / `99`, Sustain `64`, …); the second
+  data byte `vv` is the raw value. The channel-mode family
+  (`controller` in `120..=127`: All Sound Off / Reset All
+  Controllers / Local Control / All Notes Off / Omni Off / Omni On
+  / Mono Mode On / Poly Mode On) is *not* diverted to a separate
+  surface — those events ride the same `Bn` lane, and the
+  `ControlChangeEvent::is_channel_mode()` predicate gives callers a
+  one-line route into reset detection without re-checking the
+  controller range. Resolution against a controller vocabulary
+  (the 14-bit MSB / LSB pairing for controllers `0..=31` plus
+  `32..=63`, the on-off threshold `value >= 64` for switch
+  controllers, the Data Entry pump that drives RPN / NRPN parameter
+  writes) is left to the receiving application — the helper stays
+  controller-agnostic and surfaces the raw value byte so callers
+  building a DAW lane editor / a CC-1 modulation-curve renderer / a
+  CC-7 / CC-11 volume-expression curve view / an RPN-NRPN pair
+  reassembler pick their own controller-vocabulary policy. Per-track
+  sequences are stably merged by absolute tick — track 0's events
+  fire before track 1's at the same tick — the same convention used
+  by every meta-event and SysEx helper. Companion to the wire-state
+  primitive `channel_snapshot_at` which folds the *last* value of
+  the six snapshot-tracked controllers (Bank MSB / LSB, Modulation,
+  Volume, Pan, Expression, Sustain) into the snapshot for seek
+  initialisation: where the snapshot answers "what value is CC-7 /
+  CC-10 / … at tick T?", `control_changes()` answers "give me every
+  controller change in song order, including the controllers the
+  snapshot doesn't track" — a DAW automation lane reads the latter.
   Round 234 closes the SMF read-vs-write asymmetry: the parser
   has always materialised the full event vocabulary (`Channel`,
   `Sysex`, `Meta`), and round 234 adds the matching writer.
