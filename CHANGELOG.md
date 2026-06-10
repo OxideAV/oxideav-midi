@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 267 — `SmfFile::pitch_bends()` — En-lsb-msb channel-voice pitch-bend iteration helper
+
+- New `SmfFile::pitch_bends(&self) -> Vec<PitchBendEvent>` surfaces
+  every `En lsb msb` Pitch Bend channel-voice event on every track,
+  pinned to the absolute tick at which it fires, in time order. Each
+  entry is a `PitchBendEvent { tick, track, channel, value }` with the
+  status nibble's low four bits decoded into the spec's `0..=15`
+  channel index and the two data bytes combined into the 14-bit code
+  `(msb << 7) | lsb`, `0..=0x3FFF`, no-bend centre `0x2000` (the parser
+  assembles the value at decode time).
+- The new `PitchBendEvent` struct carries the same `tick` / `track`
+  pair the existing channel-voice iteration helpers use plus the
+  decoded `channel` and the assembled 14-bit `value`. The `channel()`
+  / `value()` accessors return the fields with mnemonic names; a
+  `signed_value() -> i16` accessor returns the displacement from centre
+  in `-8192..=8191` (`value as i32 - 0x2000`, so `0x2000` → `0`,
+  `0x0000` → `-8192`, `0x3FFF` → `8191`); an `is_centre()` predicate
+  flags the no-bend position for bend-lane collapse / wheel-release
+  detection.
+- Resolving the 14-bit code to an actual pitch displacement requires
+  the channel's Pitch Bend Sensitivity (RPN 0, default ±2 semitones),
+  which is intentionally left to the receiving application: the helper
+  stays sensitivity-agnostic and surfaces the raw code so callers pick
+  their own bend-range policy.
+- Per-track sequences are stably merged by absolute tick — track 0's
+  events fire before track 1's at the same tick — the same convention
+  used by every existing iteration helper (`control_changes()`,
+  `program_changes()`, the SysEx and meta-event families, …) and the
+  scheduler's merged event list.
+- Companion to the wire-state primitive `SmfFile::channel_snapshot_at`,
+  which folds the *last* pitch bend per channel into
+  `SmfChannelSnapshot::pitch_bend` at the seek point. Where the
+  snapshot answers "what is the wheel position on channel N at tick
+  T?", `pitch_bends()` answers "give me every bend in song order" —
+  the typed accessor a DAW bend-lane editor or a glissando / vibrato
+  curve renderer reads.
+- 10 new tests cover the empty-input case, the centre value at tick
+  zero, the `lsb` / `msb` 14-bit combine at both extremes (`0x0000`
+  signed `-8192`, `0x3FFF` signed `+8191`), channel-index decode across
+  the `0..=15` range, running-status reuse on the `En` two-data-byte
+  status (three chained bends sharing one status byte), late-position
+  absolute-tick tracking, stable-sort merge of same-tick events across
+  tracks, time-ordered merge of different-tick events across tracks,
+  filtering against the other six channel-voice status kinds (`8n`,
+  `9n`, `An`, `Bn`, `Cn`, `Dn`), a cross-check against
+  `channel_snapshot_at` confirming the snapshot's `pitch_bend` field
+  tracks the iterator at each change point and on the silence between
+  changes, and a `to_bytes()` / `parse()` round trip confirming the
+  bend stream survives the mux-side writer.
+
 ### Round 260 — `SmfFile::control_changes()` — Bn-cc-vv channel-voice continuous-controller / channel-mode iteration helper
 
 - New `SmfFile::control_changes(&self) -> Vec<ControlChangeEvent>`

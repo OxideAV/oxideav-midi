@@ -415,6 +415,30 @@ framework but usable standalone.
   CC-10 / … at tick T?", `control_changes()` answers "give me every
   controller change in song order, including the controllers the
   snapshot doesn't track" — a DAW automation lane reads the latter.
+  Round 267 extends the channel-voice typed-iterator family with
+  `SmfFile::pitch_bends() -> Vec<PitchBendEvent>`: every `En lsb msb`
+  Pitch Bend on every track, pinned to the absolute tick at which it
+  fires, with the channel index plus the assembled 14-bit value
+  surfaced as a `PitchBendEvent { tick, track, channel, value }`. The
+  status nibble's low four bits decode to the spec's `0..=15` channel
+  index; the two data bytes combine into `(msb << 7) | lsb`,
+  `0..=0x3FFF`, with the no-bend centre at `0x2000` (the parser
+  assembles the value at decode time). `PitchBendEvent::signed_value()`
+  returns the displacement from centre as a signed `-8192..=8191`
+  (`0x2000` → `0`, `0x0000` → `-8192`, `0x3FFF` → `8191`);
+  `is_centre()` flags the no-bend position for bend-lane collapse or
+  wheel-release detection. Resolving the 14-bit code to an actual pitch
+  displacement requires the channel's Pitch Bend Sensitivity (RPN 0,
+  default ±2 semitones), left to the receiving application — the helper
+  stays sensitivity-agnostic and surfaces the raw code. Per-track
+  sequences are stably merged by absolute tick — track 0's events fire
+  before track 1's at the same tick — the same convention used by
+  every meta-event, SysEx, and channel-voice helper. Companion to the
+  wire-state primitive `channel_snapshot_at` which folds the *last*
+  pitch bend per channel into `SmfChannelSnapshot::pitch_bend` for seek
+  initialisation: where the snapshot answers "what is the wheel
+  position on channel N at tick T?", `pitch_bends()` answers "give me
+  every bend in song order" — a DAW bend-lane editor reads the latter.
   Round 234 closes the SMF read-vs-write asymmetry: the parser
   has always materialised the full event vocabulary (`Channel`,
   `Sysex`, `Meta`), and round 234 adds the matching writer.

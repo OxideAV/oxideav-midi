@@ -1400,6 +1400,98 @@ impl ControlChangeEvent {
     }
 }
 
+/// One Pitch Bend channel-voice event pinned to the absolute tick
+/// (relative to the start of its parent track) at which the
+/// [`ChannelBody::PitchBend`] wire event fires.
+///
+/// Returned by [`SmfFile::pitch_bends`] — see that method for the
+/// merge semantics across multiple tracks.
+///
+/// `En lsb msb` is the Standard MIDI File §"Channel Voice Messages"
+/// §`En` pitch-bend message: two data bytes `lsb` / `msb` (each
+/// `0..=127`) combine into a single 14-bit unsigned value
+/// `(msb << 7) | lsb` spanning `0..=0x3FFF`, with the centre (no-bend)
+/// position at `0x2000`. The parser combines the two bytes at decode
+/// time so the value reaches this helper already assembled. The amount
+/// of pitch displacement a given value produces is the receiver's
+/// concern: it depends on the channel's Pitch Bend Sensitivity (RPN 0,
+/// default ±2 semitones), so the helper stays sensitivity-agnostic and
+/// surfaces the raw 14-bit code together with a signed-from-centre
+/// convenience accessor.
+///
+/// This helper isolates the pitch-bend stream so callers driving an
+/// expression-curve view (DAW bend-lane editor, soft-synth wheel-state
+/// rebuilder, a glissando / vibrato curve renderer) get a clean
+/// time-ordered list independent of the surrounding control-change
+/// (`Bn`), patch-select (`Cn`), aftertouch (`An` / `Dn`), and note
+/// (`8n` / `9n`) channel-voice streams. The companion wire-state
+/// primitive [`SmfFile::channel_snapshot_at`] folds the *last* pitch
+/// bend per channel into [`SmfChannelSnapshot::pitch_bend`] for seek
+/// initialisation; this helper surfaces *every* bend in chronological
+/// order so callers building the full bend timeline don't have to
+/// re-walk every track event manually.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PitchBendEvent {
+    /// Cumulative delta-sum from the start of the track that carried
+    /// the channel-voice event, in division units. For format-1 SMFs
+    /// this is also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the event came from (within
+    /// [`SmfFile::tracks`]). Format-1 files commonly place the bulk of
+    /// a part's bend automation on the same track as its note-on /
+    /// note-off events; format-2 files keep patterns separate so each
+    /// pattern's bend stream appears on its own track.
+    pub track: usize,
+    /// The MIDI channel the pitch bend targets, in the spec's `0..=15`
+    /// range (channel "1" in human-facing tools is index `0`). Decoded
+    /// from the low nibble of the `En` status byte at parse time so
+    /// the parser's running-status bookkeeping is already resolved by
+    /// the time the event reaches the helper.
+    pub channel: u8,
+    /// The combined 14-bit pitch-bend value `(msb << 7) | lsb`,
+    /// `0..=0x3FFF`, with the no-bend centre at `0x2000`. The two wire
+    /// data bytes each carry 7 significant bits (the high bit is the
+    /// MIDI status flag the parser already rejected on a data byte), so
+    /// the assembled value never exceeds 14 bits. Use
+    /// [`PitchBendEvent::signed_value`] for the displacement from
+    /// centre as a signed `-8192..=8191`.
+    pub value: u16,
+}
+
+impl PitchBendEvent {
+    /// The MIDI channel index in the spec's `0..=15` range.
+    pub fn channel(&self) -> u8 {
+        self.channel
+    }
+
+    /// The raw 14-bit pitch-bend value `(msb << 7) | lsb`,
+    /// `0..=0x3FFF`, centre `0x2000`.
+    pub fn value(&self) -> u16 {
+        self.value
+    }
+
+    /// The pitch-bend displacement from centre as a signed value in
+    /// `-8192..=8191`: `value as i32 - 0x2000`. The centre code
+    /// `0x2000` maps to `0`, the minimum code `0x0000` to `-8192`, and
+    /// the maximum code `0x3FFF` to `8191`. Resolving the signed code
+    /// to an actual pitch displacement requires the channel's Pitch
+    /// Bend Sensitivity (RPN 0, default ±2 semitones), which the helper
+    /// leaves to the receiving application.
+    pub fn signed_value(&self) -> i16 {
+        // value is always 0..=0x3FFF so the subtraction stays within
+        // i16 range (-8192..=8191).
+        (self.value as i32 - 0x2000) as i16
+    }
+
+    /// Returns `true` when the bend sits at the no-bend centre
+    /// (`value == 0x2000`). A DAW bend-lane editor can collapse a run
+    /// of centre values, and a wheel-release detector can route on this
+    /// predicate without re-checking the raw code.
+    pub fn is_centre(&self) -> bool {
+        self.value == 0x2000
+    }
+}
+
 /// One System Exclusive event pinned to the absolute tick (relative
 /// to the start of its parent track) at which the [`F0`](Event::Sysex)
 /// (start) or [`F7`](Event::Sysex) (continuation / escape) wire event
@@ -3398,6 +3490,81 @@ impl SmfFile {
                         track: track_idx,
                         channel: *channel,
                         controller: *controller,
+                        value: *value,
+                    });
+                }
+            }
+        }
+        // Stable sort by absolute tick. Within a tick, the per-track
+        // insertion order survives the sort (so track 0 wins over
+        // track 1 at the same tick — matches the scheduler's merge
+        // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every [`ChannelBody::PitchBend`] (`En lsb msb`)
+    /// channel-voice event from every track, pinned to the absolute
+    /// tick at which it fires, in time order.
+    ///
+    /// The cumulative delta is summed per-track (each track's
+    /// [`TrackEvent::delta`] is relative to the previous event in the
+    /// same track), then the per-track sequences are merged. The sort
+    /// is stable so two events at the same tick keep the `(track,
+    /// in-track-position)` order — track 0's events fire before track
+    /// 1's at the same tick. This matches the same stable-merge rule
+    /// [`SmfFile::tempo_map`] / [`SmfFile::time_signatures`] /
+    /// [`SmfFile::key_signatures`] / [`SmfFile::markers`] /
+    /// [`SmfFile::lyrics`] / [`SmfFile::cue_points`] /
+    /// [`SmfFile::track_names`] / [`SmfFile::instrument_names`] /
+    /// [`SmfFile::texts`] / [`SmfFile::copyrights`] /
+    /// [`SmfFile::smpte_offsets`] / [`SmfFile::sequencer_specifics`] /
+    /// [`SmfFile::sequence_numbers`] / [`SmfFile::midi_ports`] /
+    /// [`SmfFile::channel_prefixes`] / [`SmfFile::program_changes`] /
+    /// [`SmfFile::control_changes`] and the scheduler use
+    /// (`scheduler.rs` §"merged event list, sorted by absolute tick").
+    ///
+    /// Returns an empty `Vec` when no track carries an `En` event — a
+    /// player initialising a fresh receiver should leave every channel
+    /// at the no-bend centre (`0x2000`) until an explicit Pitch Bend
+    /// arrives, per the spec convention.
+    ///
+    /// Only `En` is selected — neighbouring Control Change (`Bn`),
+    /// Program Change (`Cn`), aftertouch (`An` / `Dn`), and note (`8n`
+    /// / `9n`) channel-voice events stay on their own surfaces. Each
+    /// entry's `value` field carries the combined 14-bit code
+    /// `(msb << 7) | lsb`, `0..=0x3FFF`, with the no-bend centre at
+    /// `0x2000`; [`PitchBendEvent::signed_value`] converts it to the
+    /// signed `-8192..=8191` displacement from centre and
+    /// [`PitchBendEvent::is_centre`] flags the no-bend position.
+    /// Companion primitive [`SmfFile::channel_snapshot_at`] folds the
+    /// *last* pitch bend per channel into
+    /// [`SmfChannelSnapshot::pitch_bend`] for seek initialisation; this
+    /// helper surfaces *every* bend in chronological order so callers
+    /// building a full bend-automation timeline (a DAW bend-lane
+    /// editor, a glissando / vibrato curve renderer) don't have to
+    /// re-walk the channel-voice stream manually. Resolving the 14-bit
+    /// code to an actual pitch displacement requires the channel's
+    /// Pitch Bend Sensitivity (RPN 0, default ±2 semitones), which the
+    /// helper leaves to the receiving application.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`] (the same cap the parser enforces).
+    pub fn pitch_bends(&self) -> Vec<PitchBendEvent> {
+        let mut out: Vec<PitchBendEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Channel(ChannelMessage {
+                    channel,
+                    body: ChannelBody::PitchBend { value },
+                }) = &ev.kind
+                {
+                    out.push(PitchBendEvent {
+                        tick: abs,
+                        track: track_idx,
+                        channel: *channel,
                         value: *value,
                     });
                 }
@@ -10200,6 +10367,239 @@ mod tests {
         let muxed = smf.to_bytes().unwrap();
         let reparsed = parse(&muxed).unwrap();
         let after = reparsed.control_changes();
+        assert_eq!(original, after);
+    }
+
+    // ───────── PitchBendEvent / SmfFile::pitch_bends (En lsb msb) ─────────
+
+    #[test]
+    fn pitch_bends_empty_when_no_bend_present() {
+        // Note On / Note Off / CC / Program Change only — no En.
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x07, 0x64, 0x00, 0x90, 0x3C, 0x64, 0x60, 0x80, 0x3C, 0x40, 0x00, 0xFF,
+            0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.pitch_bends().is_empty());
+    }
+
+    #[test]
+    fn pitch_bends_centre_at_tick_zero() {
+        // delta=0 E0 00 40 → channel 0, lsb=0x00 msb=0x40 → (0x40<<7)|0 = 0x2000 centre.
+        let events: Vec<u8> = vec![0x00, 0xE0, 0x00, 0x40, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pbs = smf.pitch_bends();
+        assert_eq!(pbs.len(), 1);
+        assert_eq!(pbs[0].tick, 0);
+        assert_eq!(pbs[0].track, 0);
+        assert_eq!(pbs[0].channel(), 0);
+        assert_eq!(pbs[0].value(), 0x2000);
+        assert_eq!(pbs[0].signed_value(), 0);
+        assert!(pbs[0].is_centre());
+    }
+
+    #[test]
+    fn pitch_bends_lsb_msb_combine_to_14bit_value() {
+        // E0 7F 7F → max value (0x7F<<7)|0x7F = 0x3FFF; signed +8191.
+        // E0 00 00 → min value 0; signed -8192.
+        let events: Vec<u8> = vec![
+            0x00, 0xE0, 0x7F, 0x7F, 0x00, 0xE0, 0x00, 0x00, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pbs = smf.pitch_bends();
+        assert_eq!(pbs.len(), 2);
+        assert_eq!(pbs[0].value(), 0x3FFF);
+        assert_eq!(pbs[0].signed_value(), 8191);
+        assert!(!pbs[0].is_centre());
+        assert_eq!(pbs[1].value(), 0x0000);
+        assert_eq!(pbs[1].signed_value(), -8192);
+        assert!(!pbs[1].is_centre());
+    }
+
+    #[test]
+    fn pitch_bends_low_nibble_decodes_channel_index() {
+        // EF 40 60 → channel 15; value (0x60<<7)|0x40 = 0x3040.
+        let events: Vec<u8> = vec![0x00, 0xEF, 0x40, 0x60, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pbs = smf.pitch_bends();
+        assert_eq!(pbs.len(), 1);
+        assert_eq!(pbs[0].channel(), 15);
+        assert_eq!(pbs[0].value(), 0x3040);
+        assert_eq!(pbs[0].signed_value(), 0x3040 - 0x2000);
+    }
+
+    #[test]
+    fn pitch_bends_running_status_chain_decodes_each_bend() {
+        // Running-status reuse — En is a two-data-byte status so each
+        // running-status frame supplies *two* bytes (`lsb` + `msb`).
+        // delta=0 E0 00 40  (set status; channel 0, centre 0x2000)
+        // delta=0    00 20  (running status — 0x1000)
+        // delta=0    7F 5F  (running status — 0x2FFF)
+        // delta=0 FF 2F 00
+        let events: Vec<u8> = vec![
+            0x00, 0xE0, 0x00, 0x40, 0x00, 0x00, 0x20, 0x00, 0x7F, 0x5F, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pbs = smf.pitch_bends();
+        assert_eq!(pbs.len(), 3);
+        assert_eq!(pbs[0].value, 0x2000);
+        assert_eq!(pbs[1].value, 0x1000);
+        assert_eq!(pbs[2].value, (0x5F << 7) | 0x7F);
+        for pb in &pbs {
+            assert_eq!(pb.channel, 0);
+        }
+    }
+
+    #[test]
+    fn pitch_bends_late_position_tracks_absolute_tick() {
+        // Bend after a 240-tick rest — surfaced at tick 240, not zero.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&encode_vlq(240));
+        events.extend_from_slice(&[0xE2, 0x00, 0x30]); // bend on ch 2 → 0x1800
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pbs = smf.pitch_bends();
+        assert_eq!(pbs.len(), 1);
+        assert_eq!(pbs[0].tick, 240);
+        assert_eq!(pbs[0].channel, 2);
+        assert_eq!(pbs[0].value, 0x1800);
+    }
+
+    #[test]
+    fn pitch_bends_stable_sort_keeps_track0_before_track1_at_same_tick() {
+        // Two format-1 tracks both with a bend at tick 0 — stable sort
+        // keeps track 0 before track 1.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xE0, 0x00, 0x10]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&[0x00, 0xE1, 0x00, 0x70]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let pbs = smf.pitch_bends();
+        assert_eq!(pbs.len(), 2);
+        assert_eq!(pbs[0].track, 0);
+        assert_eq!(pbs[0].channel, 0);
+        assert_eq!(pbs[0].value, 0x0800);
+        assert_eq!(pbs[1].track, 1);
+        assert_eq!(pbs[1].channel, 1);
+        assert_eq!(pbs[1].value, 0x3800);
+    }
+
+    #[test]
+    fn pitch_bends_merge_across_tracks_sorted_by_tick() {
+        // Track 0 at tick 100, track 1 at tick 50 — sort drops the
+        // track-1 entry first.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(100));
+        t0.extend_from_slice(&[0xE0, 0x00, 0x10]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(50));
+        t1.extend_from_slice(&[0xE1, 0x00, 0x70]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let pbs = smf.pitch_bends();
+        assert_eq!(pbs.len(), 2);
+        assert_eq!(pbs[0].tick, 50);
+        assert_eq!(pbs[0].track, 1);
+        assert_eq!(pbs[0].channel, 1);
+        assert_eq!(pbs[0].value, 0x3800);
+        assert_eq!(pbs[1].tick, 100);
+        assert_eq!(pbs[1].track, 0);
+        assert_eq!(pbs[1].channel, 0);
+        assert_eq!(pbs[1].value, 0x0800);
+    }
+
+    #[test]
+    fn pitch_bends_filter_excludes_other_channel_voice_kinds() {
+        // En picked up; note-on / note-off / CC / program / aftertouch
+        // all filtered out. Sibling helpers stay uncontaminated.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // note on
+        events.extend_from_slice(&[0x00, 0xB0, 0x07, 0x50]); // CC vol
+        events.extend_from_slice(&[0x00, 0xC0, 0x05]); // program change
+        events.extend_from_slice(&[0x00, 0xE0, 0x00, 0x50]); // pitch bend → 0x2800
+        events.extend_from_slice(&[0x00, 0xA0, 0x3C, 0x20]); // poly AT
+        events.extend_from_slice(&[0x00, 0xD0, 0x40]); // channel AT
+        events.extend_from_slice(&[0x00, 0x80, 0x3C, 0x40]); // note off
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pbs = smf.pitch_bends();
+        assert_eq!(pbs.len(), 1);
+        assert_eq!(pbs[0].channel, 0);
+        assert_eq!(pbs[0].value, 0x2800);
+    }
+
+    #[test]
+    fn pitch_bends_seek_initialisation_matches_channel_snapshot() {
+        // The snapshot folds the *last* En before the seek tick into
+        // SmfChannelSnapshot::pitch_bend; pitch_bends() exposes the full
+        // automation timeline. Verify the two agree at every change
+        // point and at a mid-way tick.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xE0, 0x00, 0x10]); // tick 0 → 0x0800
+        events.extend_from_slice(&encode_vlq(100));
+        events.extend_from_slice(&[0xE0, 0x00, 0x40]); // tick 100 → 0x2000 centre
+        events.extend_from_slice(&encode_vlq(100));
+        events.extend_from_slice(&[0xE0, 0x7F, 0x7F]); // tick 200 → 0x3FFF
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pbs = smf.pitch_bends();
+        assert_eq!(pbs.len(), 3);
+        for pb in &pbs {
+            let snap = smf.channel_snapshot_at(0, pb.tick);
+            assert_eq!(
+                snap.pitch_bend, pb.value,
+                "snapshot at tick {} should resolve to pitch_bend {:#06X}",
+                pb.tick, pb.value
+            );
+        }
+        // Mid-way between changes the snapshot still reports the most
+        // recent bend selected.
+        let snap_mid = smf.channel_snapshot_at(0, 150);
+        assert_eq!(snap_mid.pitch_bend, 0x2000);
+    }
+
+    #[test]
+    fn pitch_bends_to_bytes_round_trip() {
+        // Bend stream survives a to_bytes() / parse() round trip.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xE0, 0x00, 0x00]); // min
+        events.extend_from_slice(&[0x00, 0xE0, 0x00, 0x40]); // centre
+        events.extend_from_slice(&[0x00, 0xE0, 0x7F, 0x7F]); // max
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let original = smf.pitch_bends();
+        assert_eq!(original.len(), 3);
+        let muxed = smf.to_bytes().unwrap();
+        let reparsed = parse(&muxed).unwrap();
+        let after = reparsed.pitch_bends();
         assert_eq!(original, after);
     }
 }
