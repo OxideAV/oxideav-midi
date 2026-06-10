@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 275 — `SmfFile::channel_pressures()` — Dn-pp channel-voice mono-aftertouch iteration helper
+
+- New `SmfFile::channel_pressures(&self) -> Vec<ChannelPressureEvent>`
+  surfaces every `Dn pp` Channel Pressure (mono aftertouch)
+  channel-voice event on every track, pinned to the absolute tick at
+  which it fires, in time order. Each entry is a
+  `ChannelPressureEvent { tick, track, channel, pressure }` with the
+  status nibble's low four bits decoded into the spec's `0..=15`
+  channel index and the single data byte `pp` (`0..=127`) carrying
+  "the single greatest pressure value (of all the current depressed
+  keys)" per the MIDI 1.0 *Summary of MIDI Messages* Table 1.
+- The new `ChannelPressureEvent` struct exposes `channel()` /
+  `pressure()` accessors. The helper stays routing-agnostic — the
+  pressure value's musical effect (volume / vibrato depth / filter
+  cutoff) is left to the receiving instrument.
+- Only `Dn` is selected; polyphonic key pressure (`An`, per-key) keeps
+  its own surface, and the neighbouring CC (`Bn`) / program (`Cn`) /
+  pitch-bend (`En`) / note (`8n` / `9n`) channel-voice events stay
+  isolated. Per-track sequences are stably merged by absolute tick
+  (track 0 before track 1 at the same tick), the same convention as
+  every meta-event, SysEx, and channel-voice helper.
+- 8 new unit tests cover tick-zero decode, channel-index nibble,
+  running-status chains (single-data-byte status), late-position
+  absolute tick, stable same-tick cross-track sort, cross-track tick
+  merge, cross-kind filtering, and a `to_bytes()` / `parse` round trip.
+
 ### Round 267 — `SmfFile::pitch_bends()` — En-lsb-msb channel-voice pitch-bend iteration helper
 
 - New `SmfFile::pitch_bends(&self) -> Vec<PitchBendEvent>` surfaces

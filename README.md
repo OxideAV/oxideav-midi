@@ -439,6 +439,26 @@ framework but usable standalone.
   initialisation: where the snapshot answers "what is the wheel
   position on channel N at tick T?", `pitch_bends()` answers "give me
   every bend in song order" — a DAW bend-lane editor reads the latter.
+  Round 275 extends the channel-voice typed-iterator family with
+  `SmfFile::channel_pressures() -> Vec<ChannelPressureEvent>`: every
+  `Dn pp` Channel Pressure (mono aftertouch) on every track, pinned to
+  the absolute tick at which it fires, with the channel index plus the
+  single pressure byte surfaced as a `ChannelPressureEvent { tick,
+  track, channel, pressure }`. Per the MIDI 1.0 *Summary of MIDI
+  Messages* Table 1, status nibble `1101` carries one data byte `pp`
+  (`0..=127`) holding "the single greatest pressure value (of all the
+  current depressed keys)" — distinct from polyphonic key pressure
+  (`An`, per-key), which keeps its own surface. The status nibble's low
+  four bits decode to the spec's `0..=15` channel index;
+  `ChannelPressureEvent::channel()` / `pressure()` surface the decoded
+  fields. The pressure value's musical effect (typically routed to
+  volume, vibrato depth, or filter cutoff by the receiving instrument)
+  is the receiver's concern, so the helper stays routing-agnostic and
+  surfaces the raw `0..=127` byte. Per-track sequences are stably
+  merged by absolute tick — track 0's events fire before track 1's at
+  the same tick — the same convention used by every meta-event, SysEx,
+  and channel-voice helper. A round-trip through `to_bytes()` / `parse`
+  preserves the stream byte-for-byte.
   Round 234 closes the SMF read-vs-write asymmetry: the parser
   has always materialised the full event vocabulary (`Channel`,
   `Sysex`, `Meta`), and round 234 adds the matching writer.
