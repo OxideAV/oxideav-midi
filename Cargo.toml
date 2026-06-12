@@ -15,3 +15,7 @@ categories = ["multimedia::audio", "multimedia::encoding"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[[bench]]
+name = "synth_render"
+harness = false

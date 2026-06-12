@@ -1712,6 +1712,91 @@ impl Sf2Voice {
         self.sustain_level
     }
 
+    /// Fill `buf[k]` with the volume-envelope value at output frame
+    /// `t0 + k` for every `k`, producing exactly the same values as
+    /// calling [`Self::envelope_at`] once per sample. The render loop
+    /// is serial (the phase walk is a loop-carried dependency), so
+    /// evaluating the envelope inline forced the whole DAHDSR stage
+    /// walk — an `Option` test plus up to four stage comparisons and
+    /// an f32 divide — onto every output sample. Profiling (round
+    /// 285) put that walk at ~31 % of the SMF→PCM wall clock. Here
+    /// the evaluation is segmented into per-stage runs instead:
+    /// constant stages (delay / hold / sustain) become `fill`s, and
+    /// the ramp stages (attack / decay / release) become element-wise
+    /// loops with no loop-carried dependency, which the compiler can
+    /// vectorise. Every per-sample expression is kept verbatim from
+    /// `envelope_at`, so the output is bit-identical.
+    fn envelope_run(&self, t0: u32, buf: &mut [f32]) {
+        // `elapsed` wraps at u32::MAX (~27 h of continuous output at
+        // 44.1 kHz). Runs that would cross the wrap point fall back to
+        // the scalar evaluator so the wrapped comparisons stay exact.
+        if t0 as u64 + buf.len() as u64 > u32::MAX as u64 {
+            for (k, slot) in buf.iter_mut().enumerate() {
+                *slot = self.envelope_at(t0.wrapping_add(k as u32));
+            }
+            return;
+        }
+        // Release: dominant once the note has been lifted.
+        if let Some(rel_at) = self.release_pos {
+            let den = self.release_samples.max(1) as f32;
+            let start = self.release_start_level;
+            for (k, slot) in buf.iter_mut().enumerate() {
+                let since = (t0 + k as u32).saturating_sub(rel_at);
+                *slot = if since >= self.release_samples {
+                    0.0
+                } else {
+                    let x = since as f32 / den;
+                    start * ((1.0 - x) * (1.0 - x))
+                };
+            }
+            return;
+        }
+        // Held note: segment `t0 .. t0 + buf.len()` into the DAHDS
+        // stages. Boundaries are widened to u64 so the absolute
+        // comparisons match `envelope_at`'s chained subtractions even
+        // when the stage sums exceed u32::MAX.
+        let b_delay = self.delay_samples as u64;
+        let b_attack = b_delay + self.attack_samples as u64;
+        let b_hold = b_attack + self.hold_samples as u64;
+        let b_decay = b_hold + self.decay_samples as u64;
+        let att_den = self.attack_samples.max(1) as f32;
+        let dec_den = self.decay_samples.max(1) as f32;
+        let drop = 1.0 - self.sustain_level;
+        let n = buf.len();
+        let mut k = 0usize;
+        while k < n {
+            let t = t0 as u64 + k as u64;
+            if t < b_delay {
+                let run = (b_delay - t).min((n - k) as u64) as usize;
+                buf[k..k + run].fill(0.0);
+                k += run;
+            } else if t < b_attack {
+                let run = (b_attack - t).min((n - k) as u64) as usize;
+                let base = (t - b_delay) as u32;
+                for (j, slot) in buf[k..k + run].iter_mut().enumerate() {
+                    *slot = (base + j as u32) as f32 / att_den;
+                }
+                k += run;
+            } else if t < b_hold {
+                let run = (b_hold - t).min((n - k) as u64) as usize;
+                buf[k..k + run].fill(1.0);
+                k += run;
+            } else if t < b_decay {
+                let run = (b_decay - t).min((n - k) as u64) as usize;
+                let base = (t - b_hold) as u32;
+                for (j, slot) in buf[k..k + run].iter_mut().enumerate() {
+                    let x = (base + j as u32) as f32 / dec_den;
+                    let curve = 1.0 - (1.0 - x) * (1.0 - x);
+                    *slot = 1.0 - drop * curve;
+                }
+                k += run;
+            } else {
+                buf[k..n].fill(self.sustain_level);
+                k = n;
+            }
+        }
+    }
+
     /// Sample one PCM frame at fractional index `phase` (linear
     /// interpolation). Returns 0.0 if `phase` is out of bounds. The
     /// sample buffer holds signed 24-bit values in i32; the conversion
@@ -1836,85 +1921,98 @@ impl BiquadState {
     }
 }
 
+/// Samples per [`Sf2Voice::envelope_run`] burst inside `render` — a
+/// stack scratch small enough to stay cache-hot, large enough to
+/// amortise the stage segmentation across a useful vector run.
+const ENV_RUN: usize = 256;
+
 impl Voice for Sf2Voice {
     fn render(&mut self, out: &mut [f32]) -> usize {
         if self.done {
             return 0;
         }
-        for (i, slot) in out.iter_mut().enumerate() {
-            let env = self.envelope_at(self.elapsed);
-            // Envelope ran fully out post-release? Voice is done.
-            if self.release_pos.is_some() && env <= 0.0 {
-                self.done = true;
-                return i;
-            }
-
-            // Apply mod-env to pitch / filter cutoff. We re-derive the
-            // playback rate every sample only when the mod-env routes
-            // to pitch — most banks don't, so the common path stays
-            // multiplication-only.
-            let mod_lvl = if self.mod_env_to_pitch_cents != 0 || self.filter.is_some() {
-                self.mod_env_at(self.elapsed)
-            } else {
-                0.0
-            };
-            if self.mod_env_to_pitch_cents != 0 {
-                let pitch_cents =
-                    self.pitch_bend_cents + (mod_lvl * self.mod_env_to_pitch_cents as f32) as i32;
-                let bend_ratio = (2.0f64).powf(pitch_cents as f64 / 1200.0);
-                self.phase_inc = self.base_phase_inc * bend_ratio;
-            }
-            // Filter cutoff modulation: only recompute coefficients
-            // when the cutoff drifts more than ~50 cents from the last
-            // computed value (cheap perceptual gate).
-            if self.filter.is_some() {
-                let target = self.initial_filter_fc_cents
-                    + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32;
-                let last = self
-                    .filter
-                    .as_ref()
-                    .map(|f| f.last_cutoff_cents)
-                    .unwrap_or(i32::MIN);
-                // Saturating subtraction so the i32::MIN sentinel
-                // (used to force a first-call computation) doesn't
-                // wrap around when subtracted from a positive target.
-                if target.saturating_sub(last).saturating_abs() > 50 {
-                    self.update_filter_coeffs(target, self.output_rate);
+        let total = out.len();
+        let mut env_buf = [0.0f32; ENV_RUN];
+        let mut base = 0usize;
+        while base < total {
+            let n = (total - base).min(ENV_RUN);
+            self.envelope_run(self.elapsed, &mut env_buf[..n]);
+            let chunk = &mut out[base..base + n];
+            for (j, (slot, &env)) in chunk.iter_mut().zip(&env_buf[..n]).enumerate() {
+                // Envelope ran fully out post-release? Voice is done.
+                if self.release_pos.is_some() && env <= 0.0 {
+                    self.done = true;
+                    return base + j;
                 }
-            }
 
-            // If we've walked off the end of the (non-looping) sample
-            // and the user hasn't released us, mark done — there's no
-            // signal to produce.
-            if self.phase >= self.end as f64 {
-                if self.loops {
-                    // Wrap to the loop start, preserving the fractional
-                    // overshoot so a 1.5-frame overshoot lands at
-                    // start_loop + 0.5.
+                // Apply mod-env to pitch / filter cutoff. We re-derive the
+                // playback rate every sample only when the mod-env routes
+                // to pitch — most banks don't, so the common path stays
+                // multiplication-only.
+                let mod_lvl = if self.mod_env_to_pitch_cents != 0 || self.filter.is_some() {
+                    self.mod_env_at(self.elapsed)
+                } else {
+                    0.0
+                };
+                if self.mod_env_to_pitch_cents != 0 {
+                    let pitch_cents = self.pitch_bend_cents
+                        + (mod_lvl * self.mod_env_to_pitch_cents as f32) as i32;
+                    let bend_ratio = (2.0f64).powf(pitch_cents as f64 / 1200.0);
+                    self.phase_inc = self.base_phase_inc * bend_ratio;
+                }
+                // Filter cutoff modulation: only recompute coefficients
+                // when the cutoff drifts more than ~50 cents from the last
+                // computed value (cheap perceptual gate).
+                if self.filter.is_some() {
+                    let target = self.initial_filter_fc_cents
+                        + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32;
+                    let last = self
+                        .filter
+                        .as_ref()
+                        .map(|f| f.last_cutoff_cents)
+                        .unwrap_or(i32::MIN);
+                    // Saturating subtraction so the i32::MIN sentinel
+                    // (used to force a first-call computation) doesn't
+                    // wrap around when subtracted from a positive target.
+                    if target.saturating_sub(last).saturating_abs() > 50 {
+                        self.update_filter_coeffs(target, self.output_rate);
+                    }
+                }
+
+                // If we've walked off the end of the (non-looping) sample
+                // and the user hasn't released us, mark done — there's no
+                // signal to produce.
+                if self.phase >= self.end as f64 {
+                    if self.loops {
+                        // Wrap to the loop start, preserving the fractional
+                        // overshoot so a 1.5-frame overshoot lands at
+                        // start_loop + 0.5.
+                        let over = self.phase - self.end_loop as f64;
+                        let loop_len = (self.end_loop as f64 - self.start_loop as f64).max(1.0);
+                        let wrapped = over.rem_euclid(loop_len);
+                        self.phase = self.start_loop as f64 + wrapped;
+                    } else {
+                        self.done = true;
+                        return base + j;
+                    }
+                } else if self.loops && self.phase >= self.end_loop as f64 {
                     let over = self.phase - self.end_loop as f64;
                     let loop_len = (self.end_loop as f64 - self.start_loop as f64).max(1.0);
                     let wrapped = over.rem_euclid(loop_len);
                     self.phase = self.start_loop as f64 + wrapped;
-                } else {
-                    self.done = true;
-                    return i;
                 }
-            } else if self.loops && self.phase >= self.end_loop as f64 {
-                let over = self.phase - self.end_loop as f64;
-                let loop_len = (self.end_loop as f64 - self.start_loop as f64).max(1.0);
-                let wrapped = over.rem_euclid(loop_len);
-                self.phase = self.start_loop as f64 + wrapped;
-            }
 
-            let mut s = self.fetch(self.phase);
-            if self.filter.is_some() {
-                s = self.filter_step(0, s);
+                let mut s = self.fetch(self.phase);
+                if self.filter.is_some() {
+                    s = self.filter_step(0, s);
+                }
+                *slot = s * env * self.amplitude * self.pressure_gain;
+                self.phase += self.phase_inc;
+                self.elapsed = self.elapsed.wrapping_add(1);
             }
-            *slot = s * env * self.amplitude * self.pressure_gain;
-            self.phase += self.phase_inc;
-            self.elapsed = self.elapsed.wrapping_add(1);
+            base += n;
         }
-        out.len()
+        total
     }
 
     fn release(&mut self) {
@@ -3691,5 +3789,84 @@ mod tests {
         // the value isn't exactly zero. Just assert at least one
         // rendered sample is non-zero (proves the fetch path runs).
         assert!(buf.iter().any(|s| s.abs() > 0.0), "voice rendered silence");
+    }
+
+    /// Bit-identity contract for the round-285 envelope optimization:
+    /// the run-segmented evaluator must produce exactly the same f32
+    /// (compared via `to_bits`) as the per-sample stage walk for every
+    /// frame, across every DAHDSR stage boundary, in the release tail,
+    /// and through the `elapsed` wrap fallback.
+    #[test]
+    fn envelope_run_matches_envelope_at_per_sample() {
+        // Timecents chosen so every stage lands on awkward, non-round
+        // sample counts at 44 100 Hz: delay ≈ 441, attack ≈ 3 277,
+        // hold ≈ 1 378, decay ≈ 13 891, release ≈ 7 796 frames.
+        let plan = SamplePlan {
+            start: 0,
+            end: 20,
+            start_loop: 0,
+            end_loop: 20,
+            sample_rate: 22_050,
+            loops: true,
+            pitch_ratio: 1.0,
+            semitones: 0,
+            fine_cents: 0,
+            env: EnvParams {
+                delay_tc: -7973,
+                attack_tc: -4500,
+                hold_tc: -6000,
+                decay_tc: -2000,
+                sustain_cb: 200,
+                release_tc: -3000,
+            },
+            mod_env: ModEnvParams::default(),
+            mod_env_to_pitch_cents: 0,
+            mod_env_to_filter_cents: 0,
+            initial_filter_fc_cents: 13_500,
+            initial_filter_q_cb: 0,
+            initial_attenuation_cb: 0,
+            exclusive_class: 0,
+            stereo_pair: None,
+        };
+        let data: Arc<[i32]> = Arc::from(vec![0i32; 32].into_boxed_slice());
+        let mut v = Sf2Voice::from_plan(data, &plan, 100, 44_100);
+
+        // Odd burst length so run boundaries land mid-stage/mid-buffer.
+        let mut buf = [0.0f32; 173];
+        let mut check_span = |v: &Sf2Voice, from: u32, to: u32| {
+            let mut t = from;
+            while t < to {
+                let n = buf.len().min((to - t) as usize);
+                v.envelope_run(t, &mut buf[..n]);
+                for (k, &got) in buf[..n].iter().enumerate() {
+                    let want = v.envelope_at(t + k as u32);
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "held/released env diverged at t={}",
+                        t + k as u32
+                    );
+                }
+                t += n as u32;
+            }
+        };
+
+        // Held note: delay → attack → hold → decay → sustain.
+        check_span(&v, 0, 40_000);
+
+        // Release from mid-decay, walked past the release end (both
+        // evaluators must agree on the 0.0 tail too).
+        v.elapsed = 9_000;
+        v.release();
+        check_span(&v, 9_000, 20_000);
+
+        // Wrap fallback: a run crossing u32::MAX must match the scalar
+        // walk on the wrapped counter.
+        let t0 = u32::MAX - 50;
+        v.envelope_run(t0, &mut buf);
+        for (k, &got) in buf.iter().enumerate() {
+            let want = v.envelope_at(t0.wrapping_add(k as u32));
+            assert_eq!(got.to_bits(), want.to_bits(), "wrap env diverged at k={k}");
+        }
     }
 }

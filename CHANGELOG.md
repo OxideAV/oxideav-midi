@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 285 — synthesis profiling + run-segmented volume envelope (bit-identical, ~20 % faster)
+
+- New `benches/synth_render.rs` (`harness = false`) — repeatable
+  SMF→PCM wall-clock harness: dense 8-channel / 32-voice score with
+  pitch-bend sweeps + volume/pan CCs rendered through an in-memory
+  looping SF2 bank. `--corpus` hashes (FNV-1a-64) the PCM for every
+  in-tree fixture SMF through both the SF2 bank and the tone
+  fallback; `--spin SECS` loops the render as a sampling-profiler
+  target; default mode prints per-iteration wall time + output hash.
+- Profiling ranked `Sf2Voice::render` at ~89 % of the synthesis wall
+  clock; within it the per-sample DAHDSR volume-envelope stage walk
+  (an `Option` test + up to four stage comparisons + an f32 divide,
+  serialised behind the phase walk) at ~31 % of total, ahead of
+  sample fetch + linear interpolation (~15 %).
+- `Sf2Voice::render` now evaluates the volume envelope in
+  stage-segmented runs (`envelope_run`) into a 256-entry stack
+  buffer: delay / hold / sustain become slice fills, attack / decay /
+  release become element-wise loops with no loop-carried dependency
+  that the compiler vectorises. Every per-sample expression is kept
+  verbatim from `envelope_at`, so the rendered PCM is bit-identical —
+  corpus hashes are unchanged and the new
+  `envelope_run_matches_envelope_at_per_sample` test pins
+  `to_bits()` equality across stage boundaries, the release tail,
+  and the `elapsed`-wrap fallback. Dense-score render: 80.2 ms →
+  64.2 ms (-20 %) on an Apple-silicon dev box.
+
 ### Round 275 — `SmfFile::channel_pressures()` — Dn-pp channel-voice mono-aftertouch iteration helper
 
 - New `SmfFile::channel_pressures(&self) -> Vec<ChannelPressureEvent>`

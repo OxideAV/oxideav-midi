@@ -796,3 +796,29 @@ sf2 / dls and 2 M across sfz with zero remaining crashes. The
 single round-172 finding (overflow in the SFZ key-name octave
 multiplication) was fixed in-place and pinned by a new
 `parse_key_octave_extremes_do_not_overflow` unit test.
+
+## Profiling
+
+Round 285 adds `benches/synth_render.rs` (`harness = false`) — a
+repeatable SMF→PCM wall-clock harness over a dense 8-channel /
+32-voice score (24 s of music, pitch-bend sweeps, volume + pan CCs)
+rendered through an in-memory looping SF2 bank, plus a `--corpus`
+mode that hashes (FNV-1a-64) the PCM produced for every in-tree
+fixture SMF through both the SF2 bank and the tone fallback, and a
+`--spin SECS` mode that loops the render as a stable sampling-profiler
+target.
+
+Profiling that harness put `Sf2Voice::render` at ~89 % of the wall
+clock, and within it the per-sample DAHDSR volume-envelope stage walk
+at ~31 % of the total (sample fetch + linear interpolation ~15 %).
+The envelope is now evaluated in stage-segmented runs into a 256-entry
+stack buffer (`envelope_run`): constant stages (delay / hold /
+sustain) become slice fills and the ramp stages (attack / decay /
+release) become element-wise loops with no loop-carried dependency,
+which the compiler vectorises (NEON `fdiv.4s` on aarch64). Every
+per-sample expression is kept verbatim from the scalar evaluator, so
+the rendered PCM is **bit-identical** (corpus hashes unchanged; the
+`envelope_run_matches_envelope_at_per_sample` unit test pins
+`to_bits()` equality across all stage boundaries, the release tail,
+and the `elapsed`-wrap fallback). Dense-score render time: 80.2 ms →
+64.2 ms (-20 %) on an Apple-silicon dev box.
