@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-midi/compare/v0.0.3...v0.0.4) - 2026-06-12
+
+### Other
+
+- run-segmented volume-envelope evaluation — bit-identical, ~20% faster SMF→PCM synthesis
+- add SmfFile::channel_pressures() — Dn-pp mono-aftertouch iteration helper
+- SMF SmfFile::pitch_bends() — En-lsb-msb channel-voice pitch-bend iteration helper
+- SmfFile::control_changes() — Bn-cc-vv channel-voice continuous-controller / channel-mode iteration helper
+- SmfFile::program_changes() — Cn-pp channel-voice patch-select iteration helper
+- SmfFile::universal_sysex_events() — Table-4-classified file-wide iteration helper
+- SysExEvent::universal_classification() — Table 4 Universal SysEx classifier
+- SmfFile::sysex_events() iteration helper (F0 / F7)
+- SmfFile::channel_prefixes() iteration helper (FF 20 01 cc)
+- SmfFile::to_bytes() / Track::to_bytes_chunk() mux-side writer
+- SmfFile::midi_ports() iteration helper (FF 21 01 pp)
+- SmfFile::sequence_numbers() iteration helper (FF 00 02 ssss)
+- SmfFile::sequencer_specifics() iteration helper (FF 7F)
+- SmfFile::channel_snapshot_at / channel_snapshots_at (channel-state seek primitive)
+- SmfFile::smpte_offsets() iteration helper + FrameRate decoder (FF 54)
+- SmfFile::texts() + copyrights() iteration helpers (FF 01 + FF 02)
+- SmfFile::instrument_names() iteration helper (FF 04)
+
 ### Round 285 — synthesis profiling + run-segmented volume envelope (bit-identical, ~20 % faster)
 
 - New `benches/synth_render.rs` (`harness = false`) — repeatable
