@@ -1555,6 +1555,96 @@ impl ChannelPressureEvent {
     }
 }
 
+/// One sounding-note span — a Note On (`9n key vel`, `vel > 0`) matched
+/// with the Note Off that releases it — pinned to the absolute ticks at
+/// which the key is struck and released.
+///
+/// Returned by [`SmfFile::notes`]. Where the channel-voice helpers
+/// ([`SmfFile::program_changes`], [`SmfFile::control_changes`],
+/// [`SmfFile::pitch_bends`], [`SmfFile::channel_pressures`]) surface one
+/// value per *wire* event, this helper pairs the two wire events that
+/// bracket a sounding note into a single span carrying the note's
+/// duration — the primitive a piano-roll / DAW note-lane view consumes
+/// directly without re-deriving on/off pairing.
+///
+/// Per the MIDI 1.0 *Summary of MIDI Messages* Table 1, a Note On is
+/// status nibble `1001` with data bytes `kkkkkkk` (key) + `vvvvvvv`
+/// (velocity), and a Note Off is status nibble `1000` with the same two
+/// data bytes. By the long-standing spec convention a Note On with
+/// velocity `0` is treated as a Note Off (the "running-status
+/// optimisation" that lets a stream of notes share one `9n` status
+/// byte); [`SmfFile::notes`] honours that convention when matching, so a
+/// `9n key 0` releases an open note exactly as an `8n key xx` would.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Note {
+    /// Absolute tick (cumulative delta-sum on the global merged
+    /// timebase) at which the Note On fires. For format-1 SMFs every
+    /// track shares one timebase, so this is directly comparable across
+    /// tracks; for format-0 there is a single track.
+    pub start_tick: u64,
+    /// Absolute tick at which the matching Note Off fires.
+    /// `end_tick >= start_tick` always holds (a Note Off can land on the
+    /// same tick as its Note On — a zero-duration note — but never
+    /// before it, since the pairing walks events in non-decreasing tick
+    /// order).
+    pub end_tick: u64,
+    /// Index of the [`Track`] that carried the Note On (within
+    /// [`SmfFile::tracks`]). The matching Note Off is conventionally on
+    /// the same track, but the pairing is keyed on `(channel, key)` over
+    /// the *globally* merged stream so a Note Off on a different track
+    /// still closes the note; this field records where the note *began*.
+    pub track: usize,
+    /// The MIDI channel the note sounds on, in the spec's `0..=15` range
+    /// (channel "1" in human-facing tools is index `0`). Decoded from
+    /// the low nibble of the `9n` / `8n` status byte.
+    pub channel: u8,
+    /// The key (note) number `0..=127`, where `60` is Middle C. The
+    /// single wire data byte carries 7 significant bits.
+    pub key: u8,
+    /// The Note On velocity `1..=127` — the attack strength. A velocity
+    /// of `0` never appears here: a `9n key 0` is the Note-Off form and
+    /// closes an open note rather than opening one.
+    pub velocity: u8,
+    /// The Note Off velocity `0..=127` — the release strength. An `8n`
+    /// Note Off carries an explicit release velocity in its second data
+    /// byte; a `9n key 0` Note-Off form has no release velocity, so this
+    /// is `0` for notes closed by the velocity-0 convention. Most
+    /// receivers ignore release velocity, but it is preserved here for
+    /// callers that drive a release-sensitive instrument.
+    pub off_velocity: u8,
+}
+
+impl Note {
+    /// The MIDI channel index in the spec's `0..=15` range.
+    pub fn channel(&self) -> u8 {
+        self.channel
+    }
+
+    /// The key (note) number `0..=127`.
+    pub fn key(&self) -> u8 {
+        self.key
+    }
+
+    /// The Note On (attack) velocity `1..=127`.
+    pub fn velocity(&self) -> u8 {
+        self.velocity
+    }
+
+    /// The Note Off (release) velocity `0..=127` (`0` when the note was
+    /// closed by the `9n key 0` velocity-0 convention).
+    pub fn off_velocity(&self) -> u8 {
+        self.off_velocity
+    }
+
+    /// The note's duration in division ticks: `end_tick - start_tick`.
+    /// Always non-negative (the pairing closes a note only with a
+    /// release at or after its onset). A zero-duration note is possible
+    /// when a Note Off lands on the same tick as the Note On.
+    pub fn duration_ticks(&self) -> u64 {
+        self.end_tick - self.start_tick
+    }
+}
+
 /// One System Exclusive event pinned to the absolute tick (relative
 /// to the start of its parent track) at which the [`F0`](Event::Sysex)
 /// (start) or [`F7`](Event::Sysex) (continuation / escape) wire event
@@ -3716,6 +3806,167 @@ impl SmfFile {
         // track 1 at the same tick — matches the scheduler's merge
         // convention).
         out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Pair every Note On (`9n key vel`, `vel > 0`) with the Note Off
+    /// that releases it, returning one [`Note`] span per sounding note,
+    /// in onset order.
+    ///
+    /// Where the channel-voice helpers ([`SmfFile::program_changes`] /
+    /// [`SmfFile::control_changes`] / [`SmfFile::pitch_bends`] /
+    /// [`SmfFile::channel_pressures`]) surface one value per *wire*
+    /// event, this helper joins the two wire events that bracket a
+    /// sounding note — its Note On and its Note Off — into a single span
+    /// carrying the note's `start_tick`, `end_tick`, and (via
+    /// [`Note::duration_ticks`]) its length. That is the primitive a
+    /// piano-roll / DAW note-lane view consumes directly.
+    ///
+    /// **Merge + tie-break.** Events are walked over the *globally*
+    /// merged stream sorted by `(absolute tick, track, in-track
+    /// position)` — the same stable-merge convention every other
+    /// iteration helper and the scheduler use (`scheduler.rs` §"merged
+    /// event list, sorted by absolute tick"). This matters because a
+    /// note's Note Off can, in principle, land on a different track from
+    /// its Note On; matching over the merged stream pairs them
+    /// correctly. The returned `Vec` is ordered by `(start_tick, track,
+    /// in-track position)` so two notes struck on the same tick keep
+    /// track 0 before track 1, then on-disk order within a track.
+    ///
+    /// **On/off matching.** A note is opened on a `9n key vel` with
+    /// `vel > 0` and closed by the *next* release for the same
+    /// `(channel, key)`. A release is either an `8n key off_vel` (the
+    /// explicit Note-Off form, whose second data byte becomes
+    /// [`Note::off_velocity`]) or a `9n key 0` — the velocity-0
+    /// convention from the MIDI 1.0 *Summary of MIDI Messages* Table 1,
+    /// which closes the note with `off_velocity == 0`. When several
+    /// notes of the same pitch on the same channel are held at once
+    /// (re-struck before release), releases are matched **first-in,
+    /// first-out**: the earliest still-open onset is the one closed.
+    ///
+    /// **Unmatched events.** A release with no open note of that
+    /// `(channel, key)` is dropped (an interpreter has nothing to turn
+    /// off). A Note On with no matching release before end-of-file is
+    /// dropped from the returned list — a span needs both ends to carry
+    /// a duration; callers needing the dangling onsets can read the raw
+    /// note events through the channel stream. (Well-formed SMFs balance
+    /// every Note On with a Note Off; a hanging note is a producer bug,
+    /// and most receivers silence it at end-of-track.)
+    ///
+    /// Returns an empty `Vec` for a file with no note activity (e.g. a
+    /// tempo-map-only conductor track). Cost is `O(n log n)` in the
+    /// total event count for the merge sort, bounded above by
+    /// [`MAX_EVENTS_PER_FILE`] (the same cap the parser enforces).
+    pub fn notes(&self) -> Vec<Note> {
+        // Walk the globally merged stream in (tick, track, order) so a
+        // Note Off on a different track from its Note On still pairs.
+        // Each entry records the channel-voice body plus its origin so
+        // the resulting Note carries the onset track.
+        struct AbsNote<'a> {
+            tick: u64,
+            track: usize,
+            order: usize,
+            body: &'a ChannelBody,
+            channel: u8,
+        }
+        let mut merged: Vec<AbsNote> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for (order, ev) in track.events.iter().enumerate() {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Channel(ChannelMessage { channel, body }) = &ev.kind {
+                    if matches!(
+                        body,
+                        ChannelBody::NoteOn { .. } | ChannelBody::NoteOff { .. }
+                    ) {
+                        merged.push(AbsNote {
+                            tick: abs,
+                            track: track_idx,
+                            order,
+                            body,
+                            channel: *channel,
+                        });
+                    }
+                }
+            }
+        }
+        // Stable sort by (tick, track, order) — the scheduler convention.
+        merged.sort_by(|a, b| {
+            a.tick
+                .cmp(&b.tick)
+                .then_with(|| a.track.cmp(&b.track))
+                .then_with(|| a.order.cmp(&b.order))
+        });
+
+        // FIFO of still-open onsets per (channel, key). Each pending
+        // entry keeps the onset's tick / track / velocity so the closed
+        // span can be emitted in full.
+        struct Pending {
+            start_tick: u64,
+            track: usize,
+            velocity: u8,
+        }
+        // 16 channels × 128 keys; lazily-grown FIFO per slot.
+        let mut open: Vec<Vec<Pending>> = (0..(16 * 128)).map(|_| Vec::new()).collect();
+        let slot = |channel: u8, key: u8| -> usize { (channel as usize) * 128 + key as usize };
+
+        let mut out: Vec<Note> = Vec::new();
+        for ev in &merged {
+            match ev.body {
+                ChannelBody::NoteOn { key, velocity } if *velocity > 0 => {
+                    open[slot(ev.channel, *key)].push(Pending {
+                        start_tick: ev.tick,
+                        track: ev.track,
+                        velocity: *velocity,
+                    });
+                }
+                // Note On with velocity 0 is the running-status Note-Off
+                // form: close the earliest open note of this pitch with a
+                // zero release velocity.
+                ChannelBody::NoteOn { key, velocity: _ } => {
+                    let fifo = &mut open[slot(ev.channel, *key)];
+                    if !fifo.is_empty() {
+                        let p = fifo.remove(0);
+                        out.push(Note {
+                            start_tick: p.start_tick,
+                            end_tick: ev.tick,
+                            track: p.track,
+                            channel: ev.channel,
+                            key: *key,
+                            velocity: p.velocity,
+                            off_velocity: 0,
+                        });
+                    }
+                }
+                ChannelBody::NoteOff { key, velocity } => {
+                    let fifo = &mut open[slot(ev.channel, *key)];
+                    if !fifo.is_empty() {
+                        let p = fifo.remove(0);
+                        out.push(Note {
+                            start_tick: p.start_tick,
+                            end_tick: ev.tick,
+                            track: p.track,
+                            channel: ev.channel,
+                            key: *key,
+                            velocity: p.velocity,
+                            off_velocity: *velocity,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Order the result by onset, then by the onset track + a stable
+        // tie-break. Sorting by start_tick alone is unstable across
+        // chord notes that started on the same tick on different tracks,
+        // so include track and the (already in onset order) emission
+        // order to keep track 0 before track 1.
+        out.sort_by(|a, b| {
+            a.start_tick
+                .cmp(&b.start_tick)
+                .then_with(|| a.track.cmp(&b.track))
+        });
         out
     }
 
@@ -10909,5 +11160,277 @@ mod tests {
         let reparsed = parse(&muxed).unwrap();
         let after = reparsed.channel_pressures();
         assert_eq!(original, after);
+    }
+
+    // ----------------------------------------------------------------
+    // notes() — Note On / Note Off pairing into sounding-note spans.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn notes_empty_when_no_note_activity() {
+        // A conductor-only track (tempo + EOT) has no note spans.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]); // tempo
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.notes().is_empty());
+    }
+
+    #[test]
+    fn notes_single_note_pairs_on_and_off() {
+        // 9n 3C 64 at tick 0, 8n 3C 40 at tick 480.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // note on, vel 100
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0x80, 0x3C, 0x40]); // note off, rel-vel 64
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 1);
+        let n = notes[0];
+        assert_eq!(n.start_tick, 0);
+        assert_eq!(n.end_tick, 480);
+        assert_eq!(n.duration_ticks(), 480);
+        assert_eq!(n.track, 0);
+        assert_eq!(n.channel(), 0);
+        assert_eq!(n.key(), 0x3C);
+        assert_eq!(n.velocity(), 100);
+        assert_eq!(n.off_velocity(), 0x40);
+    }
+
+    #[test]
+    fn notes_velocity_zero_note_on_closes_open_note() {
+        // 9n 3C 64 (on) then 9n 3C 00 (the running-status Note-Off form).
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&encode_vlq(240));
+        events.extend_from_slice(&[0x90, 0x3C, 0x00]); // vel-0 = note off
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].start_tick, 0);
+        assert_eq!(notes[0].end_tick, 240);
+        assert_eq!(notes[0].velocity(), 100);
+        // velocity-0 form carries no release velocity.
+        assert_eq!(notes[0].off_velocity(), 0);
+    }
+
+    #[test]
+    fn notes_low_nibble_decodes_channel_index() {
+        // 9F .. on channel 15.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x9F, 0x40, 0x7F]);
+        events.extend_from_slice(&encode_vlq(96));
+        events.extend_from_slice(&[0x8F, 0x40, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].channel(), 15);
+        assert_eq!(notes[0].key(), 0x40);
+        assert_eq!(notes[0].velocity(), 0x7F);
+    }
+
+    #[test]
+    fn notes_overlapping_same_pitch_pair_fifo() {
+        // Two onsets of the same pitch before either releases — the
+        // first release closes the first (earliest) onset (FIFO).
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x50]); // on #1 @0, vel 0x50
+        events.extend_from_slice(&encode_vlq(10));
+        events.extend_from_slice(&[0x90, 0x3C, 0x60]); // on #2 @10, vel 0x60
+        events.extend_from_slice(&encode_vlq(10));
+        events.extend_from_slice(&[0x80, 0x3C, 0x20]); // off @20 → closes #1
+        events.extend_from_slice(&encode_vlq(10));
+        events.extend_from_slice(&[0x80, 0x3C, 0x30]); // off @30 → closes #2
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 2);
+        // Ordered by onset: #1 then #2.
+        assert_eq!(notes[0].start_tick, 0);
+        assert_eq!(notes[0].end_tick, 20);
+        assert_eq!(notes[0].velocity(), 0x50);
+        assert_eq!(notes[1].start_tick, 10);
+        assert_eq!(notes[1].end_tick, 30);
+        assert_eq!(notes[1].velocity(), 0x60);
+    }
+
+    #[test]
+    fn notes_chord_keeps_distinct_pitches() {
+        // Three pitches struck together, released together — three spans.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&[0x00, 0x90, 0x40, 0x64]);
+        events.extend_from_slice(&[0x00, 0x90, 0x43, 0x64]);
+        events.extend_from_slice(&encode_vlq(192));
+        events.extend_from_slice(&[0x80, 0x3C, 0x00]);
+        events.extend_from_slice(&[0x00, 0x80, 0x40, 0x00]);
+        events.extend_from_slice(&[0x00, 0x80, 0x43, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 192);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 3);
+        // Onset tick identical → on-disk order preserved (stable).
+        assert_eq!(notes[0].key(), 0x3C);
+        assert_eq!(notes[1].key(), 0x40);
+        assert_eq!(notes[2].key(), 0x43);
+        for n in &notes {
+            assert_eq!(n.start_tick, 0);
+            assert_eq!(n.end_tick, 192);
+        }
+    }
+
+    #[test]
+    fn notes_off_on_different_track_still_pairs() {
+        // Note On on track 0, Note Off on track 1 at a later tick. The
+        // globally-merged walk pairs them across tracks.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // on @0 track 0
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(120));
+        t1.extend_from_slice(&[0x80, 0x3C, 0x10]); // off @120 track 1
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].start_tick, 0);
+        assert_eq!(notes[0].end_tick, 120);
+        // Onset track is recorded (track 0).
+        assert_eq!(notes[0].track, 0);
+        assert_eq!(notes[0].off_velocity(), 0x10);
+    }
+
+    #[test]
+    fn notes_chord_across_tracks_orders_track0_first() {
+        // Same onset tick, two tracks — track 0 before track 1.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        t0.extend_from_slice(&encode_vlq(96));
+        t0.extend_from_slice(&[0x80, 0x3C, 0x00]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&[0x00, 0x91, 0x40, 0x64]);
+        t1.extend_from_slice(&encode_vlq(96));
+        t1.extend_from_slice(&[0x81, 0x40, 0x00]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].track, 0);
+        assert_eq!(notes[0].channel(), 0);
+        assert_eq!(notes[1].track, 1);
+        assert_eq!(notes[1].channel(), 1);
+    }
+
+    #[test]
+    fn notes_hanging_on_without_off_is_dropped() {
+        // A Note On with no matching Note Off yields no span.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.notes().is_empty());
+    }
+
+    #[test]
+    fn notes_unmatched_off_is_dropped() {
+        // A Note Off with no open note of that pitch is dropped.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x80, 0x3C, 0x40]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.notes().is_empty());
+    }
+
+    #[test]
+    fn notes_zero_duration_when_off_shares_onset_tick() {
+        // Note Off on the same tick as the Note On → zero-length span.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&[0x00, 0x80, 0x3C, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].start_tick, 0);
+        assert_eq!(notes[0].end_tick, 0);
+        assert_eq!(notes[0].duration_ticks(), 0);
+    }
+
+    #[test]
+    fn notes_filter_excludes_other_channel_voice_kinds() {
+        // Surrounding CC / program / pitch-bend / aftertouch don't break
+        // the pairing and don't appear as notes.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xB0, 0x07, 0x50]); // CC
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // note on
+        events.extend_from_slice(&[0x00, 0xC0, 0x05]); // program
+        events.extend_from_slice(&[0x00, 0xE0, 0x00, 0x50]); // pitch bend
+        events.extend_from_slice(&[0x00, 0xD0, 0x40]); // chan AT
+        events.extend_from_slice(&[0x00, 0xA0, 0x3C, 0x20]); // poly AT
+        events.extend_from_slice(&encode_vlq(48));
+        events.extend_from_slice(&[0x80, 0x3C, 0x40]); // note off
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].start_tick, 0);
+        assert_eq!(notes[0].end_tick, 48);
+        // Sibling helpers stay populated and uncontaminated.
+        assert_eq!(smf.control_changes().len(), 1);
+        assert_eq!(smf.program_changes().len(), 1);
+        assert_eq!(smf.pitch_bends().len(), 1);
+        assert_eq!(smf.channel_pressures().len(), 1);
+    }
+
+    #[test]
+    fn notes_survive_to_bytes_round_trip() {
+        // The pairing is identical before and after a to_bytes()/parse()
+        // structural round trip.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&[0x00, 0x90, 0x40, 0x50]);
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x80, 0x3C, 0x10]);
+        events.extend_from_slice(&encode_vlq(120));
+        events.extend_from_slice(&[0x80, 0x40, 0x20]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let original = smf.notes();
+        assert_eq!(original.len(), 2);
+        let muxed = smf.to_bytes().unwrap();
+        let reparsed = parse(&muxed).unwrap();
+        assert_eq!(original, reparsed.notes());
     }
 }

@@ -459,6 +459,28 @@ framework but usable standalone.
   the same tick — the same convention used by every meta-event, SysEx,
   and channel-voice helper. A round-trip through `to_bytes()` / `parse`
   preserves the stream byte-for-byte.
+  Round 292 adds the piano-roll companion `SmfFile::notes() ->
+  Vec<Note>`: where every prior channel-voice helper surfaces one value
+  per *wire* event, `notes()` pairs each Note On (`9n key vel`, `vel >
+  0`) with the Note Off that releases it and returns one `Note {
+  start_tick, end_tick, track, channel, key, velocity, off_velocity }`
+  span per sounding note, ordered by onset — the primitive a DAW
+  note-lane / piano-roll view consumes directly without re-deriving
+  on/off pairing. The MIDI 1.0 *Summary of MIDI Messages* Table 1
+  velocity-0 convention is honoured: a `9n key 0` is the running-status
+  Note-Off form and closes the earliest open note of that pitch (FIFO)
+  with `off_velocity == 0`, while an explicit `8n key off_vel` carries
+  its release velocity through to `Note::off_velocity`. Matching walks
+  the *globally* merged event stream sorted by `(absolute tick, track,
+  in-track position)` — the same stable-merge convention every meta /
+  SysEx / channel-voice helper and the scheduler use — so a Note Off on
+  a different track from its Note On still pairs; overlapping notes of
+  the same `(channel, key)` are matched FIFO, and an unmatched release
+  or a hanging onset (no Note Off before EOF) is dropped from the span
+  list. `Note::duration_ticks()` returns `end_tick - start_tick`
+  (always non-negative, possibly zero when an off lands on the onset
+  tick); `channel()` / `key()` / `velocity()` / `off_velocity()`
+  surface the decoded fields.
   Round 234 closes the SMF read-vs-write asymmetry: the parser
   has always materialised the full event vocabulary (`Channel`,
   `Sysex`, `Meta`), and round 234 adds the matching writer.

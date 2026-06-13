@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 292 — `SmfFile::notes()` Note On / Note Off pairing into sounding-note spans
+
+- New `SmfFile::notes() -> Vec<Note>`: pairs every Note On
+  (`9n key vel`, `vel > 0`) with the Note Off that releases it and
+  returns one `Note { start_tick, end_tick, track, channel, key,
+  velocity, off_velocity }` span per sounding note, ordered by onset.
+  Where the channel-voice helpers (`program_changes` /
+  `control_changes` / `pitch_bends` / `channel_pressures`) surface one
+  value per *wire* event, this helper joins the two wire events that
+  bracket a note into a single span carrying its duration — the
+  primitive a piano-roll / DAW note-lane view consumes directly.
+- Honours the MIDI 1.0 *Summary of MIDI Messages* Table 1 velocity-0
+  convention: a `9n key 0` is treated as a Note Off and closes the
+  earliest open note of that pitch (FIFO), with `off_velocity == 0`.
+  An explicit `8n key off_vel` carries its release velocity through to
+  `Note::off_velocity`.
+- Matches over the *globally* merged event stream sorted by
+  `(absolute tick, track, in-track position)` — the same stable-merge
+  convention every other iteration helper and the scheduler use — so a
+  Note Off on a different track from its Note On still pairs correctly.
+  Overlapping notes of the same `(channel, key)` are matched FIFO; an
+  unmatched release or a hanging onset is dropped from the span list.
+- `Note` accessors: `channel()` / `key()` / `velocity()` /
+  `off_velocity()` / `duration_ticks()` (`end_tick - start_tick`).
+- 13 new unit tests: single-note pairing, velocity-0 close, channel
+  decode, FIFO overlap, chord (distinct pitches + cross-track
+  ordering), cross-track off pairing, hanging-on / unmatched-off drop,
+  zero-duration span, sibling-helper isolation, and a `to_bytes()` /
+  `parse` structural round trip.
+
 ### Round 285 — synthesis profiling + run-segmented volume envelope (bit-identical, ~20 % faster)
 
 - New `benches/synth_render.rs` (`harness = false`) — repeatable
