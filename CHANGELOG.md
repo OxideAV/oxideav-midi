@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 301 — `SmfFile::poly_aftertouches()` Polyphonic Key Pressure stream
+
+- New `SmfFile::poly_aftertouches() -> Vec<PolyAftertouchEvent>`: every
+  `An kk pp` Polyphonic Key Pressure (per-key aftertouch) channel-voice
+  event as a `PolyAftertouchEvent { tick, track, channel, key, pressure
+  }` pinned to the absolute tick on its parent track, stably merged
+  across tracks (track 0 before track 1 at the same tick) under the same
+  convention every existing iteration helper and the scheduler use.
+- `An` was the only channel-voice status nibble without a dedicated
+  typed extraction helper. Distinct from Channel Pressure (`Dn`,
+  surfaced by `channel_pressures()`) — `An` carries a per-key `kk` byte,
+  so per-voice aftertouch automation can be rebuilt. Accessors
+  `channel()` / `key()` / `pressure()` return the decoded fields.
+- Nine new unit tests: tick-zero decode, low-nibble channel index,
+  running-status (key, pressure) pair chaining, late-position absolute
+  tick, two-track stable sort, cross-track tick merge, filter exclusion
+  of every other channel-voice kind, `to_bytes()`/`parse()` round trip,
+  and empty-when-none. Full lib suite 541 → 550 tests, zero ignored.
+
 ### Round 292 — `SmfFile::notes()` Note On / Note Off pairing into sounding-note spans
 
 - New `SmfFile::notes() -> Vec<Note>`: pairs every Note On

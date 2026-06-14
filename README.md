@@ -481,6 +481,25 @@ framework but usable standalone.
   (always non-negative, possibly zero when an off lands on the onset
   tick); `channel()` / `key()` / `velocity()` / `off_velocity()`
   surface the decoded fields.
+  Round 301 completes the per-message channel-voice typed-iterator
+  family with `SmfFile::poly_aftertouches() -> Vec<PolyAftertouchEvent>`:
+  every `An kk pp` Polyphonic Key Pressure (per-key aftertouch) event as
+  a `PolyAftertouchEvent { tick, track, channel, key, pressure }` with
+  the absolute tick on the parent track, stably merged across tracks
+  (track 0 before track 1 at the same tick) under the same merge rule as
+  every existing iteration helper and the scheduler. `An` is the only
+  channel-voice status without a dedicated extraction helper before this
+  round; it is distinct from Channel Pressure (`Dn`, surfaced by
+  `channel_pressures()` — the single greatest pressure over all depressed
+  keys) in that `An` carries a per-key `kk` byte so per-voice aftertouch
+  can be rebuilt. Only `An` is selected — Control Change (`Bn`), Program
+  Change (`Cn`), pitch-bend (`En`), channel-pressure (`Dn`), and note
+  (`8n` / `9n`) events stay on their own surfaces. Accessors `channel()`
+  / `key()` / `pressure()` return the decoded `0..=15` / `0..=127` /
+  `0..=127` fields. With this the eight channel-voice typed iterators
+  (`program_changes`, `control_changes`, `pitch_bends`,
+  `channel_pressures`, `poly_aftertouches`, `notes`, plus `sysex_events`
+  / `universal_sysex_events`) cover every status nibble the wire defines.
   Round 234 closes the SMF read-vs-write asymmetry: the parser
   has always materialised the full event vocabulary (`Channel`,
   `Sysex`, `Meta`), and round 234 adds the matching writer.
