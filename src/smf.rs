@@ -4119,6 +4119,49 @@ impl SmfFile {
         out
     }
 
+    /// Return every [`Note`] span sounding at the absolute tick `tick`,
+    /// in onset order — the piano-roll / seek companion to
+    /// [`SmfFile::notes`].
+    ///
+    /// A note is *sounding* at `tick` when it has been struck at or
+    /// before `tick` and has not yet been released: `start_tick <= tick`
+    /// **and** `end_tick > tick`. The interval is therefore half-open
+    /// `[start_tick, end_tick)` — a note released at exactly `tick` is no
+    /// longer sounding (its key has come up on that tick), and a note
+    /// struck at exactly `tick` *is* sounding (the snapshot reflects the
+    /// state immediately after that tick's events fire, the same "events
+    /// at exactly `tick` are included" convention as
+    /// [`SmfFile::channel_snapshot_at`]). A zero-duration note
+    /// (`start_tick == end_tick`, a Note Off landing on its own onset
+    /// tick) is sounding at *no* tick and never appears.
+    ///
+    /// This is the note-level analogue of the channel-state
+    /// [`SmfFile::channel_snapshot_at`] seek primitive: where the
+    /// snapshot answers "what controller / program / bend state does a
+    /// channel carry at tick T?", this answers "which keys are held down
+    /// at tick T?" — exactly the set a DAW must re-trigger (or a renderer
+    /// must prime into the voice pool) when seeking into the middle of a
+    /// file rather than playing from the top.
+    ///
+    /// The result reuses the matched spans from [`SmfFile::notes`]
+    /// verbatim, so the same on/off pairing rules apply: the velocity-0
+    /// Note-Off convention, FIFO matching of re-struck pitches, and the
+    /// drop of unmatched releases / hanging onsets (a note with no
+    /// matching Note Off before end-of-file carries no `end_tick`, so it
+    /// cannot be reported as sounding at any tick). The returned `Vec`
+    /// preserves the `notes()` order — `(start_tick, track)` — so chord
+    /// notes struck together stay grouped and track 0 precedes track 1.
+    ///
+    /// Cost is `O(n log n)` in the total event count (it runs one
+    /// [`SmfFile::notes`] pass then filters), bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn active_notes_at(&self, tick: u64) -> Vec<Note> {
+        self.notes()
+            .into_iter()
+            .filter(|n| n.start_tick <= tick && n.end_tick > tick)
+            .collect()
+    }
+
     /// Collect every [`Event::Sysex`] from every track — both the
     /// `F0` start and the `F7` continuation / escape flavours —
     /// pinned to the absolute tick at which it fires, in time order.
@@ -11772,5 +11815,141 @@ mod tests {
         let muxed = smf.to_bytes().unwrap();
         let reparsed = parse(&muxed).unwrap();
         assert_eq!(original, reparsed.notes());
+    }
+
+    // ----------------------------------------------------------------
+    // active_notes_at() — half-open [start_tick, end_tick) seek lens.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn active_notes_at_empty_when_no_note_activity() {
+        // A tempo-only conductor track has no notes at any tick.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.active_notes_at(0).is_empty());
+        assert!(smf.active_notes_at(1000).is_empty());
+    }
+
+    #[test]
+    fn active_notes_at_half_open_interval_boundaries() {
+        // One note sounding over [0, 480): struck @0, released @480.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // on @0
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0x80, 0x3C, 0x40]); // off @480
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        // Onset tick is inclusive: the note is sounding immediately after
+        // the strike fires.
+        assert_eq!(smf.active_notes_at(0).len(), 1);
+        // Mid-span.
+        assert_eq!(smf.active_notes_at(479).len(), 1);
+        // Release tick is exclusive: the key has come up at exactly 480.
+        assert!(smf.active_notes_at(480).is_empty());
+        // After release.
+        assert!(smf.active_notes_at(481).is_empty());
+    }
+
+    #[test]
+    fn active_notes_at_before_onset_is_silent() {
+        // Note struck @100; nothing sounds at an earlier tick.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&encode_vlq(100));
+        events.extend_from_slice(&[0x90, 0x3C, 0x64]); // on @100
+        events.extend_from_slice(&encode_vlq(100));
+        events.extend_from_slice(&[0x80, 0x3C, 0x40]); // off @200
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.active_notes_at(99).is_empty());
+        assert_eq!(smf.active_notes_at(100).len(), 1);
+    }
+
+    #[test]
+    fn active_notes_at_zero_duration_note_never_sounds() {
+        // Note Off on the same tick as the Note On — a zero-duration
+        // span ([start == end]) is sounding at no tick.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // on @0
+        events.extend_from_slice(&[0x00, 0x80, 0x3C, 0x00]); // off @0
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        // notes() still reports the zero-duration span...
+        assert_eq!(smf.notes().len(), 1);
+        assert_eq!(smf.notes()[0].duration_ticks(), 0);
+        // ...but active_notes_at reports it at no tick (half-open).
+        assert!(smf.active_notes_at(0).is_empty());
+    }
+
+    #[test]
+    fn active_notes_at_chord_returns_all_held_keys_in_onset_order() {
+        // Three pitches struck @0, released @192 — all three sound mid-span.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        events.extend_from_slice(&[0x00, 0x90, 0x40, 0x64]);
+        events.extend_from_slice(&[0x00, 0x90, 0x43, 0x64]);
+        events.extend_from_slice(&encode_vlq(192));
+        events.extend_from_slice(&[0x80, 0x3C, 0x00]);
+        events.extend_from_slice(&[0x00, 0x80, 0x40, 0x00]);
+        events.extend_from_slice(&[0x00, 0x80, 0x43, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 192);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let held = smf.active_notes_at(96);
+        assert_eq!(held.len(), 3);
+        // notes() order preserved: ascending on-disk pitch order.
+        assert_eq!(held[0].key(), 0x3C);
+        assert_eq!(held[1].key(), 0x40);
+        assert_eq!(held[2].key(), 0x43);
+    }
+
+    #[test]
+    fn active_notes_at_staggered_notes_overlap_window() {
+        // n1 [0, 200), n2 [100, 300). At 150 both sound; at 50 only n1;
+        // at 250 only n2.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // n1 on @0
+        events.extend_from_slice(&encode_vlq(100));
+        events.extend_from_slice(&[0x90, 0x40, 0x64]); // n2 on @100
+        events.extend_from_slice(&encode_vlq(100));
+        events.extend_from_slice(&[0x80, 0x3C, 0x00]); // n1 off @200
+        events.extend_from_slice(&encode_vlq(100));
+        events.extend_from_slice(&[0x80, 0x40, 0x00]); // n2 off @300
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let at50 = smf.active_notes_at(50);
+        assert_eq!(at50.len(), 1);
+        assert_eq!(at50[0].key(), 0x3C);
+        assert_eq!(smf.active_notes_at(150).len(), 2);
+        let at250 = smf.active_notes_at(250);
+        assert_eq!(at250.len(), 1);
+        assert_eq!(at250[0].key(), 0x40);
+    }
+
+    #[test]
+    fn active_notes_at_hanging_note_never_sounds() {
+        // A Note On with no matching Note Off is dropped by notes(), so
+        // it cannot be reported as sounding at any tick.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // on @0, no off
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.notes().is_empty());
+        assert!(smf.active_notes_at(0).is_empty());
+        assert!(smf.active_notes_at(50).is_empty());
     }
 }

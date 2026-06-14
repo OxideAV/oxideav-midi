@@ -500,6 +500,25 @@ framework but usable standalone.
   (`program_changes`, `control_changes`, `pitch_bends`,
   `channel_pressures`, `poly_aftertouches`, `notes`, plus `sysex_events`
   / `universal_sysex_events`) cover every status nibble the wire defines.
+  Round 307 adds the sounding-note seek lens
+  `SmfFile::active_notes_at(tick) -> Vec<Note>` — the piano-roll
+  companion to `notes()` and the note-level analogue of the
+  channel-state `channel_snapshot_at` primitive. Where the snapshot
+  answers "what controller / program / bend state does a channel carry
+  at tick T?", `active_notes_at` answers "which keys are held down at
+  tick T?" — exactly the set a DAW must re-trigger (or a renderer must
+  prime into the voice pool) when seeking into the middle of a file
+  rather than playing from the top. A note is sounding when
+  `start_tick <= tick && end_tick > tick`, the half-open interval
+  `[start_tick, end_tick)`: the onset tick is inclusive (the lens
+  reflects state immediately after that tick's events fire, the same
+  convention as `channel_snapshot_at`), the release tick is exclusive
+  (the key has come up), and a zero-duration note
+  (`start_tick == end_tick`) is sounding at no tick. The result reuses
+  the matched spans from `notes()` verbatim — same velocity-0 Note-Off
+  convention, FIFO re-strike matching, and drop of hanging onsets /
+  unmatched releases — and preserves the `notes()` `(start_tick, track)`
+  order so chord notes stay grouped and track 0 precedes track 1.
   Round 234 closes the SMF read-vs-write asymmetry: the parser
   has always materialised the full event vocabulary (`Channel`,
   `Sysex`, `Meta`), and round 234 adds the matching writer.

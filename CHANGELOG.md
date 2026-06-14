@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 307 — `SmfFile::active_notes_at()` sounding-note seek lens
+
+- New `SmfFile::active_notes_at(tick) -> Vec<Note>`: every `Note` span
+  sounding at the absolute `tick` — the piano-roll / seek companion to
+  `notes()`, and the note-level analogue of the channel-state
+  `channel_snapshot_at` primitive. Where the snapshot answers "what
+  controller / program / bend state does a channel carry at tick T?",
+  this answers "which keys are held down at tick T?" — exactly the set a
+  DAW must re-trigger (or a renderer must prime into the voice pool) when
+  seeking into the middle of a file rather than playing from the top.
+- A note is sounding when `start_tick <= tick && end_tick > tick` — the
+  half-open interval `[start_tick, end_tick)`. The onset tick is
+  inclusive (the snapshot reflects state immediately after that tick's
+  events fire, the same convention as `channel_snapshot_at`); the release
+  tick is exclusive (the key has come up). A zero-duration note
+  (`start_tick == end_tick`) is sounding at no tick. Hanging onsets and
+  unmatched releases — already dropped by `notes()` — cannot be reported.
+  The result preserves the `notes()` `(start_tick, track)` order so chord
+  notes stay grouped and track 0 precedes track 1.
+- Seven new unit tests: empty-when-silent, half-open boundary
+  (onset-inclusive / release-exclusive / mid-span / after-release),
+  before-onset silence, zero-duration never sounds, chord returns all
+  held keys in onset order, staggered overlap window (only-n1 / both /
+  only-n2), and hanging-note never sounds. Full lib suite 550 → 557
+  tests, zero ignored.
+
 ### Round 301 — `SmfFile::poly_aftertouches()` Polyphonic Key Pressure stream
 
 - New `SmfFile::poly_aftertouches() -> Vec<PolyAftertouchEvent>`: every
