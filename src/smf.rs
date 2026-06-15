@@ -1218,6 +1218,239 @@ impl ChannelPrefixEvent {
     }
 }
 
+/// Classification of a *Registered* Parameter Number selected by the
+/// CC 101 (RPN MSB) / CC 100 (RPN LSB) pair, per the MIDI 1.0 *Control
+/// Change Messages — Data Bytes* document, Table 3a ("Registered
+/// Parameter Numbers").
+///
+/// Registered Parameters are the MMA-defined subset of the Data Entry
+/// pump's address space; the complementary Non-Registered Parameters
+/// (CC 99 / CC 98) are manufacturer-private and carry no fixed
+/// vocabulary, so they are surfaced only as a raw 14-bit number (see
+/// [`SelectedParameter::NonRegistered`]).
+///
+/// The variant set mirrors Table 3a exactly:
+///
+/// * `0x0000` Pitch Bend Sensitivity
+/// * `0x0001` Channel Fine Tuning (formerly Fine Tuning, MMA RP-022)
+/// * `0x0002` Channel Coarse Tuning (formerly Coarse Tuning, RP-022)
+/// * `0x0003` Tuning Program Change
+/// * `0x0004` Tuning Bank Select
+/// * `0x0005` Modulation Depth Range (MMA CA-26 / GM2)
+/// * `0x0006` MPE Configuration Message (MPE specification)
+/// * `0x3D00..=0x3D08` the nine Three-Dimensional Sound Controllers
+///   (RP-049): Azimuth, Elevation, Gain, Distance Ratio, Maximum
+///   Distance, Gain At Maximum Distance, Reference Distance Ratio, Pan
+///   Spread Angle, Roll Angle
+/// * `7FH:7FH` (packed `0x3FFF`) the Null Function Number (selecting it
+///   disables the Data Entry / Increment / Decrement pump until a new
+///   parameter is selected)
+///
+/// Any 14-bit number not named in Table 3a is "RESERVED for future MMA
+/// Definition" and surfaces as [`RegisteredParameter::Reserved`] with
+/// the raw number preserved, so a forward-compatible caller can still
+/// route on the exact value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisteredParameter {
+    /// `0x0000` — Pitch Bend Sensitivity. Data Entry MSB = ± semitones,
+    /// LSB = ± cents.
+    PitchBendSensitivity,
+    /// `0x0001` — Channel Fine Tuning (formerly Fine Tuning, RP-022).
+    /// The 14-bit Data Entry value spans ±100 cents around centre
+    /// (`0x40 0x00` = A440).
+    ChannelFineTuning,
+    /// `0x0002` — Channel Coarse Tuning (formerly Coarse Tuning,
+    /// RP-022). Only the MSB is used; resolution is 100 cents
+    /// (`0x40` = A440).
+    ChannelCoarseTuning,
+    /// `0x0003` — Tuning Program Change. Data Entry selects a MIDI
+    /// Tuning Standard tuning-program number.
+    TuningProgramChange,
+    /// `0x0004` — Tuning Bank Select. Data Entry selects a MIDI Tuning
+    /// Standard tuning-bank number.
+    TuningBankSelect,
+    /// `0x0005` — Modulation Depth Range (CA-26 / GM2). Data Entry sets
+    /// the mod-wheel depth range.
+    ModulationDepthRange,
+    /// `0x0006` — MPE Configuration Message (MPE specification §2.2.1).
+    /// Data Entry MSB carries the Member-Channel count.
+    MpeConfiguration,
+    /// `0x3D00..=0x3D08` — one of the nine Three-Dimensional Sound
+    /// Controllers (RP-049). The inner byte is the LSB (`0x00`..=`0x08`):
+    /// `0` Azimuth Angle, `1` Elevation Angle, `2` Gain, `3` Distance
+    /// Ratio, `4` Maximum Distance, `5` Gain At Maximum Distance, `6`
+    /// Reference Distance Ratio, `7` Pan Spread Angle, `8` Roll Angle.
+    ThreeDimensionalSound(u8),
+    /// `7FH:7FH` (packed `0x3FFF`) — Null Function Number for RPN / NRPN. Selecting it
+    /// disables the Data Entry / Increment / Decrement controllers until
+    /// a new RPN or NRPN is selected.
+    Null,
+    /// Any 14-bit number not assigned in Table 3a — "RESERVED for future
+    /// MMA Definition". The raw `(msb << 7) | lsb` value is preserved.
+    Reserved(u16),
+}
+
+impl RegisteredParameter {
+    /// Classify the 14-bit RPN value `(msb << 7) | lsb` against Table 3a.
+    ///
+    /// `number` is the *packed* 14-bit value in `0..=0x3FFF`, with the
+    /// CC 101 (MSB) byte in the high seven bits and the CC 100 (LSB) byte
+    /// in the low seven. Table 3a displays parameters as an "MSB:LSB"
+    /// byte pair (e.g. `3DH:00H` for Azimuth, `7FH:7FH` for Null); those
+    /// pairs map to the packed values `(MSB << 7) | LSB` — `0x3DH:00H`
+    /// → `0x1E80`, `7FH:7FH` → `0x3FFF` — which is the representation
+    /// matched here (the same packing the runtime mixer uses).
+    pub fn from_number(number: u16) -> Self {
+        // 3D Sound Controllers: MSB 0x3D, LSB 0x00..=0x08 → packed
+        // 0x1E80..=0x1E88.
+        const SOUND_3D_BASE: u16 = (0x3D << 7) as u16; // 0x1E80
+        match number {
+            0x0000 => RegisteredParameter::PitchBendSensitivity,
+            0x0001 => RegisteredParameter::ChannelFineTuning,
+            0x0002 => RegisteredParameter::ChannelCoarseTuning,
+            0x0003 => RegisteredParameter::TuningProgramChange,
+            0x0004 => RegisteredParameter::TuningBankSelect,
+            0x0005 => RegisteredParameter::ModulationDepthRange,
+            0x0006 => RegisteredParameter::MpeConfiguration,
+            n if (SOUND_3D_BASE..=SOUND_3D_BASE + 8).contains(&n) => {
+                RegisteredParameter::ThreeDimensionalSound((n - SOUND_3D_BASE) as u8)
+            }
+            0x3FFF => RegisteredParameter::Null,
+            other => RegisteredParameter::Reserved(other),
+        }
+    }
+}
+
+/// The parameter a Data Entry / Increment / Decrement write addresses at
+/// the moment it fires, resolved from the channel's running RPN / NRPN
+/// selector state.
+///
+/// Per the MIDI 1.0 *Control Change Messages — Data Bytes* document, the
+/// Data Entry pump (CC 6 / CC 38) and the Data Increment / Decrement
+/// controllers (CC 96 / CC 97) act on whichever parameter was most
+/// recently selected by an RPN pair (CC 101 MSB / CC 100 LSB) or an NRPN
+/// pair (CC 99 MSB / CC 98 LSB). Selecting an RPN supersedes a prior
+/// NRPN selection and vice versa — there is a single active parameter
+/// per channel, not one of each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectedParameter {
+    /// A Registered Parameter (CC 101 / CC 100 selector). Carries both
+    /// the raw 14-bit number and its Table-3a classification.
+    Registered {
+        /// The raw `(msb << 7) | lsb` parameter number, `0..=0x3FFF`.
+        number: u16,
+        /// The Table-3a classification of `number`.
+        param: RegisteredParameter,
+    },
+    /// A Non-Registered Parameter (CC 99 / CC 98 selector). NRPNs are
+    /// manufacturer-private, so only the raw 14-bit number is surfaced.
+    /// The Null Function Number (packed `0x3FFF`, the `7FH:7FH` MSB:LSB
+    /// pair) selected via the NRPN pair is reported here as a `number` of
+    /// `0x3FFF` (it disables the pump just as the RPN-null does).
+    NonRegistered {
+        /// The raw `(msb << 7) | lsb` parameter number, `0..=0x3FFF`.
+        number: u16,
+    },
+}
+
+impl SelectedParameter {
+    /// The raw 14-bit parameter number regardless of registered /
+    /// non-registered flavour.
+    pub fn number(&self) -> u16 {
+        match self {
+            SelectedParameter::Registered { number, .. } => *number,
+            SelectedParameter::NonRegistered { number } => *number,
+        }
+    }
+
+    /// `true` for a Registered Parameter (CC 101 / CC 100 selector).
+    pub fn is_registered(&self) -> bool {
+        matches!(self, SelectedParameter::Registered { .. })
+    }
+
+    /// `true` when the selected parameter is the Null Function Number
+    /// (packed `0x3FFF`, the `7FH:7FH` MSB:LSB pair) — the sentinel that
+    /// disables the Data Entry / Increment / Decrement pump until a fresh
+    /// parameter is selected. A write addressing a null parameter is
+    /// never emitted by [`SmfFile::parameter_data_entries`].
+    pub fn is_null(&self) -> bool {
+        self.number() == 0x3FFF
+    }
+}
+
+/// The kind of Data Entry pump action a [`ParameterDataEntry`] records.
+///
+/// The MIDI 1.0 *Control Change Messages — Data Bytes* document defines
+/// two ways to write a selected parameter: an absolute Data Entry
+/// (CC 6 = MSB, CC 38 = LSB), and a relative Data Increment (CC 96) /
+/// Data Decrement (CC 97) whose own value byte is "don't care" (the
+/// step is always ±1 per MMA RP-018).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataEntryAction {
+    /// CC 6 — Data Entry MSB. The `value` byte (`0..=127`) is the
+    /// most-significant 7 bits of the parameter's 14-bit value.
+    EntryMsb(u8),
+    /// CC 38 — Data Entry LSB. The `value` byte (`0..=127`) is the
+    /// least-significant 7 bits of the parameter's 14-bit value.
+    EntryLsb(u8),
+    /// CC 96 — Data Increment. Steps the selected parameter up by one
+    /// (the controller's own value byte is ignored per RP-018).
+    Increment,
+    /// CC 97 — Data Decrement. Steps the selected parameter down by one
+    /// (the controller's own value byte is ignored per RP-018).
+    Decrement,
+}
+
+/// One Data Entry pump action (CC 6 / CC 38 / CC 96 / CC 97) resolved
+/// against the channel's running RPN / NRPN selector state, pinned to
+/// the absolute tick at which it fires.
+///
+/// Returned by [`SmfFile::parameter_data_entries`] — see that method for
+/// the selector-folding rules and the multi-track merge semantics.
+///
+/// Where [`SmfFile::control_changes`] surfaces *raw* CC bytes and leaves
+/// the RPN / NRPN Data Entry pump for the receiving application to
+/// resolve, this event carries the *resolved* target: which parameter
+/// the channel had selected (an RPN classified per Table 3a, or a raw
+/// NRPN number) and what the pump did to it (an absolute MSB / LSB write
+/// or a relative ±1 step). It is the read-side analogue of the runtime
+/// RPN / NRPN state machine a synth maintains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParameterDataEntry {
+    /// Cumulative delta-sum from the start of the track that carried the
+    /// Data Entry controller, in division units. For format-1 SMFs this
+    /// is also the absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the Data Entry controller came from.
+    pub track: usize,
+    /// The MIDI channel the write targets, in the spec's `0..=15` range.
+    pub channel: u8,
+    /// The parameter the channel had selected when the write fired —
+    /// either a Table-3a-classified Registered Parameter or a raw NRPN
+    /// number. Never the Null Function Number: writes addressing a null
+    /// parameter are dropped (the spec disables the pump in that state).
+    pub parameter: SelectedParameter,
+    /// What the pump did to `parameter`.
+    pub action: DataEntryAction,
+}
+
+impl ParameterDataEntry {
+    /// The MIDI channel index in the spec's `0..=15` range.
+    pub fn channel(&self) -> u8 {
+        self.channel
+    }
+
+    /// The parameter the write addressed.
+    pub fn parameter(&self) -> SelectedParameter {
+        self.parameter
+    }
+
+    /// The pump action the event records.
+    pub fn action(&self) -> DataEntryAction {
+        self.action
+    }
+}
+
 /// One Program Change (`Cn pp`) channel-voice event pinned to the
 /// absolute tick (relative to the start of its parent track) at which
 /// the [`ChannelBody::ProgramChange`] wire event fires.
@@ -4160,6 +4393,216 @@ impl SmfFile {
             .into_iter()
             .filter(|n| n.start_tick <= tick && n.end_tick > tick)
             .collect()
+    }
+
+    /// Fold the RPN / NRPN Data Entry pump into resolved parameter-write
+    /// events: every CC 6 / CC 38 (Data Entry MSB / LSB) and CC 96 /
+    /// CC 97 (Data Increment / Decrement) controller, paired with the
+    /// parameter the channel had selected when it fired.
+    ///
+    /// This is the read-side analogue of the runtime RPN / NRPN state
+    /// machine a synth maintains, and the resolving companion to
+    /// [`SmfFile::control_changes`]: where that helper surfaces the *raw*
+    /// CC bytes and explicitly leaves "the Data Entry pump for RPN /
+    /// NRPN parameter writes … to the receiving application", this helper
+    /// runs that state machine for the caller and emits one
+    /// [`ParameterDataEntry`] per pump action, tagged with the resolved
+    /// target.
+    ///
+    /// ## Selector state machine (MIDI 1.0 *Control Change Messages —
+    /// Data Bytes*)
+    ///
+    /// Per the spec's "To set or change the value of a Registered
+    /// Parameter" procedure and Table 3 / Table 3a, the Data Entry pump
+    /// acts on whichever parameter was *most recently selected*:
+    ///
+    /// * **RPN select** — CC 101 (`0x65`) sets the parameter MSB, CC 100
+    ///   (`0x64`) the LSB. The two combine to a 14-bit Registered
+    ///   Parameter Number classified per Table 3a.
+    /// * **NRPN select** — CC 99 (`0x63`) sets the MSB, CC 98 (`0x62`)
+    ///   the LSB. The 14-bit number is manufacturer-private, surfaced
+    ///   raw.
+    /// * Selecting an RPN supersedes a prior NRPN selection and vice
+    ///   versa: there is **one** active parameter per channel, not one of
+    ///   each. The half-set high / low byte of the *current* flavour is
+    ///   preserved while the other byte is rewritten (a lone CC 100 after
+    ///   a full RPN selection changes only the LSB), matching the
+    ///   bit-merge the runtime mixer performs.
+    /// * **Null** — the Null Function Number (packed `0x3FFF`, the
+    ///   `7FH:7FH` MSB:LSB pair, selected through either pair) disables
+    ///   the pump. A Data Entry / Increment /
+    ///   Decrement arriving while the active parameter is null — or
+    ///   before *any* parameter has been selected — produces **no** event
+    ///   (the spec: "Setting RPN to 7FH,7FH will disable the data entry,
+    ///   data increment, and data decrement controllers until a new RPN
+    ///   or NRPN is selected").
+    ///
+    /// Data Increment (CC 96) and Data Decrement (CC 97) carry a
+    /// "don't care" value byte per MMA RP-018; the emitted
+    /// [`DataEntryAction::Increment`] / [`DataEntryAction::Decrement`]
+    /// therefore drop the byte and record only the ±1 direction.
+    ///
+    /// ## Merge order
+    ///
+    /// The selector state is per-channel and evolves along the *globally
+    /// merged* event stream — every track's events are summed to absolute
+    /// ticks and merged in `(tick, track, in-track-position)` order (the
+    /// same stable convention [`SmfFile::notes`] and the scheduler use)
+    /// before the fold runs, so a selector on the conductor track
+    /// correctly governs a Data Entry on a later part track at a higher
+    /// tick. Within a tick, track 0 precedes track 1. The returned `Vec`
+    /// is in that merged order.
+    ///
+    /// Returns an empty `Vec` when no Data Entry pump controller is ever
+    /// addressed to a non-null selected parameter — the common case for a
+    /// note-only sequence.
+    ///
+    /// Cost is `O(n log n)` in the total event count (one merge sort then
+    /// a linear fold), bounded above by [`MAX_EVENTS_PER_FILE`].
+    pub fn parameter_data_entries(&self) -> Vec<ParameterDataEntry> {
+        // Build the globally merged channel-voice CC stream in
+        // (tick, track, order) so a selector on one track governs a Data
+        // Entry on another, exactly as a receiver merging both tracks
+        // onto one wire would see them.
+        struct AbsCc {
+            tick: u64,
+            track: usize,
+            order: usize,
+            channel: u8,
+            controller: u8,
+            value: u8,
+        }
+        let mut merged: Vec<AbsCc> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for (order, ev) in track.events.iter().enumerate() {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Channel(ChannelMessage {
+                    channel,
+                    body: ChannelBody::ControlChange { controller, value },
+                }) = &ev.kind
+                {
+                    merged.push(AbsCc {
+                        tick: abs,
+                        track: track_idx,
+                        order,
+                        channel: *channel,
+                        controller: *controller,
+                        value: *value,
+                    });
+                }
+            }
+        }
+        merged.sort_by(|a, b| {
+            a.tick
+                .cmp(&b.tick)
+                .then_with(|| a.track.cmp(&b.track))
+                .then_with(|| a.order.cmp(&b.order))
+        });
+
+        // Per-channel running selector. `number` is the packed 14-bit
+        // RPN/NRPN value `(msb << 7) | lsb`; `registered` distinguishes
+        // the flavour. The power-up default is the Null Function Number
+        // (packed `0x3FFF`, the `7FH:7FH` MSB:LSB pair) with the
+        // registered flag set — the spec's "RPN / NRPN MSB / LSB 127 /
+        // 127" power-up convention — so the pump is disabled until an
+        // explicit selection arrives.
+        #[derive(Clone, Copy)]
+        struct Selector {
+            number: u16,
+            registered: bool,
+        }
+        let mut sel = [Selector {
+            number: 0x3FFF,
+            registered: true,
+        }; 16];
+
+        let mut out: Vec<ParameterDataEntry> = Vec::new();
+        for cc in &merged {
+            let ch = (cc.channel & 0x0F) as usize;
+            match cc.controller {
+                // RPN MSB / LSB (CC 101 / CC 100): switch to the
+                // registered flavour, rewriting only the addressed byte.
+                101 => {
+                    let cur = if sel[ch].registered {
+                        sel[ch].number
+                    } else {
+                        0
+                    };
+                    sel[ch] = Selector {
+                        number: (cur & 0x007F) | ((cc.value as u16 & 0x7F) << 7),
+                        registered: true,
+                    };
+                }
+                100 => {
+                    let cur = if sel[ch].registered {
+                        sel[ch].number
+                    } else {
+                        0
+                    };
+                    sel[ch] = Selector {
+                        number: (cur & 0x3F80) | (cc.value as u16 & 0x7F),
+                        registered: true,
+                    };
+                }
+                // NRPN MSB / LSB (CC 99 / CC 98): switch to the
+                // non-registered flavour, rewriting only the addressed
+                // byte.
+                99 => {
+                    let cur = if !sel[ch].registered {
+                        sel[ch].number
+                    } else {
+                        0
+                    };
+                    sel[ch] = Selector {
+                        number: (cur & 0x007F) | ((cc.value as u16 & 0x7F) << 7),
+                        registered: false,
+                    };
+                }
+                98 => {
+                    let cur = if !sel[ch].registered {
+                        sel[ch].number
+                    } else {
+                        0
+                    };
+                    sel[ch] = Selector {
+                        number: (cur & 0x3F80) | (cc.value as u16 & 0x7F),
+                        registered: false,
+                    };
+                }
+                // Data Entry MSB / LSB and Data Inc / Dec — emit only
+                // when a non-null parameter is selected.
+                6 | 38 | 96 | 97 => {
+                    let s = sel[ch];
+                    if s.number == 0x3FFF {
+                        continue; // null / power-up sentinel disables the pump
+                    }
+                    let parameter = if s.registered {
+                        SelectedParameter::Registered {
+                            number: s.number,
+                            param: RegisteredParameter::from_number(s.number),
+                        }
+                    } else {
+                        SelectedParameter::NonRegistered { number: s.number }
+                    };
+                    let action = match cc.controller {
+                        6 => DataEntryAction::EntryMsb(cc.value),
+                        38 => DataEntryAction::EntryLsb(cc.value),
+                        96 => DataEntryAction::Increment,
+                        _ => DataEntryAction::Decrement,
+                    };
+                    out.push(ParameterDataEntry {
+                        tick: cc.tick,
+                        track: cc.track,
+                        channel: cc.channel & 0x0F,
+                        parameter,
+                        action,
+                    });
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Collect every [`Event::Sysex`] from every track — both the
@@ -11951,5 +12394,280 @@ mod tests {
         assert!(smf.notes().is_empty());
         assert!(smf.active_notes_at(0).is_empty());
         assert!(smf.active_notes_at(50).is_empty());
+    }
+
+    // ---- parameter_data_entries (RPN / NRPN Data Entry pump) ----
+
+    #[test]
+    fn parameter_data_entries_empty_when_no_pump_controllers() {
+        // A bare Volume CC carries no Data Entry pump action.
+        let events: Vec<u8> = vec![0x00, 0xB0, 0x07, 0x64, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.parameter_data_entries().is_empty());
+    }
+
+    #[test]
+    fn parameter_data_entries_data_entry_without_selection_is_dropped() {
+        // CC 6 with no prior RPN/NRPN selection addresses the power-up
+        // null parameter (packed 0x3FFF) and is suppressed per spec.
+        let events: Vec<u8> = vec![0x00, 0xB0, 0x06, 0x0C, 0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.parameter_data_entries().is_empty());
+    }
+
+    #[test]
+    fn parameter_data_entries_rpn0_pitch_bend_sensitivity() {
+        // Select RPN 0 (CC 101=0 MSB, CC 100=0 LSB), then Data Entry
+        // MSB=12 (CC 6) and LSB=50 (CC 38).
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x65, 0x00, // RPN MSB = 0
+            0x00, 0xB0, 0x64, 0x00, // RPN LSB = 0
+            0x00, 0xB0, 0x06, 0x0C, // Data Entry MSB = 12
+            0x00, 0xB0, 0x26, 0x32, // Data Entry LSB = 50
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pd = smf.parameter_data_entries();
+        assert_eq!(pd.len(), 2);
+        assert_eq!(pd[0].channel(), 0);
+        assert_eq!(
+            pd[0].parameter(),
+            SelectedParameter::Registered {
+                number: 0x0000,
+                param: RegisteredParameter::PitchBendSensitivity,
+            }
+        );
+        assert!(pd[0].parameter().is_registered());
+        assert!(!pd[0].parameter().is_null());
+        assert_eq!(pd[0].action(), DataEntryAction::EntryMsb(12));
+        assert_eq!(pd[1].action(), DataEntryAction::EntryLsb(50));
+    }
+
+    #[test]
+    fn parameter_data_entries_nrpn_surfaces_raw_number() {
+        // Select NRPN 0x0123 (CC 99=0x02 MSB, CC 98=0x23 LSB), then
+        // Data Entry MSB.
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x63, 0x02, // NRPN MSB = 2
+            0x00, 0xB0, 0x62, 0x23, // NRPN LSB = 0x23
+            0x00, 0xB0, 0x06, 0x40, // Data Entry MSB = 64
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pd = smf.parameter_data_entries();
+        assert_eq!(pd.len(), 1);
+        assert_eq!(
+            pd[0].parameter(),
+            SelectedParameter::NonRegistered { number: 0x0123 }
+        );
+        assert!(!pd[0].parameter().is_registered());
+        assert_eq!(pd[0].action(), DataEntryAction::EntryMsb(64));
+    }
+
+    #[test]
+    fn parameter_data_entries_increment_decrement_drop_value_byte() {
+        // RPN 2 (Channel Coarse Tuning) then Data Inc (CC 96) and Data
+        // Dec (CC 97) — the value byte is "don't care" per RP-018.
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x65, 0x00, // RPN MSB = 0
+            0x00, 0xB0, 0x64, 0x02, // RPN LSB = 2
+            0x00, 0xB0, 0x60, 0x7F, // Data Increment (value ignored)
+            0x00, 0xB0, 0x61, 0x00, // Data Decrement (value ignored)
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pd = smf.parameter_data_entries();
+        assert_eq!(pd.len(), 2);
+        assert_eq!(
+            pd[0].parameter().number(),
+            0x0002,
+            "RPN 2 = Channel Coarse Tuning"
+        );
+        assert!(matches!(
+            pd[0].parameter(),
+            SelectedParameter::Registered {
+                param: RegisteredParameter::ChannelCoarseTuning,
+                ..
+            }
+        ));
+        assert_eq!(pd[0].action(), DataEntryAction::Increment);
+        assert_eq!(pd[1].action(), DataEntryAction::Decrement);
+    }
+
+    #[test]
+    fn parameter_data_entries_null_disables_pump_until_reselect() {
+        // Select RPN 0, do a Data Entry, then select the Null Function
+        // Number (7FH:7FH, packed 0x3FFF) which must suppress the
+        // following Data Entry.
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x65, 0x00, // RPN MSB = 0
+            0x00, 0xB0, 0x64, 0x00, // RPN LSB = 0  (RPN 0)
+            0x00, 0xB0, 0x06, 0x02, // Data Entry MSB = 2  (emitted)
+            0x00, 0xB0, 0x65, 0x7F, // RPN MSB = 127
+            0x00, 0xB0, 0x64, 0x7F, // RPN LSB = 127 (Null)
+            0x00, 0xB0, 0x06, 0x0A, // Data Entry MSB = 10 (suppressed)
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pd = smf.parameter_data_entries();
+        assert_eq!(pd.len(), 1);
+        assert_eq!(pd[0].action(), DataEntryAction::EntryMsb(2));
+    }
+
+    #[test]
+    fn parameter_data_entries_rpn_supersedes_prior_nrpn() {
+        // Select NRPN, then a full RPN selection — the RPN wins; a
+        // Data Entry afterwards addresses the RPN, not the NRPN.
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x63, 0x01, // NRPN MSB = 1
+            0x00, 0xB0, 0x62, 0x02, // NRPN LSB = 2 (NRPN 0x0102)
+            0x00, 0xB0, 0x65, 0x00, // RPN MSB = 0
+            0x00, 0xB0, 0x64, 0x01, // RPN LSB = 1 (RPN 1)
+            0x00, 0xB0, 0x06, 0x40, // Data Entry MSB
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pd = smf.parameter_data_entries();
+        assert_eq!(pd.len(), 1);
+        assert_eq!(
+            pd[0].parameter(),
+            SelectedParameter::Registered {
+                number: 0x0001,
+                param: RegisteredParameter::ChannelFineTuning,
+            }
+        );
+    }
+
+    #[test]
+    fn parameter_data_entries_lone_lsb_rewrites_only_low_byte() {
+        // Full RPN selection then a lone CC 100 (LSB) rewriting only the
+        // low byte: 0x0006 (MSB 0, LSB 6) → MPE Configuration.
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x65, 0x00, // RPN MSB = 0
+            0x00, 0xB0, 0x64, 0x00, // RPN LSB = 0 (RPN 0)
+            0x00, 0xB0, 0x64, 0x06, // RPN LSB = 6 only (now RPN 6)
+            0x00, 0xB0, 0x06, 0x01, // Data Entry MSB
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pd = smf.parameter_data_entries();
+        assert_eq!(pd.len(), 1);
+        assert_eq!(pd[0].parameter().number(), 0x0006);
+        assert!(matches!(
+            pd[0].parameter(),
+            SelectedParameter::Registered {
+                param: RegisteredParameter::MpeConfiguration,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parameter_data_entries_3d_sound_controller_classification() {
+        // RPN 0x3D02 = GAIN (one of the RP-049 3D Sound Controllers).
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x65, 0x3D, // RPN MSB = 0x3D
+            0x00, 0xB0, 0x64, 0x02, // RPN LSB = 0x02
+            0x00, 0xB0, 0x06, 0x50, // Data Entry MSB
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pd = smf.parameter_data_entries();
+        assert_eq!(pd.len(), 1);
+        // MSB 0x3D, LSB 0x02 packs to (0x3D << 7) | 0x02 = 0x1E82.
+        assert_eq!(
+            pd[0].parameter(),
+            SelectedParameter::Registered {
+                number: 0x1E82,
+                param: RegisteredParameter::ThreeDimensionalSound(2),
+            }
+        );
+    }
+
+    #[test]
+    fn parameter_data_entries_reserved_rpn_preserves_raw_number() {
+        // RPN 0x0010 is not in Table 3a → Reserved with the raw number.
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x65, 0x00, // RPN MSB = 0
+            0x00, 0xB0, 0x64, 0x10, // RPN LSB = 0x10 (RPN 0x0010)
+            0x00, 0xB0, 0x06, 0x01, // Data Entry MSB
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pd = smf.parameter_data_entries();
+        assert_eq!(pd.len(), 1);
+        assert_eq!(
+            pd[0].parameter(),
+            SelectedParameter::Registered {
+                number: 0x0010,
+                param: RegisteredParameter::Reserved(0x0010),
+            }
+        );
+    }
+
+    #[test]
+    fn parameter_data_entries_per_channel_selectors_independent() {
+        // Channel 0 selects RPN 0, channel 1 selects RPN 2; each
+        // channel's Data Entry resolves against its own selector.
+        let events: Vec<u8> = vec![
+            0x00, 0xB0, 0x65, 0x00, 0x00, 0xB0, 0x64, 0x00, // ch0 RPN 0
+            0x00, 0xB1, 0x65, 0x00, 0x00, 0xB1, 0x64, 0x02, // ch1 RPN 2
+            0x00, 0xB0, 0x06, 0x05, // ch0 Data Entry MSB
+            0x00, 0xB1, 0x06, 0x07, // ch1 Data Entry MSB
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let pd = smf.parameter_data_entries();
+        assert_eq!(pd.len(), 2);
+        assert_eq!(pd[0].channel(), 0);
+        assert_eq!(pd[0].parameter().number(), 0x0000);
+        assert_eq!(pd[1].channel(), 1);
+        assert_eq!(pd[1].parameter().number(), 0x0002);
+    }
+
+    #[test]
+    fn parameter_data_entries_selector_on_other_track_governs_entry() {
+        // Track 0 selects RPN 0 at tick 0; track 1's Data Entry at a
+        // later tick resolves against it through the global merge.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xB0, 0x65, 0x00]); // RPN MSB
+        t0.extend_from_slice(&[0x00, 0xB0, 0x64, 0x00]); // RPN LSB (RPN 0)
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(10));
+        t1.extend_from_slice(&[0xB0, 0x06, 0x03]); // ch0 Data Entry MSB @tick10
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let pd = smf.parameter_data_entries();
+        assert_eq!(pd.len(), 1);
+        assert_eq!(pd[0].tick, 10);
+        assert_eq!(pd[0].track, 1);
+        assert_eq!(pd[0].parameter().number(), 0x0000);
+        assert_eq!(pd[0].action(), DataEntryAction::EntryMsb(3));
     }
 }

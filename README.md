@@ -42,6 +42,17 @@ total events capped at 1 M to keep malformed input bounded.
   `is_centre()`), `channel_pressures`, `poly_aftertouches`, and the
   piano-roll `notes()` (Note-On/Off pairing with velocity-0 = Off
   convention, FIFO re-strike) plus `active_notes_at(tick)`.
+- **RPN / NRPN decoder** — `parameter_data_entries()` folds the
+  CC 6 / 38 Data Entry pump and CC 96 / 97 Increment / Decrement against
+  each channel's running RPN (CC 101 / 100) / NRPN (CC 99 / 98) selector,
+  emitting one resolved `ParameterDataEntry` per pump action. Registered
+  parameters are classified per Table 3a (`RegisteredParameter`: Pitch
+  Bend Sensitivity, Channel Fine / Coarse Tuning, Tuning Program /
+  Bank, Modulation Depth Range, MPE Config, the nine RP-049 3D Sound
+  Controllers, Null, plus a `Reserved` catch-all); NRPNs surface as raw
+  14-bit numbers. The Null Function Number and the power-up default
+  disable the pump; one active parameter per channel (RPN supersedes
+  NRPN and vice versa).
 - **SysEx** — `sysex_events()` surfaces both `F0` and `F7` flavours
   with `manufacturer_id()` / `ends_with_eox()` / `is_complete_message()`
   helpers; `universal_sysex_events()` + `SysExEvent::

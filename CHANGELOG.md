@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 316 — `SmfFile::parameter_data_entries()` RPN / NRPN Data Entry pump decoder
+
+- New `SmfFile::parameter_data_entries() -> Vec<ParameterDataEntry>`:
+  folds the CC 6 / CC 38 (Data Entry MSB / LSB) and CC 96 / CC 97 (Data
+  Increment / Decrement) pump against each channel's running RPN
+  (CC 101 / CC 100) / NRPN (CC 99 / CC 98) selector state, emitting one
+  resolved parameter-write event per pump action. The read-side analogue
+  of the runtime RPN/NRPN state machine and the resolving companion to
+  `control_changes()`, which deliberately leaves the pump un-decoded.
+- New public types: `ParameterDataEntry` (tick / track / channel /
+  resolved parameter / action), `SelectedParameter`
+  (`Registered { number, param }` vs `NonRegistered { number }` with
+  `number()` / `is_registered()` / `is_null()`), `DataEntryAction`
+  (`EntryMsb` / `EntryLsb` / `Increment` / `Decrement`), and
+  `RegisteredParameter` classifying Table 3a: Pitch Bend Sensitivity,
+  Channel Fine / Coarse Tuning, Tuning Program Change / Bank Select,
+  Modulation Depth Range, MPE Configuration, the nine RP-049 3D Sound
+  Controllers, the Null Function Number, and a `Reserved(number)`
+  catch-all.
+- Selector semantics per MIDI 1.0 *Control Change Messages — Data
+  Bytes* (Table 3 / 3a + the "set or change a Registered Parameter"
+  procedure): one active parameter per channel (RPN supersedes NRPN and
+  vice versa), lone MSB / LSB rewrites preserve the other byte, the Null
+  Function Number (packed `0x3FFF`) and the power-up default disable the
+  pump (no event emitted), and inc/dec drop their "don't care" value
+  byte. State evolves along the globally merged `(tick, track, order)`
+  stream so a conductor-track selector governs a later part-track entry.
+- Twelve new unit tests: empty / no-selection-drop / RPN0 MSB+LSB /
+  NRPN raw number / inc-dec value-drop / null-disables / RPN-supersedes-
+  NRPN / lone-LSB-rewrite / 3D-controller packing / reserved-RPN /
+  per-channel-independence / cross-track selector. Full lib suite
+  557 → 569 tests, zero ignored.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-midi/compare/v0.0.3...v0.0.4) - 2026-06-14
 
 ### Other
