@@ -330,6 +330,100 @@ impl TempoChange {
     }
 }
 
+/// Default tempo assumed before the first Set Tempo (`FF 51`) meta
+/// event: 500 000 microseconds per quarter note = 120 BPM. The SMF
+/// specification (M1 *MIDI 1.0 Detailed Specification*, the Standard
+/// MIDI Files addendum) defines this as the playback default for any
+/// file that omits an initial tempo.
+pub const DEFAULT_TEMPO_US_PER_QUARTER: u32 = 500_000;
+
+/// A precomputed mapping from absolute division ticks to wall-clock
+/// seconds, folding a file's tempo map against its
+/// [`Division`](crate::smf::Division).
+///
+/// Built once via [`SmfFile::tempo_timeline`], then queried repeatedly
+/// with [`tick_to_seconds`](Self::tick_to_seconds) in `O(log n)` per
+/// lookup (binary search over the tempo segments). This is the
+/// read-side companion to the scheduler's tick→sample conversion — both
+/// use the same arithmetic so a file's reported duration agrees with
+/// the rendered output length.
+///
+/// ## Conversion math
+///
+/// For a [`Division::TicksPerQuarter`] `div` under a tempo of
+/// `usec_per_quarter` microseconds per quarter note, the seconds spent
+/// crossing one tick is constant within a tempo segment:
+///
+/// ```text
+///   seconds_per_tick = (usec_per_quarter / 1_000_000) / div
+/// ```
+///
+/// At each Set Tempo change the rate switches; the timeline accumulates
+/// the elapsed seconds at each change boundary so an arbitrary tick is
+/// resolved as `seconds_at_segment_start + ticks_into_segment *
+/// seconds_per_tick`.
+///
+/// For a [`Division::Smpte`] file the timebase is already absolute
+/// (frames × subdivisions per second), so tempo meta events do **not**
+/// affect timing and the rate is constant:
+///
+/// ```text
+///   seconds_per_tick = 1 / (frames_per_second * ticks_per_frame)
+/// ```
+///
+/// matching the scheduler's SMPTE branch. Note the stored
+/// `frames_per_second` byte is used verbatim — `29` is treated as a
+/// literal 29 here (the same simplification the scheduler makes),
+/// rather than the 29.97 drop-frame playback rate the SMPTE counter
+/// nominally labels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TempoTimeline {
+    /// Per-segment anchors. Each entry is
+    /// `(start_tick, seconds_at_start_tick, seconds_per_tick)` and the
+    /// vector is sorted by `start_tick` with a synthetic leading entry
+    /// at tick 0 (the default tempo applies until the first change).
+    segments: Vec<TimelineSegment>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TimelineSegment {
+    start_tick: u64,
+    seconds_at_start: f64,
+    seconds_per_tick: f64,
+}
+
+impl TempoTimeline {
+    /// Convert an absolute division tick to elapsed wall-clock seconds
+    /// from the start of the file.
+    ///
+    /// Ticks before the first tempo segment boundary resolve against
+    /// the default tempo (the segment list always begins at tick 0).
+    /// The result is monotonically non-decreasing in `tick`.
+    pub fn tick_to_seconds(&self, tick: u64) -> f64 {
+        // Find the last segment whose start_tick <= tick. The list is
+        // sorted and always non-empty (a tick-0 anchor is synthesised
+        // at construction), so partition_point gives the segment index.
+        let idx = self
+            .segments
+            .partition_point(|s| s.start_tick <= tick)
+            .saturating_sub(1);
+        let seg = self.segments[idx];
+        let into_segment = tick.saturating_sub(seg.start_tick) as f64;
+        seg.seconds_at_start + into_segment * seg.seconds_per_tick
+    }
+
+    /// The tempo segments backing this timeline, exposed for callers
+    /// that want to walk boundaries directly. Each tuple is
+    /// `(start_tick, seconds_at_start, seconds_per_tick)`; the first
+    /// entry is always the tick-0 anchor.
+    pub fn segments(&self) -> Vec<(u64, f64, f64)> {
+        self.segments
+            .iter()
+            .map(|s| (s.start_tick, s.seconds_at_start, s.seconds_per_tick))
+            .collect()
+    }
+}
+
 /// One key-signature change pinned to the absolute tick (relative to
 /// the start of its parent track) at which the
 /// [`FF 59 02 sf mi`](MetaEvent::KeySignature) meta event fires.
@@ -2887,6 +2981,125 @@ impl SmfFile {
         // convention).
         out.sort_by_key(|c| c.tick);
         out
+    }
+
+    /// Build a [`TempoTimeline`] that converts absolute division ticks
+    /// to elapsed wall-clock seconds, folding this file's
+    /// [`tempo_map`](Self::tempo_map) against its
+    /// [`Division`](crate::smf::Division).
+    ///
+    /// The timeline starts at the SMF default tempo
+    /// ([`DEFAULT_TEMPO_US_PER_QUARTER`] = 120 BPM) and switches at each
+    /// Set Tempo (`FF 51`) change in merged `(tick, track)` order — the
+    /// same ordering [`tempo_map`](Self::tempo_map) and the scheduler
+    /// use. A tempo change repeated at the same tick keeps only its
+    /// final value (the last write at a tick wins, matching a receiver
+    /// processing both in order). For an [`Division::Smpte`] file the
+    /// rate is fixed by the timebase and Set Tempo events are ignored,
+    /// exactly as the scheduler treats them.
+    ///
+    /// Build once, then query [`TempoTimeline::tick_to_seconds`]
+    /// repeatedly; each lookup is `O(log n)` over the tempo segments.
+    /// For a single conversion prefer [`tick_to_seconds`](Self::tick_to_seconds).
+    ///
+    /// Cost is `O(n log n)` in the total event count (one tempo-map
+    /// pass plus the sort), bounded above by [`MAX_EVENTS_PER_FILE`].
+    pub fn tempo_timeline(&self) -> TempoTimeline {
+        let seconds_per_tick_at = |us_per_quarter: u32| -> f64 {
+            match self.header.division {
+                Division::TicksPerQuarter(div) => {
+                    // (usec_per_quarter / 1_000_000) / division — the
+                    // scheduler's samples_per_tick math with sr factored
+                    // out. div is clamped to >= 1 to mirror the
+                    // scheduler's div.max(1) guard against a malformed
+                    // zero division.
+                    (us_per_quarter as f64 / 1_000_000.0) / (div.max(1) as f64)
+                }
+                Division::Smpte {
+                    frames_per_second,
+                    ticks_per_frame,
+                } => {
+                    // Absolute timebase: tempo events do not apply.
+                    let denom = (frames_per_second.max(1) as f64) * (ticks_per_frame.max(1) as f64);
+                    1.0 / denom
+                }
+            }
+        };
+
+        let mut segments: Vec<TimelineSegment> = Vec::new();
+        // Leading anchor at tick 0 with the default tempo. For an SMPTE
+        // division the rate is constant so this single segment suffices;
+        // for a musical division it covers the span before the first
+        // Set Tempo change.
+        segments.push(TimelineSegment {
+            start_tick: 0,
+            seconds_at_start: 0.0,
+            seconds_per_tick: seconds_per_tick_at(DEFAULT_TEMPO_US_PER_QUARTER),
+        });
+
+        if matches!(self.header.division, Division::TicksPerQuarter(_)) {
+            for change in self.tempo_map() {
+                let prev = *segments.last().expect("anchor always present");
+                if change.tick == prev.start_tick {
+                    // A tempo change at the same tick as the current
+                    // anchor replaces its rate (last write wins); the
+                    // elapsed seconds at this boundary are unchanged.
+                    if let Some(last) = segments.last_mut() {
+                        last.seconds_per_tick =
+                            seconds_per_tick_at(change.microseconds_per_quarter_note);
+                    }
+                    continue;
+                }
+                let span_ticks = change.tick.saturating_sub(prev.start_tick) as f64;
+                let seconds_at_start = prev.seconds_at_start + span_ticks * prev.seconds_per_tick;
+                segments.push(TimelineSegment {
+                    start_tick: change.tick,
+                    seconds_at_start,
+                    seconds_per_tick: seconds_per_tick_at(change.microseconds_per_quarter_note),
+                });
+            }
+        }
+
+        TempoTimeline { segments }
+    }
+
+    /// Convert a single absolute division tick to elapsed wall-clock
+    /// seconds from the start of the file.
+    ///
+    /// Convenience wrapper that builds a [`TempoTimeline`] and performs
+    /// one lookup. For many conversions build the timeline once with
+    /// [`tempo_timeline`](Self::tempo_timeline) and reuse it instead of
+    /// paying the `O(n log n)` build cost per call.
+    pub fn tick_to_seconds(&self, tick: u64) -> f64 {
+        self.tempo_timeline().tick_to_seconds(tick)
+    }
+
+    /// The total wall-clock duration of the file in seconds: the elapsed
+    /// time at the file's last event tick, folding the tempo map.
+    ///
+    /// The end tick is the maximum absolute tick across every track
+    /// (each track's deltas summed independently, then the max taken) —
+    /// for a format-0/1 file this is the latest event on the shared
+    /// timebase, including the terminating End of Track. Returns `0.0`
+    /// for a file with no events.
+    ///
+    /// Note this measures the *scheduled event span*, not the audible
+    /// tail: a synth voice with a long release envelope may still be
+    /// sounding after the last event. It mirrors the scheduler's
+    /// `estimated_total_samples` stop bound, in seconds.
+    ///
+    /// Cost is `O(n log n)` in the total event count, bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn duration_seconds(&self) -> f64 {
+        let mut end_tick: u64 = 0;
+        for track in &self.tracks {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+            }
+            end_tick = end_tick.max(abs);
+        }
+        self.tempo_timeline().tick_to_seconds(end_tick)
     }
 
     /// Collect every [`MetaEvent::TimeSignature`] from every track,
@@ -6483,6 +6696,144 @@ mod tests {
         assert_eq!(tc.microseconds_per_quarter_note, 0);
         assert!(tc.bpm.is_infinite());
         assert!(tc.bpm.is_sign_positive());
+    }
+
+    // ───────── TempoTimeline / SmfFile::tick_to_seconds ─────────
+
+    #[test]
+    fn tick_to_seconds_default_tempo_120bpm() {
+        // No FF 51 → default 500_000 µs/qn = 120 BPM. At 480 ticks per
+        // quarter, one quarter note (480 ticks) lasts 0.5 s.
+        let events: &[u8] = &[0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(events));
+        let smf = parse(&blob).unwrap();
+        // 0.5 s/quarter / 480 ticks = 1/960 s per tick.
+        assert!((smf.tick_to_seconds(0) - 0.0).abs() < 1e-12);
+        assert!((smf.tick_to_seconds(480) - 0.5).abs() < 1e-9);
+        assert!((smf.tick_to_seconds(960) - 1.0).abs() < 1e-9);
+        assert!((smf.tick_to_seconds(240) - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tick_to_seconds_initial_tempo_change() {
+        // delta=0 FF 51 03 03 D0 90 → 250_000 µs/qn = 240 BPM. One
+        // quarter (480 ticks) now lasts 0.25 s.
+        let events: &[u8] = &[
+            0x00, 0xFF, 0x51, 0x03, 0x03, 0xD0, 0x90, 0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(events));
+        let smf = parse(&blob).unwrap();
+        assert!((smf.tick_to_seconds(480) - 0.25).abs() < 1e-9);
+        assert!((smf.tick_to_seconds(960) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tick_to_seconds_piecewise_across_tempo_changes() {
+        // tick 0   : 120 BPM (500_000) → 1/960 s/tick
+        // tick 480 : 240 BPM (250_000) → 1/1920 s/tick
+        // tick 960 :  60 BPM (1_000_000) → 1/480 s/tick
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]); // 500_000
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0xFF, 0x51, 0x03, 0x03, 0xD0, 0x90]); // 250_000
+        events.extend_from_slice(&encode_vlq(480));
+        events.extend_from_slice(&[0xFF, 0x51, 0x03, 0x0F, 0x42, 0x40]); // 1_000_000
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let tl = smf.tempo_timeline();
+        // First segment: 480 ticks @ 0.5 s/quarter = 0.5 s elapsed at tick 480.
+        assert!((tl.tick_to_seconds(480) - 0.5).abs() < 1e-9);
+        // Mid first segment.
+        assert!((tl.tick_to_seconds(240) - 0.25).abs() < 1e-9);
+        // Second segment: 480 ticks @ 0.25 s/quarter = +0.25 → 0.75 s at tick 960.
+        assert!((tl.tick_to_seconds(960) - 0.75).abs() < 1e-9);
+        // Mid second segment (tick 720, 240 ticks in): 0.5 + 240/1920.
+        assert!((tl.tick_to_seconds(720) - (0.5 + 240.0 / 1920.0)).abs() < 1e-9);
+        // Third segment: 480 ticks @ 1.0 s/quarter = +1.0 → 1.75 s at tick 1440.
+        assert!((tl.tick_to_seconds(1440) - 1.75).abs() < 1e-9);
+        // Monotonic non-decreasing.
+        let mut prev = 0.0;
+        for t in [0u64, 100, 480, 720, 960, 1200, 1440, 5000] {
+            let s = tl.tick_to_seconds(t);
+            assert!(s >= prev - 1e-12, "non-monotonic at tick {t}: {s} < {prev}");
+            prev = s;
+        }
+    }
+
+    #[test]
+    fn tick_to_seconds_smpte_ignores_tempo() {
+        // 25 fps, 40 ticks/frame → 1000 ticks/second exactly. A Set
+        // Tempo event must NOT change the rate for an SMPTE division.
+        let div = u16::from_be_bytes([0xE7, 0x28]); // -25 fps, 40 tpf
+        let mut events: Vec<u8> = Vec::new();
+        // A tempo change that would alter a musical division — ignored here.
+        events.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x03, 0xD0, 0x90]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, div);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        // 1 / (25 * 40) = 1/1000 s per tick.
+        assert!((smf.tick_to_seconds(1000) - 1.0).abs() < 1e-9);
+        assert!((smf.tick_to_seconds(500) - 0.5).abs() < 1e-9);
+        // Only the tick-0 anchor segment exists; tempo events skipped.
+        assert_eq!(smf.tempo_timeline().segments().len(), 1);
+    }
+
+    #[test]
+    fn duration_seconds_uses_max_end_tick_across_tracks() {
+        // Track 0: 120 BPM, EOT at tick 960 (two quarters = 1.0 s).
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]); // 500_000
+        t0.extend_from_slice(&encode_vlq(960));
+        t0.extend_from_slice(&[0xFF, 0x2F, 0x00]);
+        // Track 1: a note that ends at tick 1440 (three quarters = 1.5 s).
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]);
+        t1.extend_from_slice(&encode_vlq(1440));
+        t1.extend_from_slice(&[0x80, 0x3C, 0x40]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        // Max end tick = 1440 → 1.5 s at 120 BPM.
+        assert!((smf.duration_seconds() - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn duration_seconds_empty_file_is_zero() {
+        let events: &[u8] = &[0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 480);
+        blob.extend(track_chunk(events));
+        let smf = parse(&blob).unwrap();
+        // Only an EOT at tick 0 → zero elapsed.
+        assert!((smf.duration_seconds() - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn tempo_timeline_same_tick_change_last_wins() {
+        // Two tempo changes both at tick 0: the later one (250_000)
+        // must govern the segment rate. Place them on two tracks so the
+        // merge collapses them to the same tick.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]); // 500_000
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03, 0x03, 0xD0, 0x90]); // 250_000
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 480);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let tl = smf.tempo_timeline();
+        // Single segment at tick 0; rate from the last write (track 1,
+        // 250_000 = 240 BPM): 480 ticks → 0.25 s.
+        assert_eq!(tl.segments().len(), 1);
+        assert!((tl.tick_to_seconds(480) - 0.25).abs() < 1e-9);
     }
 
     // ───────── KeySignatureChange / SmfFile::key_signatures ─────────

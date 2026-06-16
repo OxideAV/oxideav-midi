@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 320 — `SmfFile` tick → wall-clock-seconds conversion
+
+- New `SmfFile::tempo_timeline() -> TempoTimeline`: precomputes the
+  per-segment mapping from absolute division ticks to elapsed seconds by
+  folding `tempo_map()` against the header `Division`. The returned
+  `TempoTimeline::tick_to_seconds(tick)` resolves any tick in `O(log n)`
+  via binary search over tempo segments; `TempoTimeline::segments()`
+  exposes the `(start_tick, seconds_at_start, seconds_per_tick)` anchors.
+- New `SmfFile::tick_to_seconds(tick) -> f64` one-shot convenience and
+  `SmfFile::duration_seconds() -> f64` (elapsed time at the max end tick
+  across all tracks; `0.0` for an empty file).
+- New public `const DEFAULT_TEMPO_US_PER_QUARTER: u32 = 500_000` (the SMF
+  120-BPM default assumed before the first Set Tempo).
+- Conversion semantics mirror the scheduler's tick→sample arithmetic:
+  for `Division::TicksPerQuarter`, `seconds_per_tick =
+  (usec_per_quarter / 1_000_000) / division`, integrated piecewise
+  across each `FF 51` Set Tempo change (a change repeated at the same
+  tick keeps its last value); for `Division::Smpte`, the rate is fixed
+  at `1 / (frames_per_second × ticks_per_frame)` and Set Tempo events do
+  not apply. The `frames_per_second` byte is used verbatim (29 treated
+  literally, as the scheduler does). Result is monotonically
+  non-decreasing in tick, so reported duration agrees with rendered
+  output length.
+- Seven new unit tests: default-120-BPM / initial-tempo-change /
+  piecewise-across-changes (+ monotonicity) / SMPTE-ignores-tempo /
+  duration-max-end-tick / empty-file-zero / same-tick-last-wins. Full
+  lib suite 569 → 576 tests, zero ignored.
+
 ### Round 316 — `SmfFile::parameter_data_entries()` RPN / NRPN Data Entry pump decoder
 
 - New `SmfFile::parameter_data_entries() -> Vec<ParameterDataEntry>`:

@@ -59,6 +59,16 @@ total events capped at 1 M to keep malformed input bounded.
   universal_classification()` decode the Universal SysEx Table 4
   vocabulary (`UniversalSysEx` / `UniversalSubId1`), realm-aware
   (Non-RT `0x7E` vs RT `0x7F`).
+- **Tick → wall-clock time** — `tempo_timeline()` folds the tempo map
+  against the header `Division` into a `TempoTimeline`; its
+  `tick_to_seconds(tick)` resolves any absolute tick to elapsed seconds
+  in `O(log n)` (binary search over tempo segments). `tick_to_seconds()`
+  is the one-shot convenience and `duration_seconds()` reports the
+  scheduled event span (max end tick across tracks). Musical divisions
+  integrate piecewise across Set Tempo changes; SMPTE divisions use the
+  fixed `1/(fps × ticks_per_frame)` rate and ignore tempo events —
+  matching the scheduler's tick→sample arithmetic so reported duration
+  agrees with rendered length.
 - **Channel-state snapshot** — `SmfChannelSnapshot` +
   `channel_snapshot_at(channel, tick)` /
   `channel_snapshots_at(tick)` replay channel-voice events up to a
