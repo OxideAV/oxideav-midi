@@ -58,7 +58,12 @@ total events capped at 1 M to keep malformed input bounded.
   helpers; `universal_sysex_events()` + `SysExEvent::
   universal_classification()` decode the Universal SysEx Table 4
   vocabulary (`UniversalSysEx` / `UniversalSubId1`), realm-aware
-  (Non-RT `0x7E` vs RT `0x7F`).
+  (Non-RT `0x7E` vs RT `0x7F`). `UniversalSysExEvent::
+  mtc_full_message()` decodes the Real-Time MIDI Time Code **Full
+  Message** body (`F0 7F dev 01 01 hr mn sc fr F7`) into a typed
+  `MtcFullMessage` — the SMPTE `hr/mn/sc/fr` quartet plus a decoded
+  `FrameRate` (24 / 25 / 30-drop / 30-non-drop) and hours count;
+  `None` on non-Full-Message packets or a quartet truncated mid-stream.
 - **Tick → wall-clock time** — `tempo_timeline()` folds the tempo map
   against the header `Division` into a `TempoTimeline`; its
   `tick_to_seconds(tick)` resolves any absolute tick to elapsed seconds

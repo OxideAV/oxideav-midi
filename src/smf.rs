@@ -2238,6 +2238,98 @@ pub struct UniversalSysExEvent {
     pub data: Vec<u8>,
 }
 
+/// A decoded MIDI Time Code **Full Message** — the single-packet SMPTE
+/// time an MTC generator sends when a system is located or cued to an
+/// absolute position (fast-forward / rewind / autolocate), rather than
+/// streamed two-frames-at-a-time as Quarter-Frame messages.
+///
+/// Wire shape (RP-004/008 §"Full Message", 10 bytes):
+///
+/// ```text
+/// F0 7F <device ID> 01 01 hr mn sc fr F7
+///   hr = 0 yy zzzzz   yy = frame-rate type (bits 5-6); zzzzz = hours 0..=23
+///   mn = minutes 0..=59
+///   sc = seconds 0..=59
+///   fr = frames  0..=29 (per the type's nominal rate)
+/// ```
+///
+/// The packet is a Real-Time (`0x7F`) Universal SysEx with Sub-ID #1
+/// `0x01` (MIDI Time Code) and Sub-ID #2 `0x01` (Full Message). Decoded
+/// via [`UniversalSysExEvent::mtc_full_message`].
+///
+/// The `hr` byte packs the frame-rate type in bits 5-6 exactly as the
+/// `FF 54` SMPTE Offset meta event does, so the rate is decoded through
+/// the shared [`FrameRate::from_hours_byte`]. Bit 7 of `hr` is reserved
+/// and ignored by receivers per the spec; the raw byte is preserved in
+/// [`hours_raw`](Self::hours_raw) for callers that need it.
+///
+/// Counter fields are surfaced verbatim from the wire — the decoder does
+/// not clamp to the per-rate legal ranges, so a pathological generator
+/// that emits an out-of-range frame number stays visible to the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MtcFullMessage {
+    /// Raw `hr` byte. Bits 5-6 hold the frame-rate type (`yy`); bits
+    /// 0-4 hold the hours count (`0..=23`); bit 7 is reserved and
+    /// ignored by receivers per RP-004/008.
+    pub hours_raw: u8,
+    /// Minutes count (`0..=59` per spec; preserved verbatim).
+    pub minutes: u8,
+    /// Seconds count (`0..=59` per spec; preserved verbatim).
+    pub seconds: u8,
+    /// Frames count (`0..=29` for 30 Hz; `0..=24` for 25 Hz; `0..=23`
+    /// for 24 Hz — preserved verbatim).
+    pub frames: u8,
+}
+
+impl MtcFullMessage {
+    /// Hours count (`0..=23`), the low five bits of the `hr` byte.
+    pub fn hours_count(&self) -> u8 {
+        self.hours_raw & 0b0001_1111
+    }
+
+    /// Decoded SMPTE frame rate from bits 5-6 of the `hr` byte.
+    pub fn frame_rate(&self) -> FrameRate {
+        FrameRate::from_hours_byte(self.hours_raw)
+    }
+}
+
+impl UniversalSysExEvent {
+    /// Decode this packet as an MTC **Full Message** when it is one,
+    /// returning the SMPTE `hr / mn / sc / fr` quartet (and, via
+    /// [`MtcFullMessage`], the decoded frame rate and hours count).
+    ///
+    /// Returns `None` unless the packet classifies as a Real-Time
+    /// (`0x7F`) MIDI Time Code Full Message
+    /// ([`UniversalSubId2::RtMtcFullMessage`]) *and* the verbatim
+    /// payload carries the full four-byte time quartet after Sub-ID #2.
+    /// A correctly-classified packet that is truncated before all four
+    /// time bytes arrive (a malformed stream) yields `None` rather than
+    /// a partially-decoded time.
+    ///
+    /// Payload indexing follows the [`data`](Self::data) layout
+    /// `<realm> <device_id> <sub_id1> <sub_id2> hr mn sc fr [F7]`, so
+    /// the quartet begins at byte index 4.
+    pub fn mtc_full_message(&self) -> Option<MtcFullMessage> {
+        if !matches!(
+            self.classification.sub_id1,
+            UniversalSubId1::MidiTimeCode(UniversalSubId2::RtMtcFullMessage)
+        ) {
+            return None;
+        }
+        // <realm> <device_id> <sub_id1> <sub_id2> hr mn sc fr ...
+        let hr = *self.data.get(4)?;
+        let mn = *self.data.get(5)?;
+        let sc = *self.data.get(6)?;
+        let fr = *self.data.get(7)?;
+        Some(MtcFullMessage {
+            hours_raw: hr,
+            minutes: mn,
+            seconds: sc,
+            frames: fr,
+        })
+    }
+}
+
 /// Sub-ID #1 category of a Universal System Exclusive packet — the
 /// `<sub_id1>` byte in the `F0 <realm> <device_id> <sub_id1> …` wire
 /// shape, decoded against Table 4 of the MIDI 1.0 *Universal System
@@ -9857,6 +9949,110 @@ mod tests {
             assert_eq!(lhs.classification, rhs.2);
             assert_eq!(lhs.data, rhs.3);
         }
+    }
+
+    // ───────── UniversalSysExEvent::mtc_full_message ─────────
+
+    /// Build a `UniversalSysExEvent` directly from a verbatim payload
+    /// (the bytes `SysExEvent::data` would carry: `<realm> <device_id>
+    /// <sub_id1> <sub_id2> …`). Mirrors `make_sysex` for the universal
+    /// view.
+    fn make_universal(payload: &[u8]) -> UniversalSysExEvent {
+        let classification = make_sysex(payload).universal_classification().unwrap();
+        UniversalSysExEvent {
+            tick: 0,
+            track: 0,
+            classification,
+            data: payload.to_vec(),
+        }
+    }
+
+    #[test]
+    fn mtc_full_message_decodes_smpte_quartet_and_rate() {
+        // RP-004/008 worked example 01:37:52:16 @ 30 fps non-drop.
+        // hr = 0 11 00001 = 0b0110_0001 = 0x61 (type 3 = 30 non-drop,
+        // hours 1); mn = 37 = 0x25; sc = 52 = 0x34; fr = 16 = 0x10.
+        // F0 7F 7F 01 01 61 25 34 10 F7
+        let ev = make_universal(&[0x7F, 0x7F, 0x01, 0x01, 0x61, 0x25, 0x34, 0x10, 0xF7]);
+        let full = ev.mtc_full_message().expect("classifies as Full Message");
+        assert_eq!(full.hours_raw, 0x61);
+        assert_eq!(full.hours_count(), 1);
+        assert_eq!(full.minutes, 37);
+        assert_eq!(full.seconds, 52);
+        assert_eq!(full.frames, 16);
+        assert_eq!(full.frame_rate(), FrameRate::Fps30NonDrop);
+    }
+
+    #[test]
+    fn mtc_full_message_decodes_all_four_frame_rate_types() {
+        // hr byte = 0 yy zzzzz; sweep the frame-rate type in bits 5-6
+        // (yy = 00/01/10/11) with hours 0: 0x00 / 0x20 / 0x40 / 0x60.
+        for (hr, rate) in [
+            (0x00u8, FrameRate::Fps24),
+            (0x20, FrameRate::Fps25),
+            (0x40, FrameRate::Fps30DropFrame),
+            (0x60, FrameRate::Fps30NonDrop),
+        ] {
+            let ev = make_universal(&[0x7F, 0x7F, 0x01, 0x01, hr, 0x00, 0x00, 0x00, 0xF7]);
+            let full = ev.mtc_full_message().unwrap();
+            assert_eq!(full.frame_rate(), rate, "hr={hr:#04x}");
+            assert_eq!(full.hours_count(), 0);
+        }
+    }
+
+    #[test]
+    fn mtc_full_message_none_for_non_full_message_universal_packets() {
+        // RT MTC User Bits (sub-id2 0x02) is MTC but not a Full Message.
+        let user_bits = make_universal(&[
+            0x7F, 0x7F, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF7,
+        ]);
+        assert_eq!(user_bits.mtc_full_message(), None);
+        // GM 1 System On (Non-RT) — not MTC at all.
+        let gm_on = make_universal(&[0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        assert_eq!(gm_on.mtc_full_message(), None);
+        // Master Volume (RT Device Control) — different sub-id1.
+        let master_vol = make_universal(&[0x7F, 0x7F, 0x04, 0x01, 0x30, 0x30, 0xF7]);
+        assert_eq!(master_vol.mtc_full_message(), None);
+    }
+
+    #[test]
+    fn mtc_full_message_none_when_quartet_truncated() {
+        // Correctly classified RT MTC Full Message but the stream ends
+        // before all four time bytes arrive: hr + mn present, sc/fr
+        // missing → None rather than a half-decoded time.
+        let truncated = make_universal(&[0x7F, 0x7F, 0x01, 0x01, 0x61, 0x25]);
+        assert_eq!(truncated.classification.realm, UniversalRealm::RealTime);
+        assert_eq!(
+            truncated.classification.sub_id1,
+            UniversalSubId1::MidiTimeCode(UniversalSubId2::RtMtcFullMessage)
+        );
+        assert_eq!(truncated.mtc_full_message(), None);
+    }
+
+    #[test]
+    fn mtc_full_message_via_parsed_smf_at_absolute_tick() {
+        // delta=128 F0 09 7F 7F 01 01 41 1E 0F 0C F7 — Full Message.
+        // hr = 0 10 00001 = 0x41 → type 2 (30 drop), hours 1;
+        // mn = 0x1E = 30; sc = 0x0F = 15; fr = 0x0C = 12.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&encode_vlq(128));
+        events.extend_from_slice(&[
+            0xF0, 0x09, 0x7F, 0x7F, 0x01, 0x01, 0x41, 0x1E, 0x0F, 0x0C, 0xF7,
+        ]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let u = smf.universal_sysex_events();
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].tick, 128);
+        let full = u[0].mtc_full_message().expect("Full Message decodes");
+        assert_eq!(full.frame_rate(), FrameRate::Fps30DropFrame);
+        assert!(full.frame_rate().is_drop_frame());
+        assert_eq!(full.hours_count(), 1);
+        assert_eq!(full.minutes, 30);
+        assert_eq!(full.seconds, 15);
+        assert_eq!(full.frames, 12);
     }
 
     // ───────── SysExEvent::universal_classification ─────────

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 327 — MTC Full Message body decoder
+
+- New `MtcFullMessage` struct + `UniversalSysExEvent::mtc_full_message()
+  -> Option<MtcFullMessage>`: decodes a Real-Time MIDI Time Code **Full
+  Message** (`F0 7F <dev> 01 01 hr mn sc fr F7`, RP-004/008 §"Full
+  Message") into its SMPTE `hr / mn / sc / fr` quartet. Returns `None`
+  unless the packet classifies as `UniversalSubId2::RtMtcFullMessage`
+  *and* carries all four time bytes (truncated streams yield `None`
+  rather than a half-decoded time).
+- `MtcFullMessage::frame_rate()` decodes bits 5-6 of the `hr` byte
+  through the shared `FrameRate::from_hours_byte`; `hours_count()`
+  returns the low five bits (`0..=23`). Counter fields are surfaced
+  verbatim — no per-rate clamping — so pathological generators stay
+  visible to the caller.
+
 ### Round 320 — `SmfFile` tick → wall-clock-seconds conversion
 
 - New `SmfFile::tempo_timeline() -> TempoTimeline`: precomputes the
