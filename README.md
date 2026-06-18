@@ -64,6 +64,12 @@ total events capped at 1 M to keep malformed input bounded.
   `MtcFullMessage` — the SMPTE `hr/mn/sc/fr` quartet plus a decoded
   `FrameRate` (24 / 25 / 30-drop / 30-non-drop) and hours count;
   `None` on non-Full-Message packets or a quartet truncated mid-stream.
+  `UniversalSysExEvent::mtc_user_bits()` decodes the Real-Time MTC
+  **User Bits Message** body (`F0 7F dev 01 02 u1..u9 F7`) into a typed
+  `MtcUserBits` — the eight SMPTE/EBU Binary Groups plus the two Binary
+  Group Flag Bits (`flag_i` / `flag_j`) and the `reassembled()` 32-bit
+  value (`hhhhgggg ffffeeee ddddcccc bbbbaaaa` nibble order); `None` on
+  non-User-Bits packets or a payload truncated before all nine bytes.
 - **Tick → wall-clock time** — `tempo_timeline()` folds the tempo map
   against the header `Division` into a `TempoTimeline`; its
   `tick_to_seconds(tick)` resolves any absolute tick to elapsed seconds

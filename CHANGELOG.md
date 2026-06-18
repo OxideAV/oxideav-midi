@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 332 — MTC User Bits Message body decoder
+
+- New `MtcUserBits` struct + `UniversalSysExEvent::mtc_user_bits()
+  -> Option<MtcUserBits>`: decodes a Real-Time MIDI Time Code **User
+  Bits Message** (`F0 7F <dev> 01 02 u1..u9 F7`, RP-004/008 §"User
+  Bits") into its eight SMPTE/EBU Binary Groups (`groups: [u8; 8]`,
+  each masked to the low nibble of its `0000xxxx` payload byte) plus
+  the `u9` Binary Group Flag-Bits byte. Returns `None` unless the
+  packet classifies as `UniversalSubId2::RtMtcUserBits` *and* carries
+  all nine `u1..u9` bytes (truncated streams yield `None`).
+- `MtcUserBits::flag_i()` / `flag_j()` isolate the two flag bits
+  (`i` = `u9` bit 0 = SMPTE bit 43 / EBU bit 27; `j` = `u9` bit 1 =
+  SMPTE bit 59 / EBU bit 43). `reassembled()` returns the 32-bit
+  value the eight groups form per the November-1991 redefinition
+  (`hhhhgggg ffffeeee ddddcccc bbbbaaaa`: Group 1 in the least-
+  significant nibble, Group 8 in the most-significant).
+
 ### Round 327 — MTC Full Message body decoder
 
 - New `MtcFullMessage` struct + `UniversalSysExEvent::mtc_full_message()

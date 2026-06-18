@@ -2293,6 +2293,87 @@ impl MtcFullMessage {
     }
 }
 
+/// A decoded MIDI Time Code **User Bits Message** — the 32 SMPTE/EBU
+/// user-bits an MTC generator transfers down the line, plus the two
+/// Binary Group Flag Bits.
+///
+/// SMPTE provides 32 "user bits" for application-defined data (date
+/// code, reel number, …) that persist throughout a run of time code.
+/// The message ships them as eight 4-bit Binary Groups (each in the
+/// low nibble of a payload byte) plus a ninth byte holding two flag
+/// bits.
+///
+/// Wire shape (RP-004/008 §"User Bits", 15 bytes):
+///
+/// ```text
+/// F0 7F <device ID> 01 02 u1 u2 u3 u4 u5 u6 u7 u8 u9 F7
+///   u1 = 0000aaaa   Binary Group 1 (low nibble)
+///   u2 = 0000bbbb   Binary Group 2
+///   u3 = 0000cccc   Binary Group 3
+///   u4 = 0000dddd   Binary Group 4
+///   u5 = 0000eeee   Binary Group 5
+///   u6 = 0000ffff   Binary Group 6
+///   u7 = 0000gggg   Binary Group 7
+///   u8 = 0000hhhh   Binary Group 8
+///   u9 = 000000ji   Binary Group Flag Bits (j = SMPTE bit 59 / EBU
+///                   bit 43; i = SMPTE bit 43 / EBU bit 27)
+/// ```
+///
+/// The packet is a Real-Time (`0x7F`) Universal SysEx with Sub-ID #1
+/// `0x01` (MIDI Time Code) and Sub-ID #2 `0x02` (User Bits Message).
+/// Decoded via [`UniversalSysExEvent::mtc_user_bits`].
+///
+/// Per the November-1991 redefinition noted in RP-004/008, when the
+/// eight Binary Group nibbles carry 8-bit characters they reassemble
+/// as four bytes in the order `hhhhgggg ffffeeee ddddcccc bbbbaaaa`;
+/// [`reassembled`](Self::reassembled) returns exactly that 32-bit
+/// value. The flag bits are surfaced individually via [`flag_i`] /
+/// [`flag_j`] and the raw `u9` byte is preserved in
+/// [`flag_byte`](Self::flag_byte).
+///
+/// Group nibbles are surfaced verbatim in [`groups`](Self::groups) —
+/// the decoder masks each to its low four bits but otherwise does not
+/// interpret BCD vs. 8-bit-character usage, leaving that to the caller.
+///
+/// [`flag_i`]: Self::flag_i
+/// [`flag_j`]: Self::flag_j
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MtcUserBits {
+    /// The eight Binary Groups 1..=8, each the low four bits of its
+    /// payload byte (`a` = `groups[0]` … `h` = `groups[7]`).
+    pub groups: [u8; 8],
+    /// Raw `u9` byte holding the two Binary Group Flag Bits in bits
+    /// 0-1 (`i` = bit 0, `j` = bit 1); bits 2-7 are reserved.
+    pub flag_byte: u8,
+}
+
+impl MtcUserBits {
+    /// The `i` Binary Group Flag Bit (bit 0 of `u9`) — SMPTE time code
+    /// bit 43 / EBU bit 27.
+    pub fn flag_i(&self) -> bool {
+        self.flag_byte & 0b0000_0001 != 0
+    }
+
+    /// The `j` Binary Group Flag Bit (bit 1 of `u9`) — SMPTE time code
+    /// bit 59 / EBU bit 43.
+    pub fn flag_j(&self) -> bool {
+        self.flag_byte & 0b0000_0010 != 0
+    }
+
+    /// The 32-bit value the eight Binary Groups reassemble into when
+    /// they carry 8-bit characters, per the November-1991 RP-004/008
+    /// redefinition: byte order `hhhhgggg ffffeeee ddddcccc bbbbaaaa`,
+    /// i.e. Group 1 (`a`) occupies the least-significant nibble and
+    /// Group 8 (`h`) the most-significant nibble.
+    pub fn reassembled(&self) -> u32 {
+        let mut value = 0u32;
+        for (i, &g) in self.groups.iter().enumerate() {
+            value |= ((g & 0x0F) as u32) << (4 * i);
+        }
+        value
+    }
+}
+
 impl UniversalSysExEvent {
     /// Decode this packet as an MTC **Full Message** when it is one,
     /// returning the SMPTE `hr / mn / sc / fr` quartet (and, via
@@ -2327,6 +2408,40 @@ impl UniversalSysExEvent {
             seconds: sc,
             frames: fr,
         })
+    }
+
+    /// Decode this packet as an MTC **User Bits Message** when it is
+    /// one, returning the eight SMPTE/EBU Binary Groups and the Binary
+    /// Group Flag Bits (and, via [`MtcUserBits`], the reassembled
+    /// 32-bit value and the individual flag bits).
+    ///
+    /// Returns `None` unless the packet classifies as a Real-Time
+    /// (`0x7F`) MIDI Time Code User Bits Message
+    /// ([`UniversalSubId2::RtMtcUserBits`]) *and* the verbatim payload
+    /// carries all nine `u1..u9` bytes after Sub-ID #2. A correctly-
+    /// classified packet that is truncated before all nine bytes arrive
+    /// (a malformed stream) yields `None` rather than partially-decoded
+    /// groups.
+    ///
+    /// Payload indexing follows the [`data`](Self::data) layout
+    /// `<realm> <device_id> <sub_id1> <sub_id2> u1..u9 [F7]`, so the
+    /// nine user-bits bytes begin at byte index 4. Each group nibble is
+    /// masked to its low four bits; reserved high bits in `u1..u8` are
+    /// discarded, matching the `0000xxxx` wire shape.
+    pub fn mtc_user_bits(&self) -> Option<MtcUserBits> {
+        if !matches!(
+            self.classification.sub_id1,
+            UniversalSubId1::MidiTimeCode(UniversalSubId2::RtMtcUserBits)
+        ) {
+            return None;
+        }
+        // <realm> <device_id> <sub_id1> <sub_id2> u1..u9 ...
+        let mut groups = [0u8; 8];
+        for (i, slot) in groups.iter_mut().enumerate() {
+            *slot = *self.data.get(4 + i)? & 0x0F;
+        }
+        let flag_byte = *self.data.get(12)?;
+        Some(MtcUserBits { groups, flag_byte })
     }
 }
 
@@ -10053,6 +10168,87 @@ mod tests {
         assert_eq!(full.minutes, 30);
         assert_eq!(full.seconds, 15);
         assert_eq!(full.frames, 12);
+    }
+
+    // ───────── UniversalSysExEvent::mtc_user_bits ─────────
+
+    #[test]
+    fn mtc_user_bits_decodes_groups_and_flag_bits() {
+        // RP-004/008 User Bits: F0 7F 7F 01 02 u1..u9 F7.
+        // Groups a..h = 1..8; flag byte u9 = 0b11 (both i and j set).
+        let ev = make_universal(&[
+            0x7F, 0x7F, 0x01, 0x02, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x03, 0xF7,
+        ]);
+        let ub = ev.mtc_user_bits().expect("classifies as User Bits");
+        assert_eq!(ub.groups, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(ub.flag_i());
+        assert!(ub.flag_j());
+        // Reassembly order hhhhgggg ffffeeee ddddcccc bbbbaaaa: Group 1
+        // (a=1) is the least-significant nibble, Group 8 (h=8) the most.
+        assert_eq!(ub.reassembled(), 0x8765_4321);
+    }
+
+    #[test]
+    fn mtc_user_bits_masks_high_nibbles_and_isolates_flags() {
+        // u1..u8 carry only their low nibble per the 0000xxxx wire
+        // shape; high bits set on the wire are masked off.
+        // u9 = 0b0000_0001 → i set, j clear.
+        let ev = make_universal(&[
+            0x7F, 0x7F, 0x01, 0x02, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF, 0xF0, 0xF1, 0x01, 0xF7,
+        ]);
+        let ub = ev.mtc_user_bits().unwrap();
+        assert_eq!(ub.groups, [0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 0x0, 0x1]);
+        assert!(ub.flag_i());
+        assert!(!ub.flag_j());
+        assert_eq!(ub.reassembled(), 0x10FE_DCBA);
+    }
+
+    #[test]
+    fn mtc_user_bits_none_for_non_user_bits_universal_packets() {
+        // RT MTC Full Message (sub-id2 0x01) is MTC but not User Bits.
+        let full = make_universal(&[0x7F, 0x7F, 0x01, 0x01, 0x61, 0x25, 0x34, 0x10, 0xF7]);
+        assert_eq!(full.mtc_user_bits(), None);
+        // GM 1 System On (Non-RT) — not MTC at all.
+        let gm_on = make_universal(&[0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        assert_eq!(gm_on.mtc_user_bits(), None);
+    }
+
+    #[test]
+    fn mtc_user_bits_none_when_payload_truncated() {
+        // Correctly classified RT MTC User Bits but the stream ends
+        // before all nine u1..u9 bytes arrive (u9 missing) → None.
+        let truncated = make_universal(&[
+            0x7F, 0x7F, 0x01, 0x02, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        ]);
+        assert_eq!(truncated.classification.realm, UniversalRealm::RealTime);
+        assert_eq!(
+            truncated.classification.sub_id1,
+            UniversalSubId1::MidiTimeCode(UniversalSubId2::RtMtcUserBits)
+        );
+        assert_eq!(truncated.mtc_user_bits(), None);
+    }
+
+    #[test]
+    fn mtc_user_bits_via_parsed_smf_at_absolute_tick() {
+        // delta=64 F0 0D 7F 7F 01 02 u1..u9 F7 — User Bits message.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&encode_vlq(64));
+        events.extend_from_slice(&[
+            0xF0, 0x0D, 0x7F, 0x7F, 0x01, 0x02, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08,
+            0x02, 0xF7,
+        ]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let u = smf.universal_sysex_events();
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].tick, 64);
+        let ub = u[0].mtc_user_bits().expect("User Bits decodes");
+        assert_eq!(ub.groups, [0xF, 0xE, 0xD, 0xC, 0xB, 0xA, 0x9, 0x8]);
+        assert!(!ub.flag_i());
+        assert!(ub.flag_j());
+        assert_eq!(ub.reassembled(), 0x89AB_CDEF);
     }
 
     // ───────── SysExEvent::universal_classification ─────────
