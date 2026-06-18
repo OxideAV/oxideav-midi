@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 337 — Notation Information Bar Number + Time Signature body decoders
+
+- New `NotationBarNumber` struct + `UniversalSysExEvent::
+  notation_bar_number() -> Option<NotationBarNumber>`: decodes a
+  Real-Time Notation Information **Bar Number** message
+  (`F0 7F <dev> 03 01 aa aa F7`, MIDI 1.0 Detailed Specification
+  §"Notation Information — Bar Marker") into its signed 14-bit `aa aa`
+  field (assembled lsb-first from the two 7-bit data bytes).
+  `raw14` is the unsigned field, `value()` the sign-extended `i16`
+  (`−8192 ..= 8191`), and `state()` classifies it into the documented
+  regions via the new `NotationBarState` enum: `NotRunning` (`0x2000`),
+  `CountIn(i16)` (the negative-through-zero range, bar `0` = last count-
+  in bar), `BarInSong(i16)` (`1 ..= 8062`), and `RunningUnknown`
+  (`0x1F7F`). Returns `None` unless the packet classifies as
+  `RtNotationBarNumber` and carries both `aa` bytes.
+- New `NotationTimeSignature` + `NotationTimeSignaturePair` structs +
+  `UniversalSysExEvent::notation_time_signature() ->
+  Option<NotationTimeSignature>`: decodes a Real-Time Notation
+  Information **Time Signature** message in both forms — Immediate
+  (`03 02`, effective on receipt) and Delayed (`03 42`, effective on the
+  next Bar Marker; `is_delayed()`). The body `ln nn dd cc bb [nn dd ...]`
+  duplicates the `FF 58` Standard MIDI File Time Signature meta event
+  layout, extended with compound-signature pairs. `pairs` carries every
+  `numerator` / `denominator_pow2` pair in wire order (`primary()`,
+  `is_compound()`); `NotationTimeSignaturePair::denominator()` decodes
+  `1 << denominator_pow2`. `clocks_per_click` / `thirty_seconds_per_
+  quarter` are the leading pair's metronome bytes. Returns `None` when
+  `ln` is below the 4-byte minimum, is not of the `4 + 2k` form, or the
+  body is truncated before `ln` bytes arrive.
+- Ten new unit tests (in-song / count-in / flag regions / truncation /
+  parsed-SMF for Bar Number; simple / delayed / compound / invalid-ln /
+  parsed-SMF for Time Signature). Full lib suite 586 → 596 tests, zero
+  ignored.
+
 ### Round 332 — MTC User Bits Message body decoder
 
 - New `MtcUserBits` struct + `UniversalSysExEvent::mtc_user_bits()

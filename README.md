@@ -70,6 +70,18 @@ total events capped at 1 M to keep malformed input bounded.
   Group Flag Bits (`flag_i` / `flag_j`) and the `reassembled()` 32-bit
   value (`hhhhgggg ffffeeee ddddcccc bbbbaaaa` nibble order); `None` on
   non-User-Bits packets or a payload truncated before all nine bytes.
+  `UniversalSysExEvent::notation_bar_number()` decodes the Notation
+  Information **Bar Number** message (`F0 7F dev 03 01 aa aa F7`) into a
+  `NotationBarNumber` — the signed 14-bit (lsb-first) field plus a
+  `state()` classifier (`NotationBarState`: NotRunning `0x2000`, the
+  negative-through-zero CountIn range, the positive BarInSong range, and
+  RunningUnknown `0x1F7F`). `notation_time_signature()` decodes the
+  **Time Signature** message in both Immediate (`03 02`) and Delayed
+  (`03 42`, `is_delayed()`) forms into a `NotationTimeSignature` — the
+  leading `nn dd cc bb` quartet (mirroring the `FF 58` meta event) plus
+  every compound `nn dd` pair (`is_compound()`); `denominator()` decodes
+  `1 << dd`. Both return `None` on a wrong-classification packet or a
+  body truncated before the declared bytes arrive.
 - **Tick → wall-clock time** — `tempo_timeline()` folds the tempo map
   against the header `Division` into a `TempoTimeline`; its
   `tick_to_seconds(tick)` resolves any absolute tick to elapsed seconds

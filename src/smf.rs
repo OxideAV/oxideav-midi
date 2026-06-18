@@ -2374,7 +2374,288 @@ impl MtcUserBits {
     }
 }
 
+/// The semantic state a Notation **Bar Number** message conveys, decoded
+/// from its signed 14-bit `aa aa` (lsb-first) field per the MIDI 1.0
+/// Detailed Specification §"Notation Information — Bar Marker".
+///
+/// The numbering system reserves the two extreme values as flags and
+/// uses negative numbers for the count-in that precedes bar 1:
+///
+/// ```text
+///   raw 14-bit value (two's-complement over 14 bits)
+///     0x2000 (-8192)            NotRunning
+///     0x2001 (-8191) ..= 0x0000 CountIn(-8191 ..= 0)
+///     0x0001 (1)     ..= 0x1F7E (8062) BarInSong(1 ..= 8062)
+///     0x1F7F (8063)             RunningUnknown
+/// ```
+///
+/// The "last bar of count-in" is bar `0`; bar `1` is the first bar of
+/// the song proper. Systems with a single count-in bar can simply count
+/// from `0` upward and never see a negative number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotationBarState {
+    /// `0x2000` (raw −8192) — the transport is stopped / not running.
+    NotRunning,
+    /// `0x2001 ..= 0x0000` (raw −8191 ..= 0) — a count-in bar. The
+    /// payload is the signed bar number (negative until it reaches `0`,
+    /// the last bar of count-in).
+    CountIn(i16),
+    /// `0x0001 ..= 0x1F7E` (1 ..= 8062) — a numbered bar within the
+    /// song. Bar `1` is the first bar of the song proper.
+    BarInSong(i16),
+    /// `0x1F7F` (8063) — running, but the bar number is unknown (or it
+    /// has exceeded the representable 8K range).
+    RunningUnknown,
+}
+
+/// A decoded Notation **Bar Number** message — the high-level
+/// measure-boundary marker an MTC/synchronisation source emits so a
+/// display device can show the current bar without counting MIDI clocks.
+///
+/// Wire shape (MIDI 1.0 Detailed Specification §"Notation Information —
+/// Bar Marker", 8 bytes):
+///
+/// ```text
+/// F0 7F <device ID> 03 01 aa aa F7
+///   aa aa = bar number, lsb first, signed over 14 bits
+/// ```
+///
+/// The packet is a Real-Time (`0x7F`) Universal SysEx with Sub-ID #1
+/// `0x03` (Notation Information) and Sub-ID #2 `0x01` (Bar Number).
+/// Decoded via [`UniversalSysExEvent::notation_bar_number`].
+///
+/// The two `aa` bytes are each 7-bit data bytes; they pack lsb-first
+/// into a 14-bit field that is then interpreted as a signed value
+/// (sign-extended from bit 13). [`raw14`](Self::raw14) preserves the
+/// unsigned 14-bit value and [`value`](Self::value) the sign-extended
+/// `i16`; [`state`](Self::state) classifies it into the four documented
+/// regions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotationBarNumber {
+    /// The unsigned 14-bit field assembled lsb-first from `aa aa`
+    /// (`0x0000 ..= 0x3FFF`).
+    pub raw14: u16,
+}
+
+impl NotationBarNumber {
+    /// The sign-extended signed bar number (`−8192 ..= 8191`). Bit 13 of
+    /// the 14-bit field is the sign bit.
+    pub fn value(&self) -> i16 {
+        // Sign-extend bit 13 into a full i16. Work in i32 to avoid the
+        // intermediate overflow that `(x as i16) << 2` would hit for
+        // values whose bit 13 is set (e.g. raw 0x2000 = 8192).
+        let v = (self.raw14 & 0x3FFF) as i32;
+        ((v << 18) >> 18) as i16
+    }
+
+    /// Classify the bar number into its documented semantic region:
+    /// `0x2000` → [`NotationBarState::NotRunning`], the
+    /// negative-through-zero count-in range, the positive in-song range,
+    /// and the `0x1F7F` running-but-unknown flag.
+    pub fn state(&self) -> NotationBarState {
+        match self.raw14 & 0x3FFF {
+            0x2000 => NotationBarState::NotRunning,
+            0x1F7F => NotationBarState::RunningUnknown,
+            _ => {
+                let v = self.value();
+                if v <= 0 {
+                    NotationBarState::CountIn(v)
+                } else {
+                    NotationBarState::BarInSong(v)
+                }
+            }
+        }
+    }
+}
+
+/// A single time-signature pair within a Notation **Time Signature**
+/// message — the `nn dd cc bb` quartet whose first two bytes mirror the
+/// `FF 58` Standard MIDI File Time Signature meta event.
+///
+/// In a compound time signature several pairs follow the leading
+/// `cc bb` metronome bytes; only the first pair carries `cc` / `bb`, so
+/// the additional pairs surface here with `numerator` / `denominator`
+/// only (their `clocks_per_click` / `thirty_seconds_per_quarter` echo
+/// the leading pair's values for convenience).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotationTimeSignaturePair {
+    /// `nn` — number of beats (the numerator).
+    pub numerator: u8,
+    /// `dd` — beat value as a negative power of two (the denominator is
+    /// `1 << dd`); decode via [`denominator`](Self::denominator).
+    pub denominator_pow2: u8,
+}
+
+impl NotationTimeSignaturePair {
+    /// The decoded denominator, `1 << denominator_pow2` (e.g.
+    /// `denominator_pow2 = 3` → `8`, a `/8` signature). Saturates the
+    /// shift amount at 31 to avoid overflow on a pathological byte.
+    pub fn denominator(&self) -> u32 {
+        1u32 << (self.denominator_pow2.min(31))
+    }
+}
+
+/// A decoded Notation **Time Signature** message — Immediate (`0x02`,
+/// effective on receipt) or Delayed (`0x42`, effective on the next Bar
+/// Marker). The body mirrors the `FF 58` Standard MIDI File Time
+/// Signature meta event, extended with optional compound-signature
+/// pairs.
+///
+/// Wire shape (MIDI 1.0 Detailed Specification §"Notation Information —
+/// Time Signature"):
+///
+/// ```text
+/// F0 7F <device ID> 03 02 ln nn dd cc bb [nn dd ...] F7   (Immediate)
+/// F0 7F <device ID> 03 42 ln nn dd cc bb [nn dd ...] F7   (Delayed)
+///   ln       number of data bytes that follow (4 for a simple meter;
+///            +2 per extra compound pair)
+///   nn       numerator (beats)
+///   dd       denominator as a negative power of two (1 << dd)
+///   cc       MIDI clocks per metronome click
+///   bb       notated 32nd notes per MIDI quarter note
+///   [nn dd]  additional pairs for a compound meter within the bar
+/// ```
+///
+/// The packet is a Real-Time (`0x7F`) Universal SysEx with Sub-ID #1
+/// `0x03` (Notation Information) and Sub-ID #2 `0x02` / `0x42`. Decoded
+/// via [`UniversalSysExEvent::notation_time_signature`]; the
+/// Immediate-versus-Delayed distinction is read from the classified
+/// Sub-ID #2 and surfaced through [`is_delayed`](Self::is_delayed).
+///
+/// `clocks_per_click` and `thirty_seconds_per_quarter` are the leading
+/// pair's metronome bytes — the four-byte form duplicates the `FF 58`
+/// meta-event layout exactly. The first signature pair is always
+/// [`pairs`](Self::pairs)`[0]`; compound meters append further pairs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotationTimeSignature {
+    /// `true` for the Delayed form (Sub-ID #2 `0x42`, effective on the
+    /// next Bar Marker); `false` for the Immediate form (`0x02`).
+    pub delayed: bool,
+    /// The signature pairs, in wire order. Always at least one; a
+    /// compound meter carries two or more.
+    pub pairs: Vec<NotationTimeSignaturePair>,
+    /// `cc` — MIDI clocks per metronome click (from the leading pair).
+    pub clocks_per_click: u8,
+    /// `bb` — notated 32nd notes per MIDI quarter note (from the leading
+    /// pair).
+    pub thirty_seconds_per_quarter: u8,
+}
+
+impl NotationTimeSignature {
+    /// `true` for the Delayed form, `false` for the Immediate form.
+    pub fn is_delayed(&self) -> bool {
+        self.delayed
+    }
+
+    /// The leading (and, for a simple meter, only) signature pair.
+    pub fn primary(&self) -> NotationTimeSignaturePair {
+        self.pairs[0]
+    }
+
+    /// `true` when the message carries more than one signature pair (a
+    /// compound meter such as `4/4 + 3/8` within the same bar).
+    pub fn is_compound(&self) -> bool {
+        self.pairs.len() > 1
+    }
+}
+
 impl UniversalSysExEvent {
+    /// Decode this packet as a Notation **Bar Number** message when it
+    /// is one, returning the signed 14-bit bar number and its semantic
+    /// classification (not-running / count-in / in-song / running-
+    /// unknown).
+    ///
+    /// Returns `None` unless the packet classifies as a Real-Time
+    /// (`0x7F`) Notation Information Bar Number
+    /// ([`UniversalSubId2::RtNotationBarNumber`]) *and* the verbatim
+    /// payload carries both `aa` bytes after Sub-ID #2. A correctly-
+    /// classified packet truncated before the second `aa` byte yields
+    /// `None` rather than a half-assembled value.
+    ///
+    /// Payload indexing follows the [`data`](Self::data) layout
+    /// `<realm> <device_id> <sub_id1> <sub_id2> aa_lsb aa_msb [F7]`, so
+    /// the two data bytes begin at index 4 and pack lsb-first into the
+    /// 14-bit field. High bits beyond bit 6 of each `aa` byte are
+    /// masked off (they are 7-bit data bytes on the wire).
+    pub fn notation_bar_number(&self) -> Option<NotationBarNumber> {
+        if !matches!(
+            self.classification.sub_id1,
+            UniversalSubId1::NotationInformation(UniversalSubId2::RtNotationBarNumber)
+        ) {
+            return None;
+        }
+        // <realm> <device_id> <sub_id1> <sub_id2> aa_lsb aa_msb ...
+        let lsb = (*self.data.get(4)? & 0x7F) as u16;
+        let msb = (*self.data.get(5)? & 0x7F) as u16;
+        Some(NotationBarNumber {
+            raw14: lsb | (msb << 7),
+        })
+    }
+
+    /// Decode this packet as a Notation **Time Signature** message
+    /// (Immediate or Delayed) when it is one, returning every
+    /// `numerator / denominator` pair plus the leading metronome bytes.
+    ///
+    /// Returns `None` unless the packet classifies as a Real-Time
+    /// (`0x7F`) Notation Information Time Signature — Immediate
+    /// ([`UniversalSubId2::RtNotationTimeSignatureImmediate`]) or
+    /// Delayed ([`UniversalSubId2::RtNotationTimeSignatureDelayed`]) —
+    /// *and* the verbatim payload carries the declared `ln` data bytes
+    /// after Sub-ID #2. A packet whose `ln` is not a valid pair-count
+    /// (less than 4, or not of the form `4 + 2k`) or whose body is
+    /// truncated before `ln` bytes arrive yields `None`.
+    ///
+    /// Payload indexing follows the [`data`](Self::data) layout
+    /// `<realm> <device_id> <sub_id1> <sub_id2> ln nn dd cc bb [nn dd ...]
+    /// [F7]`: `ln` is at index 4, the leading `nn dd cc bb` quartet at
+    /// indices 5..9, and each additional compound pair `nn dd` follows.
+    /// The four-byte form duplicates the `FF 58` meta-event layout.
+    pub fn notation_time_signature(&self) -> Option<NotationTimeSignature> {
+        let delayed = match self.classification.sub_id1 {
+            UniversalSubId1::NotationInformation(
+                UniversalSubId2::RtNotationTimeSignatureImmediate,
+            ) => false,
+            UniversalSubId1::NotationInformation(
+                UniversalSubId2::RtNotationTimeSignatureDelayed,
+            ) => true,
+            _ => return None,
+        };
+        // <realm> <device_id> <sub_id1> <sub_id2> ln nn dd cc bb ...
+        let ln = *self.data.get(4)? as usize;
+        // The minimum legal body is the 4-byte simple meter; compound
+        // meters add 2 bytes per extra pair, so ln must be 4, 6, 8, ...
+        if ln < 4 || (ln - 4) % 2 != 0 {
+            return None;
+        }
+        // The leading quartet is nn dd cc bb at indices 5..9.
+        let nn = *self.data.get(5)?;
+        let dd = *self.data.get(6)?;
+        let cc = *self.data.get(7)?;
+        let bb = *self.data.get(8)?;
+        let mut pairs = vec![NotationTimeSignaturePair {
+            numerator: nn,
+            denominator_pow2: dd,
+        }];
+        // Additional compound pairs are nn dd from index 9 onward; ln - 4
+        // is the extra byte count (always even per the check above).
+        let extra_pairs = (ln - 4) / 2;
+        for k in 0..extra_pairs {
+            let base = 9 + k * 2;
+            let nn = *self.data.get(base)?;
+            let dd = *self.data.get(base + 1)?;
+            pairs.push(NotationTimeSignaturePair {
+                numerator: nn,
+                denominator_pow2: dd,
+            });
+        }
+        Some(NotationTimeSignature {
+            delayed,
+            pairs,
+            clocks_per_click: cc,
+            thirty_seconds_per_quarter: bb,
+        })
+    }
+
     /// Decode this packet as an MTC **Full Message** when it is one,
     /// returning the SMPTE `hr / mn / sc / fr` quartet (and, via
     /// [`MtcFullMessage`], the decoded frame rate and hours count).
@@ -10249,6 +10530,183 @@ mod tests {
         assert!(!ub.flag_i());
         assert!(ub.flag_j());
         assert_eq!(ub.reassembled(), 0x89AB_CDEF);
+    }
+
+    // ───────── UniversalSysExEvent::notation_bar_number ─────────
+
+    #[test]
+    fn notation_bar_number_decodes_in_song_bar() {
+        // Bar 1: aa aa = 01 00 (lsb-first). F0 7F 7F 03 01 01 00 F7.
+        let ev = make_universal(&[0x7F, 0x7F, 0x03, 0x01, 0x01, 0x00, 0xF7]);
+        let bn = ev.notation_bar_number().expect("classifies as Bar Number");
+        assert_eq!(bn.raw14, 1);
+        assert_eq!(bn.value(), 1);
+        assert_eq!(bn.state(), NotationBarState::BarInSong(1));
+        // Bar 8062 (0x1F7E): lsb = 0x7E, msb = 0x3E (8062 = 0b01_1111_0111_1110).
+        let ev = make_universal(&[0x7F, 0x7F, 0x03, 0x01, 0x7E, 0x3E, 0xF7]);
+        let bn = ev.notation_bar_number().unwrap();
+        assert_eq!(bn.raw14, 0x1F7E);
+        assert_eq!(bn.value(), 8062);
+        assert_eq!(bn.state(), NotationBarState::BarInSong(8062));
+    }
+
+    #[test]
+    fn notation_bar_number_decodes_flag_and_count_in_regions() {
+        // Not running: raw 0x2000 → lsb = 0x00, msb = 0x40.
+        let ev = make_universal(&[0x7F, 0x7F, 0x03, 0x01, 0x00, 0x40, 0xF7]);
+        let bn = ev.notation_bar_number().unwrap();
+        assert_eq!(bn.raw14, 0x2000);
+        assert_eq!(bn.value(), -8192);
+        assert_eq!(bn.state(), NotationBarState::NotRunning);
+        // Running, bar unknown: raw 0x1F7F → lsb = 0x7F, msb = 0x3E.
+        let ev = make_universal(&[0x7F, 0x7F, 0x03, 0x01, 0x7F, 0x3E, 0xF7]);
+        let bn = ev.notation_bar_number().unwrap();
+        assert_eq!(bn.raw14, 0x1F7F);
+        assert_eq!(bn.state(), NotationBarState::RunningUnknown);
+        // Last bar of count-in is 0: raw 0x0000 → lsb 0x00 msb 0x00.
+        let ev = make_universal(&[0x7F, 0x7F, 0x03, 0x01, 0x00, 0x00, 0xF7]);
+        let bn = ev.notation_bar_number().unwrap();
+        assert_eq!(bn.value(), 0);
+        assert_eq!(bn.state(), NotationBarState::CountIn(0));
+        // Count-in bar −1: raw 0x3FFF (two's complement of -1 over 14 bits)
+        // → lsb 0x7F msb 0x7F.
+        let ev = make_universal(&[0x7F, 0x7F, 0x03, 0x01, 0x7F, 0x7F, 0xF7]);
+        let bn = ev.notation_bar_number().unwrap();
+        assert_eq!(bn.value(), -1);
+        assert_eq!(bn.state(), NotationBarState::CountIn(-1));
+    }
+
+    #[test]
+    fn notation_bar_number_none_for_non_bar_number_packets() {
+        // Time Signature (Immediate) is Notation but not Bar Number.
+        let ts = make_universal(&[0x7F, 0x7F, 0x03, 0x02, 0x04, 0x04, 0x02, 0x18, 0x08, 0xF7]);
+        assert_eq!(ts.notation_bar_number(), None);
+        // GM 1 System On — not Notation at all.
+        let gm_on = make_universal(&[0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        assert_eq!(gm_on.notation_bar_number(), None);
+    }
+
+    #[test]
+    fn notation_bar_number_none_when_truncated() {
+        // Classified Bar Number but the second aa byte is missing.
+        let ev = make_universal(&[0x7F, 0x7F, 0x03, 0x01, 0x01]);
+        assert_eq!(
+            ev.classification.sub_id1,
+            UniversalSubId1::NotationInformation(UniversalSubId2::RtNotationBarNumber)
+        );
+        assert_eq!(ev.notation_bar_number(), None);
+    }
+
+    #[test]
+    fn notation_bar_number_via_parsed_smf_at_absolute_tick() {
+        // delta=48 F0 07 7F 7F 03 01 05 00 F7 — Bar Number = 5.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&encode_vlq(48));
+        events.extend_from_slice(&[0xF0, 0x07, 0x7F, 0x7F, 0x03, 0x01, 0x05, 0x00, 0xF7]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let u = smf.universal_sysex_events();
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].tick, 48);
+        let bn = u[0].notation_bar_number().expect("Bar Number decodes");
+        assert_eq!(bn.state(), NotationBarState::BarInSong(5));
+    }
+
+    // ───────── UniversalSysExEvent::notation_time_signature ─────────
+
+    #[test]
+    fn notation_time_signature_decodes_simple_immediate_meter() {
+        // 4/4, 24 clocks/click, 8 thirty-seconds/quarter — duplicates
+        // the FF 58 meta event nn dd cc bb. ln = 4.
+        // F0 7F 7F 03 02 04 04 02 18 08 F7
+        let ev = make_universal(&[0x7F, 0x7F, 0x03, 0x02, 0x04, 0x04, 0x02, 0x18, 0x08, 0xF7]);
+        let ts = ev
+            .notation_time_signature()
+            .expect("classifies as Time Signature");
+        assert!(!ts.is_delayed());
+        assert!(!ts.is_compound());
+        assert_eq!(ts.pairs.len(), 1);
+        assert_eq!(ts.primary().numerator, 4);
+        assert_eq!(ts.primary().denominator_pow2, 2);
+        assert_eq!(ts.primary().denominator(), 4);
+        assert_eq!(ts.clocks_per_click, 24);
+        assert_eq!(ts.thirty_seconds_per_quarter, 8);
+    }
+
+    #[test]
+    fn notation_time_signature_decodes_delayed_form() {
+        // Delayed sub-id2 = 0x42. 3/8, 12 clocks/click, 8 32nds/quarter.
+        // F0 7F 7F 03 42 04 03 03 0C 08 F7
+        let ev = make_universal(&[0x7F, 0x7F, 0x03, 0x42, 0x04, 0x03, 0x03, 0x0C, 0x08, 0xF7]);
+        let ts = ev
+            .notation_time_signature()
+            .expect("delayed Time Signature");
+        assert!(ts.is_delayed());
+        assert_eq!(ts.primary().numerator, 3);
+        assert_eq!(ts.primary().denominator(), 8);
+        assert_eq!(ts.clocks_per_click, 12);
+    }
+
+    #[test]
+    fn notation_time_signature_decodes_compound_meter() {
+        // Compound 4/4 + 3/8 within the same bar: ln = 6 (one extra pair).
+        // F0 7F 7F 03 02 06 04 02 18 08 03 03 F7
+        let ev = make_universal(&[
+            0x7F, 0x7F, 0x03, 0x02, 0x06, 0x04, 0x02, 0x18, 0x08, 0x03, 0x03, 0xF7,
+        ]);
+        let ts = ev.notation_time_signature().expect("compound meter");
+        assert!(ts.is_compound());
+        assert_eq!(ts.pairs.len(), 2);
+        assert_eq!(ts.pairs[0].numerator, 4);
+        assert_eq!(ts.pairs[0].denominator(), 4);
+        assert_eq!(ts.pairs[1].numerator, 3);
+        assert_eq!(ts.pairs[1].denominator(), 8);
+        // Metronome bytes come from the leading pair only.
+        assert_eq!(ts.clocks_per_click, 24);
+        assert_eq!(ts.thirty_seconds_per_quarter, 8);
+    }
+
+    #[test]
+    fn notation_time_signature_none_for_invalid_or_truncated_body() {
+        // ln = 3 is shorter than the 4-byte minimum → None.
+        let short_ln = make_universal(&[0x7F, 0x7F, 0x03, 0x02, 0x03, 0x04, 0x02, 0x18, 0xF7]);
+        assert_eq!(short_ln.notation_time_signature(), None);
+        // ln = 5 is not of the 4 + 2k form → None.
+        let odd_ln = make_universal(&[
+            0x7F, 0x7F, 0x03, 0x02, 0x05, 0x04, 0x02, 0x18, 0x08, 0x03, 0xF7,
+        ]);
+        assert_eq!(odd_ln.notation_time_signature(), None);
+        // ln = 6 declared but the second pair is truncated → None.
+        let truncated = make_universal(&[0x7F, 0x7F, 0x03, 0x02, 0x06, 0x04, 0x02, 0x18, 0x08]);
+        assert_eq!(truncated.notation_time_signature(), None);
+        // Bar Number is Notation but not a Time Signature.
+        let bar = make_universal(&[0x7F, 0x7F, 0x03, 0x01, 0x01, 0x00, 0xF7]);
+        assert_eq!(bar.notation_time_signature(), None);
+    }
+
+    #[test]
+    fn notation_time_signature_via_parsed_smf_at_absolute_tick() {
+        // delta=96 F0 0A 7F 7F 03 02 04 06 03 0C 08 F7 — 6/8 immediate.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&encode_vlq(96));
+        events.extend_from_slice(&[
+            0xF0, 0x0A, 0x7F, 0x7F, 0x03, 0x02, 0x04, 0x06, 0x03, 0x0C, 0x08, 0xF7,
+        ]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let u = smf.universal_sysex_events();
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].tick, 96);
+        let ts = u[0]
+            .notation_time_signature()
+            .expect("Time Signature decodes");
+        assert_eq!(ts.primary().numerator, 6);
+        assert_eq!(ts.primary().denominator(), 8);
+        assert!(!ts.is_delayed());
     }
 
     // ───────── SysExEvent::universal_classification ─────────
