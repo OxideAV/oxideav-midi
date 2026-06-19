@@ -6147,6 +6147,31 @@ impl SmfFile {
     /// standards (a megabyte is unusual) so a heap-resident buffer is
     /// the right shape.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.encode(RunningStatus::Explicit)
+    }
+
+    /// Serialise this [`SmfFile`] using **running-status compression**.
+    ///
+    /// Identical to [`to_bytes`](Self::to_bytes) except that a
+    /// channel-voice event whose status byte equals the one emitted by
+    /// the immediately preceding event omits the redundant status byte,
+    /// per the SMF running-status rule (MIDI 1.0 Detailed Specification,
+    /// "Running Status"). The running-status buffer is cleared by every
+    /// meta event and every sysex event (`F0` / `F7`) — exactly the
+    /// reset points the parser observes — so the compressed stream still
+    /// round-trips byte-for-byte through [`parse`] back to this
+    /// [`SmfFile`].
+    ///
+    /// A Note On with velocity 0 is left as written (the encoder does
+    /// not rewrite `8n key 0` into a running `9n` Note Off, nor vice
+    /// versa — it compresses only status bytes that are already equal,
+    /// preserving the caller's event shapes). Same validation as
+    /// [`to_bytes`](Self::to_bytes).
+    pub fn to_bytes_running_status(&self) -> Result<Vec<u8>> {
+        self.encode(RunningStatus::Compress)
+    }
+
+    fn encode(&self, rs: RunningStatus) -> Result<Vec<u8>> {
         if self.header.ntrks as usize != self.tracks.len() {
             return Err(Error::invalid(format!(
                 "SMF: header.ntrks ({}) does not match tracks.len() ({}) — \
@@ -6158,7 +6183,7 @@ impl SmfFile {
         let mut out: Vec<u8> = Vec::new();
         write_header_chunk(&mut out, &self.header)?;
         for (i, track) in self.tracks.iter().enumerate() {
-            write_track_chunk(&mut out, track)
+            write_track_chunk(&mut out, track, rs)
                 .map_err(|e| Error::invalid(format!("SMF: track {i}: {e}", e = err_msg(&e))))?;
         }
         Ok(out)
@@ -6173,9 +6198,29 @@ impl Track {
     /// rationale on not auto-appending.
     pub fn to_bytes_chunk(&self) -> Result<Vec<u8>> {
         let mut out: Vec<u8> = Vec::new();
-        write_track_chunk(&mut out, self)?;
+        write_track_chunk(&mut out, self, RunningStatus::Explicit)?;
         Ok(out)
     }
+
+    /// Serialise this [`Track`] as a single `MTrk` chunk using
+    /// running-status compression. See
+    /// [`SmfFile::to_bytes_running_status`] for the compression rule.
+    pub fn to_bytes_chunk_running_status(&self) -> Result<Vec<u8>> {
+        let mut out: Vec<u8> = Vec::new();
+        write_track_chunk(&mut out, self, RunningStatus::Compress)?;
+        Ok(out)
+    }
+}
+
+/// Whether a track serialiser emits an explicit status byte on every
+/// channel-voice event or compresses consecutive same-status events
+/// with running status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunningStatus {
+    /// Always emit the status byte (the default, bit-stable output).
+    Explicit,
+    /// Omit the status byte when it equals the previously-emitted one.
+    Compress,
 }
 
 fn err_msg(e: &Error) -> String {
@@ -6222,7 +6267,7 @@ fn write_header_chunk(out: &mut Vec<u8>, header: &SmfHeader) -> Result<()> {
     Ok(())
 }
 
-fn write_track_chunk(out: &mut Vec<u8>, track: &Track) -> Result<()> {
+fn write_track_chunk(out: &mut Vec<u8>, track: &Track, rs: RunningStatus) -> Result<()> {
     // Validate end-of-track placement: must be the final event.
     let eot_count = track
         .events
@@ -6256,8 +6301,12 @@ fn write_track_chunk(out: &mut Vec<u8>, track: &Track) -> Result<()> {
     let len_pos = out.len();
     out.extend_from_slice(&[0u8; 4]); // placeholder; patched after body emit
     let body_start = out.len();
+    // The running-status buffer is local to each track: it starts
+    // cleared and is reset by every meta / sysex event the same way the
+    // parser resets it. Unused when `rs == Explicit`.
+    let mut running: Option<u8> = None;
     for (i, ev) in track.events.iter().enumerate() {
-        write_event(out, ev)
+        write_event(out, ev, rs, &mut running)
             .map_err(|e| Error::invalid(format!("SMF: event {i}: {msg}", msg = err_msg(&e))))?;
     }
     let body_len = out.len() - body_start;
@@ -6266,21 +6315,37 @@ fn write_track_chunk(out: &mut Vec<u8>, track: &Track) -> Result<()> {
     Ok(())
 }
 
-fn write_event(out: &mut Vec<u8>, ev: &TrackEvent) -> Result<()> {
+fn write_event(
+    out: &mut Vec<u8>,
+    ev: &TrackEvent,
+    rs: RunningStatus,
+    running: &mut Option<u8>,
+) -> Result<()> {
     write_vlq(out, ev.delta)?;
     match &ev.kind {
-        Event::Channel(msg) => write_channel(out, msg),
+        Event::Channel(msg) => write_channel(out, msg, rs, running),
         Event::Sysex { escape, data } => {
             out.push(if *escape { 0xF7 } else { 0xF0 });
             write_vlq(out, u32_len(data.len(), "sysex payload")?)?;
             out.extend_from_slice(data);
+            // Sysex clears the running-status buffer.
+            *running = None;
             Ok(())
         }
-        Event::Meta(meta) => write_meta(out, meta),
+        Event::Meta(meta) => {
+            write_meta(out, meta)?;
+            // Meta events clear the running-status buffer.
+            *running = None;
+            Ok(())
+        }
     }
 }
 
-fn write_channel(out: &mut Vec<u8>, msg: &ChannelMessage) -> Result<()> {
+/// Status byte (high nibble | channel) and the two-or-one data bytes
+/// for a channel-voice message. Returns the status and the body bytes
+/// so the caller can decide whether to emit the status or rely on
+/// running status.
+fn channel_wire_bytes(msg: &ChannelMessage) -> Result<(u8, [u8; 2], usize)> {
     if msg.channel > 0x0F {
         return Err(Error::invalid(format!(
             "SMF: channel {} out of range 0..=15",
@@ -6288,34 +6353,34 @@ fn write_channel(out: &mut Vec<u8>, msg: &ChannelMessage) -> Result<()> {
         )));
     }
     let chan = msg.channel & 0x0F;
-    match msg.body {
+    let (status, b0, b1, n) = match msg.body {
         ChannelBody::NoteOff { key, velocity } => {
             check_data_byte(key, "NoteOff.key")?;
             check_data_byte(velocity, "NoteOff.velocity")?;
-            out.extend_from_slice(&[0x80 | chan, key, velocity]);
+            (0x80 | chan, key, velocity, 2)
         }
         ChannelBody::NoteOn { key, velocity } => {
             check_data_byte(key, "NoteOn.key")?;
             check_data_byte(velocity, "NoteOn.velocity")?;
-            out.extend_from_slice(&[0x90 | chan, key, velocity]);
+            (0x90 | chan, key, velocity, 2)
         }
         ChannelBody::PolyAftertouch { key, pressure } => {
             check_data_byte(key, "PolyAftertouch.key")?;
             check_data_byte(pressure, "PolyAftertouch.pressure")?;
-            out.extend_from_slice(&[0xA0 | chan, key, pressure]);
+            (0xA0 | chan, key, pressure, 2)
         }
         ChannelBody::ControlChange { controller, value } => {
             check_data_byte(controller, "ControlChange.controller")?;
             check_data_byte(value, "ControlChange.value")?;
-            out.extend_from_slice(&[0xB0 | chan, controller, value]);
+            (0xB0 | chan, controller, value, 2)
         }
         ChannelBody::ProgramChange { program } => {
             check_data_byte(program, "ProgramChange.program")?;
-            out.extend_from_slice(&[0xC0 | chan, program]);
+            (0xC0 | chan, program, 0, 1)
         }
         ChannelBody::ChannelAftertouch { pressure } => {
             check_data_byte(pressure, "ChannelAftertouch.pressure")?;
-            out.extend_from_slice(&[0xD0 | chan, pressure]);
+            (0xD0 | chan, pressure, 0, 1)
         }
         ChannelBody::PitchBend { value } => {
             if value > 0x3FFF {
@@ -6325,9 +6390,27 @@ fn write_channel(out: &mut Vec<u8>, msg: &ChannelMessage) -> Result<()> {
             }
             let lsb = (value & 0x7F) as u8;
             let msb = ((value >> 7) & 0x7F) as u8;
-            out.extend_from_slice(&[0xE0 | chan, lsb, msb]);
+            (0xE0 | chan, lsb, msb, 2)
         }
+    };
+    Ok((status, [b0, b1], n))
+}
+
+fn write_channel(
+    out: &mut Vec<u8>,
+    msg: &ChannelMessage,
+    rs: RunningStatus,
+    running: &mut Option<u8>,
+) -> Result<()> {
+    let (status, data, n) = channel_wire_bytes(msg)?;
+    // Emit the status byte unless running-status compression is on AND
+    // the previously-emitted status already equals this one.
+    let omit = rs == RunningStatus::Compress && *running == Some(status);
+    if !omit {
+        out.push(status);
     }
+    out.extend_from_slice(&data[..n]);
+    *running = Some(status);
     Ok(())
 }
 
@@ -13870,5 +13953,289 @@ mod tests {
         assert_eq!(pd[0].track, 1);
         assert_eq!(pd[0].parameter().number(), 0x0000);
         assert_eq!(pd[0].action(), DataEntryAction::EntryMsb(3));
+    }
+
+    // ───────────── running-status writer ─────────────
+
+    /// Build a single-track format-0 file from a list of channel/meta
+    /// events (each at delta 0 except where noted), terminated with EOT.
+    fn one_track_file(events: Vec<TrackEvent>) -> SmfFile {
+        let mut events = events;
+        events.push(TrackEvent {
+            delta: 0,
+            kind: Event::Meta(MetaEvent::EndOfTrack),
+        });
+        SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::SingleTrack,
+                ntrks: 1,
+                division: Division::TicksPerQuarter(96),
+            },
+            tracks: vec![Track { events }],
+        }
+    }
+
+    fn ch(channel: u8, body: ChannelBody, delta: u32) -> TrackEvent {
+        TrackEvent {
+            delta,
+            kind: Event::Channel(ChannelMessage { channel, body }),
+        }
+    }
+
+    #[test]
+    fn running_status_compresses_consecutive_same_status_note_ons() {
+        // Three Note On (same channel) → status emitted once.
+        let smf = one_track_file(vec![
+            ch(
+                0,
+                ChannelBody::NoteOn {
+                    key: 60,
+                    velocity: 39,
+                },
+                0,
+            ),
+            ch(
+                0,
+                ChannelBody::NoteOn {
+                    key: 64,
+                    velocity: 43,
+                },
+                0,
+            ),
+            ch(
+                0,
+                ChannelBody::NoteOn {
+                    key: 67,
+                    velocity: 37,
+                },
+                0,
+            ),
+        ]);
+        let explicit = smf.to_bytes().unwrap();
+        let running = smf.to_bytes_running_status().unwrap();
+        // Each omitted status saves exactly one byte; two are omitted.
+        assert_eq!(running.len(), explicit.len() - 2);
+        // The compressed body must contain exactly one 0x90 status byte
+        // inside the MTrk payload (skip MThd=14 + MTrk tag/len=8).
+        let body = &running[22..];
+        assert_eq!(body.iter().filter(|&&b| b == 0x90).count(), 1);
+        // And it must still round-trip.
+        assert_eq!(parse(&running).unwrap(), smf);
+    }
+
+    #[test]
+    fn running_status_does_not_cross_channel_change() {
+        // Note On ch0 then Note On ch1 — different status, no omission.
+        let smf = one_track_file(vec![
+            ch(
+                0,
+                ChannelBody::NoteOn {
+                    key: 60,
+                    velocity: 64,
+                },
+                0,
+            ),
+            ch(
+                1,
+                ChannelBody::NoteOn {
+                    key: 62,
+                    velocity: 64,
+                },
+                0,
+            ),
+        ]);
+        let explicit = smf.to_bytes().unwrap();
+        let running = smf.to_bytes_running_status().unwrap();
+        assert_eq!(running, explicit);
+        assert_eq!(parse(&running).unwrap(), smf);
+    }
+
+    #[test]
+    fn running_status_cleared_by_meta_event() {
+        // Note On, then a meta text, then Note On (same status) — the
+        // meta resets the buffer so the second status must be re-emitted.
+        let smf = one_track_file(vec![
+            ch(
+                0,
+                ChannelBody::NoteOn {
+                    key: 60,
+                    velocity: 64,
+                },
+                0,
+            ),
+            TrackEvent {
+                delta: 0,
+                kind: Event::Meta(MetaEvent::Text {
+                    kind: 0x01,
+                    text: b"x".to_vec(),
+                }),
+            },
+            ch(
+                0,
+                ChannelBody::NoteOn {
+                    key: 62,
+                    velocity: 64,
+                },
+                0,
+            ),
+        ]);
+        let running = smf.to_bytes_running_status().unwrap();
+        let body = &running[22..];
+        // Two 0x90 status bytes survive (the meta interposed).
+        assert_eq!(body.iter().filter(|&&b| b == 0x90).count(), 2);
+        assert_eq!(parse(&running).unwrap(), smf);
+    }
+
+    #[test]
+    fn running_status_cleared_by_sysex() {
+        let smf = one_track_file(vec![
+            ch(
+                0,
+                ChannelBody::ControlChange {
+                    controller: 7,
+                    value: 100,
+                },
+                0,
+            ),
+            TrackEvent {
+                delta: 0,
+                kind: Event::Sysex {
+                    escape: false,
+                    data: vec![0x7E, 0x7F, 0x09, 0x01, 0xF7],
+                },
+            },
+            ch(
+                0,
+                ChannelBody::ControlChange {
+                    controller: 7,
+                    value: 90,
+                },
+                0,
+            ),
+        ]);
+        let running = smf.to_bytes_running_status().unwrap();
+        let body = &running[22..];
+        assert_eq!(body.iter().filter(|&&b| b == 0xB0).count(), 2);
+        assert_eq!(parse(&running).unwrap(), smf);
+    }
+
+    #[test]
+    fn running_status_single_data_byte_messages_compress() {
+        // Two consecutive Program Change on the same channel.
+        let smf = one_track_file(vec![
+            ch(0, ChannelBody::ProgramChange { program: 0 }, 0),
+            ch(0, ChannelBody::ProgramChange { program: 1 }, 5),
+        ]);
+        let explicit = smf.to_bytes().unwrap();
+        let running = smf.to_bytes_running_status().unwrap();
+        assert_eq!(running.len(), explicit.len() - 1);
+        assert_eq!(parse(&running).unwrap(), smf);
+    }
+
+    #[test]
+    fn running_status_writer_matches_parser_compressed_input() {
+        // A hand-built compressed stream (status once, then bare data
+        // pairs) must parse to the same SmfFile our running-status
+        // writer would emit.
+        let events = [
+            0x00, 0x90, 0x3C, 0x27, // Note On C
+            0x00, 0x40, 0x2B, // running: Note On E
+            0x00, 0x43, 0x25, // running: Note On G
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let parsed = parse(&blob).unwrap();
+        let reemitted = parsed.to_bytes_running_status().unwrap();
+        assert_eq!(reemitted, blob);
+    }
+
+    #[test]
+    fn running_status_track_chunk_helper_matches_file_writer() {
+        let smf = one_track_file(vec![
+            ch(
+                0,
+                ChannelBody::NoteOn {
+                    key: 60,
+                    velocity: 64,
+                },
+                0,
+            ),
+            ch(
+                0,
+                ChannelBody::NoteOn {
+                    key: 64,
+                    velocity: 64,
+                },
+                0,
+            ),
+        ]);
+        let chunk = smf.tracks[0].to_bytes_chunk_running_status().unwrap();
+        let whole = smf.to_bytes_running_status().unwrap();
+        // The file's MTrk chunk (after the 14-byte MThd) equals the
+        // standalone chunk helper's output.
+        assert_eq!(&whole[14..], &chunk[..]);
+    }
+
+    #[test]
+    fn running_status_all_channel_voice_kinds_round_trip() {
+        // Pairs of each two-data-byte kind compress; verify round-trip
+        // across every channel-voice shape.
+        let smf = one_track_file(vec![
+            ch(
+                0,
+                ChannelBody::NoteOff {
+                    key: 60,
+                    velocity: 0,
+                },
+                0,
+            ),
+            ch(
+                0,
+                ChannelBody::NoteOff {
+                    key: 62,
+                    velocity: 0,
+                },
+                0,
+            ),
+            ch(
+                0,
+                ChannelBody::PolyAftertouch {
+                    key: 60,
+                    pressure: 10,
+                },
+                0,
+            ),
+            ch(
+                0,
+                ChannelBody::PolyAftertouch {
+                    key: 62,
+                    pressure: 20,
+                },
+                0,
+            ),
+            ch(
+                0,
+                ChannelBody::ControlChange {
+                    controller: 1,
+                    value: 5,
+                },
+                0,
+            ),
+            ch(
+                0,
+                ChannelBody::ControlChange {
+                    controller: 1,
+                    value: 6,
+                },
+                0,
+            ),
+            ch(0, ChannelBody::ChannelAftertouch { pressure: 33 }, 0),
+            ch(0, ChannelBody::ChannelAftertouch { pressure: 44 }, 0),
+            ch(0, ChannelBody::PitchBend { value: 0x2000 }, 0),
+            ch(0, ChannelBody::PitchBend { value: 0x3000 }, 0),
+        ]);
+        let running = smf.to_bytes_running_status().unwrap();
+        assert_eq!(parse(&running).unwrap(), smf);
     }
 }

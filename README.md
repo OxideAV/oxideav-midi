@@ -27,6 +27,13 @@ total events capped at 1 M to keep malformed input bounded.
   explicit status bytes and round-trips byte-for-byte through `parse`.
   `MAX_VLQ_VALUE = 0x0FFF_FFFF` is the public 4-byte VLQ cap;
   out-of-range values surface `Error::InvalidData` at encode time.
+  `SmfFile::to_bytes_running_status()` /
+  `Track::to_bytes_chunk_running_status()` emit the same stream with
+  **running-status compression** — a channel-voice event whose status
+  byte equals the previous emitted one drops the redundant status byte,
+  with the running-status buffer cleared by every meta / sysex event
+  (the parser's reset points), so the compressed output still
+  round-trips byte-for-byte.
 - **Meta-event iterators** — one typed, absolute-tick, stably-merged
   (track 0 before track 1 at the same tick) iterator per meta kind:
   `tempo_map`, `time_signatures`, `key_signatures`, `markers`,

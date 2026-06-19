@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 345 — running-status writer
+
+- New `SmfFile::to_bytes_running_status() -> Result<Vec<u8>>` and
+  `Track::to_bytes_chunk_running_status() -> Result<Vec<u8>>`:
+  serialise with **running-status compression** (MIDI 1.0 Detailed
+  Specification, "Running Status"). A channel-voice event whose status
+  byte equals the immediately-preceding emitted status omits the
+  redundant status byte; the running-status buffer is cleared by every
+  meta event and every sysex (`F0` / `F7`) event — exactly the reset
+  points the parser observes — so the compressed stream still
+  round-trips byte-for-byte through `parse`. The existing `to_bytes` /
+  `to_bytes_chunk` remain the explicit-status default (bit-stable
+  output). Same strict validation as the explicit writer. Status-byte
+  compression only: the encoder never rewrites a Note On velocity-0
+  into a running Note Off or vice versa, preserving caller event shapes.
+
 ### Round 337 — Notation Information Bar Number + Time Signature body decoders
 
 - New `NotationBarNumber` struct + `UniversalSysExEvent::
