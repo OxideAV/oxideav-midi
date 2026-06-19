@@ -235,6 +235,195 @@ pub struct SmfFile {
     pub tracks: Vec<Track>,
 }
 
+/// Incrementally assemble one [`Track`] from events placed at **absolute
+/// ticks**, deferring the SMF delta-time arithmetic to [`build`].
+///
+/// The wire format stores each event's offset as a *delta* from the
+/// previous event in the same track, which is awkward to author by hand
+/// — every insertion shifts the deltas after it. `TrackBuilder` lets a
+/// caller place events at absolute ticks in any order and computes the
+/// deltas once at [`build`] time:
+///
+/// 1. Events are stably sorted by tick (insertion order breaks ties, so
+///    two events at the same tick keep the order they were added — which
+///    matters for, e.g., a Program Change that must precede the Note On
+///    it patches).
+/// 2. The delta of each event is `tick − previous_tick`.
+/// 3. A trailing [`MetaEvent::EndOfTrack`] is appended automatically at
+///    the last event's tick (delta 0) unless the caller already added
+///    one, so the output is always a legal `MTrk`.
+///
+/// [`build`]: TrackBuilder::build
+#[derive(Clone, Debug, Default)]
+pub struct TrackBuilder {
+    /// `(tick, insertion_index, event)` — the index preserves add order
+    /// for the stable tie-break.
+    events: Vec<(u64, usize, Event)>,
+    next_index: usize,
+}
+
+impl TrackBuilder {
+    /// A new, empty builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Place an arbitrary [`Event`] at `tick`. Returns `self` for
+    /// chaining.
+    pub fn push(&mut self, tick: u64, event: Event) -> &mut Self {
+        self.events.push((tick, self.next_index, event));
+        self.next_index += 1;
+        self
+    }
+
+    /// Place a channel-voice message at `tick`.
+    pub fn channel(&mut self, tick: u64, channel: u8, body: ChannelBody) -> &mut Self {
+        self.push(tick, Event::Channel(ChannelMessage { channel, body }))
+    }
+
+    /// Place a meta event at `tick`.
+    pub fn meta(&mut self, tick: u64, meta: MetaEvent) -> &mut Self {
+        self.push(tick, Event::Meta(meta))
+    }
+
+    /// Convenience: a Note On (`9n`) at `tick` and a matching Note Off
+    /// (`8n key 0`) at `tick + duration`.
+    pub fn note(
+        &mut self,
+        tick: u64,
+        duration: u64,
+        channel: u8,
+        key: u8,
+        velocity: u8,
+    ) -> &mut Self {
+        self.channel(tick, channel, ChannelBody::NoteOn { key, velocity });
+        self.channel(
+            tick.saturating_add(duration),
+            channel,
+            ChannelBody::NoteOff { key, velocity: 0 },
+        )
+    }
+
+    /// Resolve the absolute-tick events into a [`Track`] with computed
+    /// delta-times.
+    ///
+    /// Events are stably sorted by tick (insertion order breaks ties).
+    /// If the caller did not already add a final
+    /// [`MetaEvent::EndOfTrack`], one is appended at the last event's
+    /// tick. An empty builder yields a single-event track holding just
+    /// the End-of-Track marker (the minimum legal `MTrk`).
+    pub fn build(self) -> Track {
+        let mut items = self.events;
+        // Stable sort by tick; equal ticks keep insertion order via the
+        // secondary index key.
+        items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let has_trailing_eot = matches!(
+            items.last().map(|(_, _, e)| e),
+            Some(Event::Meta(MetaEvent::EndOfTrack))
+        );
+        let last_tick = items.last().map(|(t, _, _)| *t).unwrap_or(0);
+
+        let mut events: Vec<TrackEvent> = Vec::with_capacity(items.len() + 1);
+        let mut prev_tick: u64 = 0;
+        for (tick, _, kind) in items {
+            let delta = tick.saturating_sub(prev_tick);
+            // SMF deltas are 28-bit VLQs; clamp pathological gaps to the
+            // cap so the writer can always serialise (a gap this large
+            // never occurs in real scores).
+            let delta = delta.min(MAX_VLQ_VALUE as u64) as u32;
+            events.push(TrackEvent { delta, kind });
+            prev_tick = tick;
+        }
+        if !has_trailing_eot {
+            // The auto-EOT lands at the last event's tick — `prev_tick`
+            // already equals `last_tick` after the loop — so its delta
+            // is 0. (`last_tick` is referenced only for documentation.)
+            debug_assert_eq!(prev_tick, last_tick);
+            events.push(TrackEvent {
+                delta: 0,
+                kind: Event::Meta(MetaEvent::EndOfTrack),
+            });
+        }
+        Track { events }
+    }
+}
+
+/// Incrementally assemble a complete [`SmfFile`] from one or more
+/// [`TrackBuilder`]s, keeping the header `ntrks` in sync with the track
+/// count so the result always satisfies [`SmfFile::to_bytes`]'s
+/// header-consistency check.
+///
+/// The format defaults to `1` (multi-track simultaneous) and the
+/// division to 480 ticks-per-quarter — the two most common choices —
+/// but both are overridable.
+#[derive(Clone, Debug)]
+pub struct SmfBuilder {
+    format: SmfFormat,
+    division: Division,
+    tracks: Vec<Track>,
+}
+
+impl Default for SmfBuilder {
+    fn default() -> Self {
+        Self {
+            format: SmfFormat::MultiTrackSimultaneous,
+            division: Division::TicksPerQuarter(480),
+            tracks: Vec::new(),
+        }
+    }
+}
+
+impl SmfBuilder {
+    /// A new builder: format 1, 480 ticks-per-quarter, no tracks.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the SMF format word (0 / 1 / 2).
+    pub fn format(&mut self, format: SmfFormat) -> &mut Self {
+        self.format = format;
+        self
+    }
+
+    /// Set the time division (ticks-per-quarter or SMPTE).
+    pub fn division(&mut self, division: Division) -> &mut Self {
+        self.division = division;
+        self
+    }
+
+    /// Append a finished [`Track`].
+    pub fn add_track(&mut self, track: Track) -> &mut Self {
+        self.tracks.push(track);
+        self
+    }
+
+    /// Build a [`TrackBuilder`], resolve it, and append the result.
+    pub fn track(&mut self, build: impl FnOnce(&mut TrackBuilder)) -> &mut Self {
+        let mut tb = TrackBuilder::new();
+        build(&mut tb);
+        self.tracks.push(tb.build());
+        self
+    }
+
+    /// Finalise into an [`SmfFile`]. `ntrks` is set from the track count.
+    ///
+    /// For format 0 the spec allows exactly one track; this is not
+    /// enforced here (the writer / parser tolerate the count), but a
+    /// caller targeting strict format-0 output should add a single
+    /// track.
+    pub fn build(self) -> SmfFile {
+        SmfFile {
+            header: SmfHeader {
+                format: self.format,
+                ntrks: self.tracks.len() as u16,
+                division: self.division,
+            },
+            tracks: self.tracks,
+        }
+    }
+}
+
 /// One time-signature change pinned to the absolute tick (relative to
 /// the start of its parent track) at which the
 /// [`FF 58 04 nn dd cc bb`](MetaEvent::TimeSignature) meta event
@@ -14175,6 +14364,221 @@ mod tests {
         // The file's MTrk chunk (after the 14-byte MThd) equals the
         // standalone chunk helper's output.
         assert_eq!(&whole[14..], &chunk[..]);
+    }
+
+    // ───────────── builder API ─────────────
+
+    #[test]
+    fn track_builder_computes_deltas_from_absolute_ticks() {
+        let mut tb = TrackBuilder::new();
+        tb.channel(
+            0,
+            0,
+            ChannelBody::NoteOn {
+                key: 60,
+                velocity: 100,
+            },
+        );
+        tb.channel(
+            480,
+            0,
+            ChannelBody::NoteOff {
+                key: 60,
+                velocity: 0,
+            },
+        );
+        let track = tb.build();
+        // NoteOn@0 (delta 0), NoteOff@480 (delta 480), auto-EOT@480 (delta 0).
+        assert_eq!(track.events.len(), 3);
+        assert_eq!(track.events[0].delta, 0);
+        assert_eq!(track.events[1].delta, 480);
+        assert_eq!(track.events[2].delta, 0);
+        assert!(matches!(
+            track.events[2].kind,
+            Event::Meta(MetaEvent::EndOfTrack)
+        ));
+    }
+
+    #[test]
+    fn track_builder_sorts_out_of_order_inserts_stably() {
+        let mut tb = TrackBuilder::new();
+        // Insert in non-monotonic tick order.
+        tb.channel(
+            480,
+            0,
+            ChannelBody::NoteOff {
+                key: 60,
+                velocity: 0,
+            },
+        );
+        tb.channel(
+            0,
+            0,
+            ChannelBody::NoteOn {
+                key: 60,
+                velocity: 100,
+            },
+        );
+        // Two events at the SAME tick: insertion order must survive.
+        tb.channel(0, 0, ChannelBody::ProgramChange { program: 5 });
+        let track = tb.build();
+        // After sort: NoteOn@0, ProgramChange@0 (insertion order at tie),
+        // NoteOff@480, EOT.
+        assert!(matches!(
+            track.events[0].kind,
+            Event::Channel(ChannelMessage {
+                body: ChannelBody::NoteOn { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            track.events[1].kind,
+            Event::Channel(ChannelMessage {
+                body: ChannelBody::ProgramChange { program: 5 },
+                ..
+            })
+        ));
+        assert_eq!(track.events[1].delta, 0);
+        assert!(matches!(
+            track.events[2].kind,
+            Event::Channel(ChannelMessage {
+                body: ChannelBody::NoteOff { .. },
+                ..
+            })
+        ));
+        assert_eq!(track.events[2].delta, 480);
+    }
+
+    #[test]
+    fn track_builder_note_helper_emits_on_off_pair() {
+        let mut tb = TrackBuilder::new();
+        tb.note(96, 192, 3, 64, 90);
+        let track = tb.build();
+        assert_eq!(track.events.len(), 3); // on, off, eot
+        assert!(matches!(
+            track.events[0].kind,
+            Event::Channel(ChannelMessage {
+                channel: 3,
+                body: ChannelBody::NoteOn {
+                    key: 64,
+                    velocity: 90
+                },
+            })
+        ));
+        assert_eq!(track.events[0].delta, 96);
+        assert!(matches!(
+            track.events[1].kind,
+            Event::Channel(ChannelMessage {
+                channel: 3,
+                body: ChannelBody::NoteOff {
+                    key: 64,
+                    velocity: 0
+                },
+            })
+        ));
+        assert_eq!(track.events[1].delta, 192);
+    }
+
+    #[test]
+    fn track_builder_respects_explicit_trailing_eot() {
+        let mut tb = TrackBuilder::new();
+        tb.channel(
+            0,
+            0,
+            ChannelBody::NoteOn {
+                key: 60,
+                velocity: 64,
+            },
+        );
+        tb.meta(240, MetaEvent::EndOfTrack);
+        let track = tb.build();
+        // No second EOT appended.
+        let eot_count = track
+            .events
+            .iter()
+            .filter(|e| matches!(e.kind, Event::Meta(MetaEvent::EndOfTrack)))
+            .count();
+        assert_eq!(eot_count, 1);
+        assert_eq!(track.events.last().unwrap().delta, 240);
+    }
+
+    #[test]
+    fn track_builder_empty_yields_lone_end_of_track() {
+        let track = TrackBuilder::new().build();
+        assert_eq!(track.events.len(), 1);
+        assert!(matches!(
+            track.events[0].kind,
+            Event::Meta(MetaEvent::EndOfTrack)
+        ));
+        assert_eq!(track.events[0].delta, 0);
+    }
+
+    #[test]
+    fn smf_builder_sets_ntrks_and_round_trips() {
+        let mut b = SmfBuilder::new();
+        b.format(SmfFormat::MultiTrackSimultaneous)
+            .division(Division::TicksPerQuarter(96));
+        b.track(|t| {
+            t.meta(0, MetaEvent::Tempo(500_000));
+        });
+        b.track(|t| {
+            t.note(0, 96, 0, 60, 100);
+        });
+        let smf = b.build();
+        assert_eq!(smf.header.ntrks, 2);
+        assert_eq!(smf.tracks.len(), 2);
+        // ntrks consistency means to_bytes accepts it; round-trip.
+        let bytes = smf.to_bytes().unwrap();
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed, smf);
+    }
+
+    #[test]
+    fn smf_builder_default_format1_480tpqn() {
+        let mut b = SmfBuilder::new();
+        b.track(|t| {
+            t.note(0, 240, 0, 72, 64);
+        });
+        let smf = b.build();
+        assert_eq!(smf.header.format, SmfFormat::MultiTrackSimultaneous);
+        assert_eq!(smf.header.division, Division::TicksPerQuarter(480));
+        assert_eq!(smf.header.ntrks, 1);
+    }
+
+    #[test]
+    fn smf_builder_format0_single_track_round_trips_through_running_writer() {
+        let mut b = SmfBuilder::new();
+        b.format(SmfFormat::SingleTrack)
+            .division(Division::TicksPerQuarter(96));
+        b.track(|t| {
+            t.channel(
+                0,
+                0,
+                ChannelBody::NoteOn {
+                    key: 60,
+                    velocity: 64,
+                },
+            );
+            t.channel(
+                0,
+                0,
+                ChannelBody::NoteOn {
+                    key: 64,
+                    velocity: 64,
+                },
+            );
+            t.channel(
+                0,
+                0,
+                ChannelBody::NoteOn {
+                    key: 67,
+                    velocity: 64,
+                },
+            );
+        });
+        let smf = b.build();
+        let bytes = smf.to_bytes_running_status().unwrap();
+        assert_eq!(parse(&bytes).unwrap(), smf);
     }
 
     #[test]

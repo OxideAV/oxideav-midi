@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 345 — SMF builder API (`SmfBuilder` / `TrackBuilder`)
+
+- New `TrackBuilder`: assemble a `Track` from events placed at
+  **absolute ticks** in any order, deferring the SMF delta-time
+  arithmetic to `build()`. Events are stably sorted by tick (insertion
+  order breaks ties, so a Program Change added before a Note On at the
+  same tick stays before it); each event's delta is `tick −
+  previous_tick`; a trailing `MetaEvent::EndOfTrack` is appended
+  automatically (at the last tick) unless the caller already added one,
+  so the output is always a legal `MTrk`. `push` / `channel` / `meta`
+  place events; the `note(tick, duration, channel, key, velocity)`
+  helper emits a Note On + matching Note Off (`8n key 0`) pair. An empty
+  builder yields a lone End-of-Track (the minimum legal track).
+- New `SmfBuilder`: assemble a complete `SmfFile`, keeping `ntrks` in
+  sync with the track count so the result always satisfies
+  `SmfFile::to_bytes`'s header-consistency check. `format` / `division`
+  override the defaults (format 1, 480 ticks-per-quarter); `add_track`
+  appends a finished `Track`, and `track(|t| …)` builds a `TrackBuilder`
+  inline. Round-trips through `to_bytes` / `to_bytes_running_status`.
+
 ### Round 345 — running-status writer
 
 - New `SmfFile::to_bytes_running_status() -> Result<Vec<u8>>` and

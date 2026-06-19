@@ -34,6 +34,15 @@ total events capped at 1 M to keep malformed input bounded.
   with the running-status buffer cleared by every meta / sysex event
   (the parser's reset points), so the compressed output still
   round-trips byte-for-byte.
+- **Builder** — `SmfBuilder` / `TrackBuilder` assemble a file from
+  scratch without hand-computing delta-times. `TrackBuilder` places
+  events at **absolute ticks** in any order, stably sorts them
+  (insertion order breaks ties), computes deltas at `build()`, and
+  auto-appends an `EndOfTrack` unless one is already present; the
+  `note(tick, duration, channel, key, velocity)` helper emits a Note
+  On/Off pair. `SmfBuilder` keeps `ntrks` in sync with the track count
+  (defaults to format 1, 480 ticks-per-quarter) so the result always
+  passes `to_bytes`'s header-consistency check.
 - **Meta-event iterators** — one typed, absolute-tick, stably-merged
   (track 0 before track 1 at the same tick) iterator per meta kind:
   `tempo_map`, `time_signatures`, `key_signatures`, `markers`,
