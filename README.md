@@ -58,6 +58,12 @@ total events capped at 1 M to keep malformed input bounded.
   `is_centre()`), `channel_pressures`, `poly_aftertouches`, and the
   piano-roll `notes()` (Note-On/Off pairing with velocity-0 = Off
   convention, FIFO re-strike) plus `active_notes_at(tick)`.
+- **Channel-mode classifier** — `ControlChangeEvent::channel_mode()`
+  decodes a `120..=127` controller into a typed `ChannelModeMessage`
+  (All Sound Off, Reset All Controllers, Local Control on/off, All Notes
+  Off, Omni Off / On, Mono On with channel count, Poly On);
+  `is_all_notes_off()` flags 123–127. `channel_mode_messages()` is the
+  stably-merged absolute-tick iterator over that subset.
 - **RPN / NRPN decoder** — `parameter_data_entries()` folds the
   CC 6 / 38 Data Entry pump and CC 96 / 97 Increment / Decrement against
   each channel's running RPN (CC 101 / 100) / NRPN (CC 99 / 98) selector,

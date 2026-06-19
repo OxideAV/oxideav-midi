@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 345 — typed Channel Mode Message classifier
+
+- New `ChannelModeMessage` enum + `ControlChangeEvent::channel_mode() ->
+  Option<ChannelModeMessage>`: classifies a channel-mode controller
+  (`Bn cc vv`, `cc` in `120..=127`) into All Sound Off, Reset All
+  Controllers, Local Control (`on` decoded from the value-byte switch:
+  `< 64` off, `>= 64` on), All Notes Off, Omni Off, Omni On, Mono On
+  (`channels` = the value byte `m`), or Poly On — MIDI 1.0 Detailed
+  Specification §"Channel Mode Messages". `is_all_notes_off()` flags
+  messages 123–127, which the spec says also act as All Notes Off.
+  Returns `None` for a continuous controller (`0..=119`).
+- New `ChannelModeEvent` struct + `SmfFile::channel_mode_messages() ->
+  Vec<ChannelModeEvent>`: the typed, absolute-tick, stably-merged
+  iterator over the channel-mode subset of the `Bn` stream (continuous
+  controllers filtered out), with `channel()` / `message()` accessors.
+
 ### Round 345 — multi-packet SysEx reassembly
 
 - New `ReassembledSysEx` struct + `SmfFile::reassembled_sysex_messages()

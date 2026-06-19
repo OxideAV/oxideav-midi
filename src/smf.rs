@@ -1883,6 +1883,62 @@ pub struct ControlChangeEvent {
     pub value: u8,
 }
 
+/// A typed Channel Mode Message (Control Change `120..=127`), classified
+/// per the MIDI 1.0 Detailed Specification §"Channel Mode Messages".
+///
+/// These seven controllers share the `Bn` Control Change status but
+/// carry mode semantics rather than continuous-controller values. Six of
+/// them take a `0` value byte by convention; two carry an argument:
+/// Local Control (on/off) and Mono Mode On (the channel count `m`).
+///
+/// Returned by [`ControlChangeEvent::channel_mode`] and collected by
+/// [`SmfFile::channel_mode_messages`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelModeMessage {
+    /// CC 120 — All Sound Off. Silences every sounding voice on the
+    /// channel immediately (ignoring release envelopes), value `0`.
+    AllSoundOff,
+    /// CC 121 — Reset All Controllers. Returns the channel's controllers
+    /// to their default values, value `0`.
+    ResetAllControllers,
+    /// CC 122 — Local Control. `on == true` for value `127` (keyboard
+    /// drives the local sound engine), `false` for value `0` (keyboard
+    /// and engine decoupled). Values `1..=126` are non-standard; the
+    /// spec's switch rule treats `0..=63` as off and `64..=127` as on.
+    LocalControl { on: bool },
+    /// CC 123 — All Notes Off, value `0`.
+    AllNotesOff,
+    /// CC 124 — Omni Mode Off (also acts as All Notes Off), value `0`.
+    OmniOff,
+    /// CC 125 — Omni Mode On (also acts as All Notes Off), value `0`.
+    OmniOn,
+    /// CC 126 — Mono Mode On / Poly Mode Off (also acts as All Notes
+    /// Off). `channels` is the value byte `m`: the number of channels
+    /// over which Mono voices are assigned, or `0` for "the number of
+    /// voices in the receiver" (assign one channel per voice across the
+    /// receive range), per the spec.
+    MonoOn { channels: u8 },
+    /// CC 127 — Poly Mode On / Mono Mode Off (also acts as All Notes
+    /// Off), value `0`.
+    PolyOn,
+}
+
+impl ChannelModeMessage {
+    /// `true` for messages 123–127, which the spec says also function as
+    /// All Notes Off (`AllNotesOff`, `OmniOff`, `OmniOn`, `MonoOn`,
+    /// `PolyOn`).
+    pub fn is_all_notes_off(&self) -> bool {
+        matches!(
+            self,
+            ChannelModeMessage::AllNotesOff
+                | ChannelModeMessage::OmniOff
+                | ChannelModeMessage::OmniOn
+                | ChannelModeMessage::MonoOn { .. }
+                | ChannelModeMessage::PolyOn
+        )
+    }
+}
+
 impl ControlChangeEvent {
     /// The MIDI channel index in the spec's `0..=15` range.
     pub fn channel(&self) -> u8 {
@@ -1913,6 +1969,60 @@ impl ControlChangeEvent {
     /// controllers.
     pub fn is_channel_mode(&self) -> bool {
         matches!(self.controller, 120..=127)
+    }
+
+    /// Classify a channel-mode controller (`120..=127`) into a typed
+    /// [`ChannelModeMessage`], decoding the value-byte argument for
+    /// Local Control (on/off) and Mono Mode On (channel count). Returns
+    /// `None` for a continuous controller (`0..=119`).
+    pub fn channel_mode(&self) -> Option<ChannelModeMessage> {
+        Some(match self.controller {
+            120 => ChannelModeMessage::AllSoundOff,
+            121 => ChannelModeMessage::ResetAllControllers,
+            122 => ChannelModeMessage::LocalControl {
+                on: self.value >= 64,
+            },
+            123 => ChannelModeMessage::AllNotesOff,
+            124 => ChannelModeMessage::OmniOff,
+            125 => ChannelModeMessage::OmniOn,
+            126 => ChannelModeMessage::MonoOn {
+                channels: self.value,
+            },
+            127 => ChannelModeMessage::PolyOn,
+            _ => return None,
+        })
+    }
+}
+
+/// One Channel Mode Message (`Bn cc vv`, `cc` in `120..=127`) pinned to
+/// the absolute tick at which it fires, with the controller already
+/// classified into a typed [`ChannelModeMessage`].
+///
+/// Returned by [`SmfFile::channel_mode_messages`] — the typed
+/// counterpart of the channel-mode subset of [`SmfFile::control_changes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelModeEvent {
+    /// Cumulative delta-sum from the start of the track that carried the
+    /// controller, in division units. For format-1 SMFs this is also the
+    /// absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the controller came from.
+    pub track: usize,
+    /// The MIDI channel index in the spec's `0..=15` range.
+    pub channel: u8,
+    /// The classified channel-mode message.
+    pub message: ChannelModeMessage,
+}
+
+impl ChannelModeEvent {
+    /// The MIDI channel index in the spec's `0..=15` range.
+    pub fn channel(&self) -> u8 {
+        self.channel
+    }
+
+    /// The classified channel-mode message.
+    pub fn message(&self) -> ChannelModeMessage {
+        self.message
     }
 }
 
@@ -4913,6 +5023,64 @@ impl SmfFile {
         // insertion order survives the sort (so track 0 wins over
         // track 1 at the same tick — matches the scheduler's merge
         // convention).
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **Channel Mode Message** (`Bn cc vv` with `cc` in
+    /// `120..=127`) from every track, pinned to the absolute tick at
+    /// which it fires, with each controller already classified into a
+    /// typed [`ChannelModeMessage`].
+    ///
+    /// The typed counterpart of the channel-mode subset of
+    /// [`SmfFile::control_changes`]: this helper walks the same `Bn`
+    /// stream, keeps only the `120..=127` controllers (All Sound Off,
+    /// Reset All Controllers, Local Control, All Notes Off, Omni Off /
+    /// On, Mono On, Poly On — MIDI 1.0 Detailed Specification §"Channel
+    /// Mode Messages"), decodes the value-byte argument for Local
+    /// Control (on/off) and Mono Mode On (channel count), and filters
+    /// out the continuous controllers (`0..=119`).
+    ///
+    /// The cumulative delta is summed per-track, then the per-track
+    /// sequences are merged. The sort is stable so two mode messages at
+    /// the same tick keep the `(track, in-track-position)` order — track
+    /// 0's events fire before track 1's at the same tick, matching the
+    /// stable-merge rule the rest of the iterator family uses.
+    ///
+    /// Returns an empty `Vec` when no track carries a channel-mode
+    /// controller.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn channel_mode_messages(&self) -> Vec<ChannelModeEvent> {
+        let mut out: Vec<ChannelModeEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Channel(ChannelMessage {
+                    channel,
+                    body: ChannelBody::ControlChange { controller, value },
+                }) = &ev.kind
+                {
+                    let scratch = ControlChangeEvent {
+                        tick: abs,
+                        track: track_idx,
+                        channel: *channel,
+                        controller: *controller,
+                        value: *value,
+                    };
+                    if let Some(message) = scratch.channel_mode() {
+                        out.push(ChannelModeEvent {
+                            tick: abs,
+                            track: track_idx,
+                            channel: *channel,
+                            message,
+                        });
+                    }
+                }
+            }
+        }
         out.sort_by_key(|c| c.tick);
         out
     }
@@ -14535,6 +14703,125 @@ mod tests {
         // The file's MTrk chunk (after the 14-byte MThd) equals the
         // standalone chunk helper's output.
         assert_eq!(&whole[14..], &chunk[..]);
+    }
+
+    // ───────────── channel-mode classifier ─────────────
+
+    #[test]
+    fn channel_mode_messages_classify_full_120_127_family() {
+        // CC 120..127 on channel 0, each at delta 0; CC 7 (continuous)
+        // interposed to confirm it is filtered out.
+        let events = [
+            0x00, 0xB0, 120, 0x00, // All Sound Off
+            0x00, 0xB0, 121, 0x00, // Reset All Controllers
+            0x00, 0xB0, 122, 0x7F, // Local Control On (127)
+            0x00, 0xB0, 122, 0x00, // Local Control Off (0)
+            0x00, 0xB0, 123, 0x00, // All Notes Off
+            0x00, 0xB0, 124, 0x00, // Omni Off
+            0x00, 0xB0, 125, 0x00, // Omni On
+            0x00, 0xB0, 126, 0x04, // Mono On, 4 channels
+            0x00, 0xB0, 127, 0x00, // Poly On
+            0x00, 0xB0, 0x07, 0x64, // CC 7 Volume — continuous, filtered
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let modes = smf.channel_mode_messages();
+        assert_eq!(modes.len(), 9);
+        assert_eq!(modes[0].message(), ChannelModeMessage::AllSoundOff);
+        assert_eq!(modes[1].message(), ChannelModeMessage::ResetAllControllers);
+        assert_eq!(
+            modes[2].message(),
+            ChannelModeMessage::LocalControl { on: true }
+        );
+        assert_eq!(
+            modes[3].message(),
+            ChannelModeMessage::LocalControl { on: false }
+        );
+        assert_eq!(modes[4].message(), ChannelModeMessage::AllNotesOff);
+        assert_eq!(modes[5].message(), ChannelModeMessage::OmniOff);
+        assert_eq!(modes[6].message(), ChannelModeMessage::OmniOn);
+        assert_eq!(
+            modes[7].message(),
+            ChannelModeMessage::MonoOn { channels: 4 }
+        );
+        assert_eq!(modes[8].message(), ChannelModeMessage::PolyOn);
+    }
+
+    #[test]
+    fn channel_mode_all_notes_off_predicate_covers_123_through_127() {
+        assert!(!ChannelModeMessage::AllSoundOff.is_all_notes_off());
+        assert!(!ChannelModeMessage::ResetAllControllers.is_all_notes_off());
+        assert!(!ChannelModeMessage::LocalControl { on: true }.is_all_notes_off());
+        assert!(ChannelModeMessage::AllNotesOff.is_all_notes_off());
+        assert!(ChannelModeMessage::OmniOff.is_all_notes_off());
+        assert!(ChannelModeMessage::OmniOn.is_all_notes_off());
+        assert!(ChannelModeMessage::MonoOn { channels: 0 }.is_all_notes_off());
+        assert!(ChannelModeMessage::PolyOn.is_all_notes_off());
+    }
+
+    #[test]
+    fn channel_mode_local_control_switch_threshold_at_64() {
+        // Spec switch rule: 0..=63 = off, 64..=127 = on.
+        let cc63 = ControlChangeEvent {
+            tick: 0,
+            track: 0,
+            channel: 0,
+            controller: 122,
+            value: 63,
+        };
+        let cc64 = ControlChangeEvent {
+            tick: 0,
+            track: 0,
+            channel: 0,
+            controller: 122,
+            value: 64,
+        };
+        assert_eq!(
+            cc63.channel_mode(),
+            Some(ChannelModeMessage::LocalControl { on: false })
+        );
+        assert_eq!(
+            cc64.channel_mode(),
+            Some(ChannelModeMessage::LocalControl { on: true })
+        );
+    }
+
+    #[test]
+    fn channel_mode_returns_none_for_continuous_controller() {
+        let cc = ControlChangeEvent {
+            tick: 0,
+            track: 0,
+            channel: 0,
+            controller: 7,
+            value: 100,
+        };
+        assert_eq!(cc.channel_mode(), None);
+    }
+
+    #[test]
+    fn channel_mode_messages_merge_across_tracks_by_tick() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(10));
+        t0.extend_from_slice(&[0xB0, 123, 0x00]); // All Notes Off @10 track 0
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(5));
+        t1.extend_from_slice(&[0xB1, 120, 0x00]); // All Sound Off @5 track 1
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let modes = smf.channel_mode_messages();
+        assert_eq!(modes.len(), 2);
+        assert_eq!(modes[0].tick, 5);
+        assert_eq!(modes[0].channel(), 1);
+        assert_eq!(modes[0].message(), ChannelModeMessage::AllSoundOff);
+        assert_eq!(modes[1].tick, 10);
+        assert_eq!(modes[1].channel(), 0);
+        assert_eq!(modes[1].message(), ChannelModeMessage::AllNotesOff);
     }
 
     // ───────────── multi-packet sysex reassembly ─────────────
