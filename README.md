@@ -71,7 +71,13 @@ total events capped at 1 M to keep malformed input bounded.
   NRPN and vice versa).
 - **SysEx** — `sysex_events()` surfaces both `F0` and `F7` flavours
   with `manufacturer_id()` / `ends_with_eox()` / `is_complete_message()`
-  helpers; `universal_sysex_events()` + `SysExEvent::
+  helpers. `reassembled_sysex_messages()` folds the `F0`-opener +
+  `F7`-continuation packet stream into complete logical
+  `ReassembledSysEx` messages (per-track continuation state machine,
+  trailing-`F7` stripped from `body`, `complete` / `packet_count` /
+  `id_byte()` / `is_universal()` accessors; standalone `F7` escapes and
+  unterminated chains surface as `complete == false`).
+  `universal_sysex_events()` + `SysExEvent::
   universal_classification()` decode the Universal SysEx Table 4
   vocabulary (`UniversalSysEx` / `UniversalSubId1`), realm-aware
   (Non-RT `0x7E` vs RT `0x7F`). `UniversalSysExEvent::

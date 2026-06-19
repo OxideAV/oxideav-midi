@@ -3347,6 +3347,68 @@ impl SysExEvent {
     }
 }
 
+/// A logical System Exclusive message reassembled from one or more
+/// on-disk SMF SysEx packets.
+///
+/// The Standard MIDI File format lets a single MIDI SysEx message be
+/// **split across multiple track events**: an `F0` start packet whose
+/// payload does *not* end with the `0xF7` End-of-Exclusive marker is
+/// continued by one or more `F7` continuation packets, the last of
+/// which ends with `0xF7`. (A producer splits a long dump so other
+/// events — timing, notes — can be interleaved at the right ticks, the
+/// SMF analogue of the wire-level rule that an EOX or any other status
+/// byte terminates a SysEx; MIDI 1.0 Detailed Specification, "EOX (End
+/// of Exclusive)".)
+///
+/// [`SmfFile::reassembled_sysex_messages`] folds those packet chains
+/// into one `ReassembledSysEx` per logical message, exposing the
+/// concatenated manufacturer payload via [`body`](Self::body) without
+/// the caller re-implementing the continuation state machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReassembledSysEx {
+    /// Absolute tick of the **opening** `F0` packet (relative to its
+    /// parent track's start; on a format-1 shared timebase this is the
+    /// absolute tick).
+    pub tick: u64,
+    /// Index of the [`Track`] the opening packet came from. All
+    /// continuation packets folded into this message come from the
+    /// same track.
+    pub track: usize,
+    /// The reassembled payload, **excluding** the leading `0xF0` (which
+    /// is implied by the `F0`-start framing and never stored in a
+    /// packet's `data`) and **excluding** the trailing `0xF7` EOX
+    /// marker. For a single-packet message this is the opener's payload
+    /// minus its trailing `0xF7`; for a multi-packet message it is the
+    /// opener's payload followed by every continuation packet's payload,
+    /// with only the final `0xF7` stripped.
+    pub body: Vec<u8>,
+    /// `true` when the chain terminated with an `0xF7` EOX marker;
+    /// `false` when the file ended (or a new `F0` opener intervened)
+    /// before an EOX was seen — a truncated / malformed message whose
+    /// `body` holds whatever bytes did arrive.
+    pub complete: bool,
+    /// Number of on-disk packets folded into this logical message (1 for
+    /// a self-contained `F0 … F7`, ≥2 for a split message).
+    pub packet_count: usize,
+}
+
+impl ReassembledSysEx {
+    /// The manufacturer / universal-realm ID byte that opens the
+    /// message — `body[0]` (the byte immediately after the implied
+    /// `0xF0`): a single-byte manufacturer ID, the `0x00` expanded-ID
+    /// prefix, or `0x7E` / `0x7F` for a Universal packet. `None` when
+    /// the reassembled body is empty.
+    pub fn id_byte(&self) -> Option<u8> {
+        self.body.first().copied()
+    }
+
+    /// `true` when the message opens with a Universal SysEx realm byte
+    /// (`0x7E` Non-Real-Time or `0x7F` Real-Time).
+    pub fn is_universal(&self) -> bool {
+        matches!(self.id_byte(), Some(0x7E | 0x7F))
+    }
+}
+
 /// Internal: decode the `<sub_id1>` byte into a [`UniversalSubId1`]
 /// against Table 4 of the MIDI 1.0 *Universal System Exclusive
 /// Messages* document, branching on realm where the same byte names
@@ -5574,6 +5636,94 @@ impl SmfFile {
         out
     }
 
+    /// Fold the per-track `F0` / `F7` SysEx packet stream into complete
+    /// logical [`ReassembledSysEx`] messages.
+    ///
+    /// The SMF format permits a single SysEx message to be split across
+    /// track events: an `F0` opener whose payload does not end in `0xF7`
+    /// is continued by `F7` packets until one ends in `0xF7` (EOX). This
+    /// helper runs that continuation state machine per track and emits
+    /// one message per chain, in time order (stably sorted by the
+    /// opener's absolute tick).
+    ///
+    /// Rules:
+    /// * An `F0` packet ending in `0xF7` is a self-contained message
+    ///   (`packet_count == 1`, `complete == true`).
+    /// * An `F0` packet *not* ending in `0xF7` opens a chain; subsequent
+    ///   `F7` packets on the same track append until one ends in `0xF7`.
+    /// * An `F7` packet with no chain open is a standalone **escape**
+    ///   sequence (the SMF "escaped" form for arbitrary wire bytes) and
+    ///   is surfaced as its own message — `complete` reflects whether
+    ///   its own payload ends in `0xF7`. Escapes are not manufacturer-
+    ///   prefixed, so [`ReassembledSysEx::id_byte`] reports their raw
+    ///   first byte without further meaning.
+    /// * A new `F0` opener while a chain is still open closes the prior
+    ///   chain as `complete == false` (the producer never sent its EOX)
+    ///   before starting the new one. A track that ends mid-chain
+    ///   likewise flushes the partial message as `complete == false`.
+    ///
+    /// The reassembled [`ReassembledSysEx::body`] strips the trailing
+    /// `0xF7` (when present) but keeps every manufacturer byte, so a
+    /// caller routing by manufacturer / universal ID reads
+    /// `body[0]` directly.
+    ///
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn reassembled_sysex_messages(&self) -> Vec<ReassembledSysEx> {
+        let mut out: Vec<ReassembledSysEx> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            // The currently-open chain, if any: (opener tick, body so
+            // far, packet count). `body` accumulates payloads with the
+            // EOX stripping deferred to flush time.
+            let mut open: Option<(u64, Vec<u8>, usize)> = None;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                let Event::Sysex { escape, data } = &ev.kind else {
+                    continue;
+                };
+                let ends_eox = matches!(data.last(), Some(&0xF7));
+                if !*escape {
+                    // F0 opener. Any in-progress chain is abandoned
+                    // (no EOX arrived) before this opener starts.
+                    if let Some((tick, body, count)) = open.take() {
+                        out.push(finish_sysex(tick, track_idx, body, false, count));
+                    }
+                    if ends_eox {
+                        // Self-contained single packet.
+                        out.push(finish_sysex(abs, track_idx, data.clone(), true, 1));
+                    } else {
+                        open = Some((abs, data.clone(), 1));
+                    }
+                } else {
+                    // F7 packet.
+                    match open.as_mut() {
+                        Some((_, body, count)) => {
+                            body.extend_from_slice(data);
+                            *count += 1;
+                            if ends_eox {
+                                let (tick, body, count) = open.take().unwrap();
+                                out.push(finish_sysex(tick, track_idx, body, true, count));
+                            }
+                        }
+                        None => {
+                            // Standalone escape: its own one-packet
+                            // message. `complete` mirrors whether the
+                            // escape payload itself terminates in EOX.
+                            out.push(finish_sysex(abs, track_idx, data.clone(), ends_eox, 1));
+                        }
+                    }
+                }
+            }
+            // Track ended mid-chain: flush the partial as incomplete.
+            if let Some((tick, body, count)) = open.take() {
+                out.push(finish_sysex(tick, track_idx, body, false, count));
+            }
+        }
+        out.sort_by_key(|m| m.tick);
+        out
+    }
+
     /// Collect every **Universal** System Exclusive packet from every
     /// track — `F0 7E …` (Non-Real-Time) and `F0 7F …` (Real-Time)
     /// only — pinned to the absolute tick at which it fires, in time
@@ -6280,6 +6430,27 @@ fn read_vlq(cursor: &mut Cursor<'_>) -> Result<u32> {
 
 fn fmt_tag(tag: &[u8]) -> String {
     String::from_utf8_lossy(tag).into_owned()
+}
+
+/// Build a [`ReassembledSysEx`] from an accumulated payload, stripping
+/// a single trailing `0xF7` EOX marker (when present) from `body`.
+fn finish_sysex(
+    tick: u64,
+    track: usize,
+    mut body: Vec<u8>,
+    complete: bool,
+    packet_count: usize,
+) -> ReassembledSysEx {
+    if matches!(body.last(), Some(&0xF7)) {
+        body.pop();
+    }
+    ReassembledSysEx {
+        tick,
+        track,
+        body,
+        complete,
+        packet_count,
+    }
 }
 
 // ───────────────────────── writer ─────────────────────────
@@ -14364,6 +14535,162 @@ mod tests {
         // The file's MTrk chunk (after the 14-byte MThd) equals the
         // standalone chunk helper's output.
         assert_eq!(&whole[14..], &chunk[..]);
+    }
+
+    // ───────────── multi-packet sysex reassembly ─────────────
+
+    #[test]
+    fn reassemble_single_packet_complete_message() {
+        // F0 7E 7F 09 01 F7 — GM System On, self-contained.
+        let events = [
+            0x00, 0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7, // F0, len 5
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let msgs = smf.reassembled_sysex_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].tick, 0);
+        assert_eq!(msgs[0].track, 0);
+        assert_eq!(msgs[0].body, vec![0x7E, 0x7F, 0x09, 0x01]);
+        assert!(msgs[0].complete);
+        assert_eq!(msgs[0].packet_count, 1);
+        assert_eq!(msgs[0].id_byte(), Some(0x7E));
+        assert!(msgs[0].is_universal());
+    }
+
+    #[test]
+    fn reassemble_two_packet_split_message() {
+        // F0 opener (no EOX) at tick 0, F7 continuation (with EOX) at +10.
+        let events = [
+            0x00, 0xF0, 0x03, 0x43, 0x12, 0x00, // F0 manufacturer 0x43, no EOX
+            0x0A, 0xF7, 0x03, 0x01, 0x02, 0xF7, // F7 continuation ends EOX
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let msgs = smf.reassembled_sysex_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].tick, 0); // opener tick
+                                     // body = opener payload (0x43 0x12 0x00) + continuation (0x01 0x02),
+                                     // trailing F7 stripped.
+        assert_eq!(msgs[0].body, vec![0x43, 0x12, 0x00, 0x01, 0x02]);
+        assert!(msgs[0].complete);
+        assert_eq!(msgs[0].packet_count, 2);
+        assert_eq!(msgs[0].id_byte(), Some(0x43));
+        assert!(!msgs[0].is_universal());
+    }
+
+    #[test]
+    fn reassemble_three_packet_split_message() {
+        let events = [
+            0x00, 0xF0, 0x02, 0x41, 0x10, // F0 Roland, no EOX
+            0x00, 0xF7, 0x02, 0x20, 0x21, // F7 middle, no EOX
+            0x00, 0xF7, 0x02, 0x30, 0xF7, // F7 final, EOX
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let msgs = smf.reassembled_sysex_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, vec![0x41, 0x10, 0x20, 0x21, 0x30]);
+        assert!(msgs[0].complete);
+        assert_eq!(msgs[0].packet_count, 3);
+    }
+
+    #[test]
+    fn reassemble_unterminated_chain_at_track_end_is_incomplete() {
+        // F0 opener, F7 continuation without EOX, then track ends.
+        let events = [
+            0x00, 0xF0, 0x02, 0x43, 0x12, // F0 no EOX
+            0x00, 0xF7, 0x02, 0x01, 0x02, // F7 no EOX
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let msgs = smf.reassembled_sysex_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, vec![0x43, 0x12, 0x01, 0x02]);
+        assert!(!msgs[0].complete);
+        assert_eq!(msgs[0].packet_count, 2);
+    }
+
+    #[test]
+    fn reassemble_new_opener_abandons_prior_open_chain() {
+        // F0 opener (no EOX), then a fresh F0 opener (complete) — the
+        // first is flushed incomplete, the second is its own message.
+        let events = [
+            0x00, 0xF0, 0x02, 0x43, 0x12, // F0 no EOX (abandoned)
+            0x00, 0xF0, 0x03, 0x7E, 0x7F, 0xF7, // F0 complete
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let msgs = smf.reassembled_sysex_messages();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].body, vec![0x43, 0x12]);
+        assert!(!msgs[0].complete);
+        assert_eq!(msgs[1].body, vec![0x7E, 0x7F]);
+        assert!(msgs[1].complete);
+    }
+
+    #[test]
+    fn reassemble_standalone_escape_is_own_message() {
+        // A lone F7 escape with no open chain.
+        let events = [
+            0x00, 0xF7, 0x03, 0xF8, 0xF8, 0xF8, // escaped real-time clocks
+            0x00, 0xFF, 0x2F, 0x00,
+        ];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let msgs = smf.reassembled_sysex_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, vec![0xF8, 0xF8, 0xF8]);
+        // Escape payload does not end in F7 → not complete.
+        assert!(!msgs[0].complete);
+        assert_eq!(msgs[0].packet_count, 1);
+    }
+
+    #[test]
+    fn reassemble_merges_across_tracks_by_opener_tick() {
+        // Track 0 opens a split at tick 20; track 1 has a complete
+        // message at tick 5. Output is sorted by opener tick.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(20));
+        t0.extend_from_slice(&[0xF0, 0x02, 0x43, 0x01]); // opener, no EOX
+        t0.extend_from_slice(&[0x00, 0xF7, 0x02, 0x02, 0xF7]); // EOX
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(5));
+        t1.extend_from_slice(&[0xF0, 0x03, 0x7E, 0x7F, 0xF7]); // complete
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let msgs = smf.reassembled_sysex_messages();
+        assert_eq!(msgs.len(), 2);
+        // tick 5 (track 1) sorts before tick 20 (track 0).
+        assert_eq!(msgs[0].tick, 5);
+        assert_eq!(msgs[0].track, 1);
+        assert_eq!(msgs[1].tick, 20);
+        assert_eq!(msgs[1].track, 0);
+        assert_eq!(msgs[1].body, vec![0x43, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn reassemble_empty_when_no_sysex() {
+        let events = [0x00, 0xFF, 0x2F, 0x00];
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.reassembled_sysex_messages().is_empty());
     }
 
     // ───────────── builder API ─────────────

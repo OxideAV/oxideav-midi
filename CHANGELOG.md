@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 345 — multi-packet SysEx reassembly
+
+- New `ReassembledSysEx` struct + `SmfFile::reassembled_sysex_messages()
+  -> Vec<ReassembledSysEx>`: folds the per-track `F0` / `F7` SysEx
+  packet stream into complete logical messages. An `F0` opener whose
+  payload does not end in `0xF7` is continued by `F7` packets until one
+  ends in `0xF7` (EOX); the helper runs that continuation state machine
+  per track and emits one message per chain, in opener-tick order. A
+  self-contained `F0 … F7` is a 1-packet message; a `F7` packet with no
+  open chain is surfaced as a standalone escape; a new `F0` opener (or
+  end of track) while a chain is still open flushes the prior chain as
+  `complete == false`. `body` concatenates the manufacturer payloads
+  with the final `0xF7` stripped; `id_byte()` / `is_universal()` expose
+  the opening manufacturer / Universal-realm byte; `complete` and
+  `packet_count` report chain termination + length. (MIDI 1.0 Detailed
+  Specification, "EOX — End of Exclusive".)
+
 ### Round 345 — SMF builder API (`SmfBuilder` / `TrackBuilder`)
 
 - New `TrackBuilder`: assemble a `Track` from events placed at
