@@ -95,6 +95,7 @@ pub mod paths;
 pub mod scheduler;
 pub mod smf;
 pub mod tuning;
+pub mod ump;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
