@@ -127,6 +127,45 @@ total events capped at 1 M to keep malformed input bounded.
   Change, Pitch Bend, and the snapshot-tracked CCs; `apply()` is
   exposed for custom replay.
 
+## UMP / MIDI 2.0 (`ump`)
+
+Universal MIDI Packet container and MIDI 2.0 Protocol vocabulary, per
+the MIDI Association *UMP Format and MIDI 2.0 Protocol* spec
+(M2-104-UM v1.1.2). Transport-independent: the module operates purely on
+32-bit `u32` words (on-wire byte order is out of scope per spec §2.1.1).
+
+- **`ump::packet`** — the [`Ump`] word container. Decodes the Message
+  Type (MT) nibble and derives packet size (1/2/3/4 words) from Table 4,
+  so even unmodelled / Reserved Message Types are sized correctly.
+  Extracts group / status / opcode / channel; Utility (MT 0x0) and UMP
+  Stream (MT 0xF) are Groupless. `UmpStream` walks a flat `&[u32]` into
+  self-delimiting packets of mixed sizes, surfacing a trailing partial
+  packet as a single `Err`.
+- **`ump::message`** — typed `decode` + `encode` for four Message Types:
+  Utility (NOOP, JR Clock, JR Timestamp, Delta Clockstamp TPQ, Delta
+  Clockstamp 20-bit); System Common / System Real Time (SPP LSB-first,
+  `0xF0`/`0xF7` rejected since SysEx rides MT 0x3); MIDI 1.0 Channel
+  Voice (all 7 opcodes, 2-byte messages zero-fill); and the full MIDI
+  2.0 Channel Voice set — registered/assignable per-note controllers,
+  registered/assignable + relative controllers, per-note pitch bend,
+  16-bit-velocity Note On/Off with attribute type/data, 32-bit poly /
+  channel pressure, per-note management D/S flags, Program Change with
+  the Bank Valid flag, and 32-bit Pitch Bend. `UmpMessage::decode`
+  dispatches on MT; Data / Flex / Stream / Reserved surface as
+  `Unhandled`.
+- **`ump::scaling`** — the spec Appendix D bit-scaling primitives:
+  Min-Center-Max upscaling (smooth shift below center, bit-repeat above)
+  and truncating downscaling, with 7/14 ⇄ 16/32 helpers. Verified
+  against the §D.1.3 numerical examples and §D.1.2 center-value table;
+  7⇄32 and 14⇄32 round-trips proven lossless.
+- **Translation** — `Midi1ChannelVoice::to_midi2` / `Midi2ChannelVoice::
+  to_midi1` implement the Default Translation Mode (§D.2/D.3): Note On
+  velocity-0 ⇄ Note Off 0x8000, velocity floored to 1 on downscale,
+  pitch-bend 14⇄32 with LSB-first packing, Program Change bank handling,
+  and `None` for the messages with no counterpart (special CCs that
+  belong to compound RPN/NRPN sequences; per-note / relative / per-note-
+  management on the way down).
+
 ## Instruments
 
 - `instruments::sf2` — full SoundFont 2 RIFF reader + voice generator.
