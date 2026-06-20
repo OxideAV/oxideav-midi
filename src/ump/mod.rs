@@ -37,3 +37,4 @@ pub use message::{
     Midi1ChannelVoice, Midi2ChannelVoice, SystemMessage, UmpMessage, UtilityMessage,
 };
 pub use packet::{MessageType, Ump, UmpStream};
+pub use scaling::{scale_down, scale_up};

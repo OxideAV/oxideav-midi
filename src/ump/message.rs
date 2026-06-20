@@ -277,6 +277,7 @@ impl Midi1ChannelVoice {
 }
 
 include!("message_midi2.rs");
+include!("translate.rs");
 
 /// A decoded UMP message dispatched on Message Type.
 #[derive(Debug, Clone, PartialEq, Eq)]
