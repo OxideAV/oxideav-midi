@@ -64,6 +64,14 @@ total events capped at 1 M to keep malformed input bounded.
   Off, Omni Off / On, Mono On with channel count, Poly On);
   `is_all_notes_off()` flags 123–127. `channel_mode_messages()` is the
   stably-merged absolute-tick iterator over that subset.
+- **Effects-depth classifier** — `ControlChangeEvent::effect_depth()`
+  decodes an `91..=95` controller into a typed `EffectDepth` (Reverb
+  Send / Tremolo / Chorus Send / Celeste / Phaser, per MIDI 1.0 *Control
+  Change Messages* Table 3), each carrying the `0..=127` level via
+  `.level()` and its source `.controller()`. CC 91 / CC 93 are the GM
+  Reverb / Chorus sends the synth's effects bus consumes.
+  `effect_depths()` is the stably-merged absolute-tick iterator over that
+  subset.
 - **RPN / NRPN decoder** — `parameter_data_entries()` folds the
   CC 6 / 38 Data Entry pump and CC 96 / 97 Increment / Decrement against
   each channel's running RPN (CC 101 / 100) / NRPN (CC 99 / 98) selector,

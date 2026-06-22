@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 361 — Effects-depth controller classifier + iterator (CC 91–95)
+
+- New `smf::EffectDepth` enum + `ControlChangeEvent::effect_depth() ->
+  Option<EffectDepth>`: classifies an "Effects N Depth" controller
+  (CC 91–95) into Reverb Send / Tremolo / Chorus Send / Celeste /
+  Phaser per the MIDI 1.0 *Control Change Messages — Data Bytes*
+  document (Table 3), each carrying the `0..=127` value via `.level()`
+  and reporting its source `.controller()`. CC 91 (default Reverb Send
+  Level) and CC 93 (default Chorus Send Level) are the two sends the
+  mixer's CA-024 effects bus consumes. Returns `None` outside 91–95.
+- New `smf::EffectDepthEvent` + `SmfFile::effect_depths() ->
+  Vec<EffectDepthEvent>`: the typed, absolute-tick, stably-merged
+  (track 0 before track 1 at the same tick) iterator over the
+  effects-depth subset of `control_changes`, with `channel()` /
+  `depth()` accessors. Empty when no track carries CC 91–95.
+- Tests: full 91–95 classification, none-outside-range, cross-track
+  merge with non-effect CCs filtered, empty-result.
+
 ### Round 361 — GM2 Reverb + Chorus DSP send bus (CA-024)
 
 - The system Reverb + Chorus parameters decoded from the GM2 Global

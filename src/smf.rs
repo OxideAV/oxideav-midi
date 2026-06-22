@@ -1939,6 +1939,58 @@ impl ChannelModeMessage {
     }
 }
 
+/// One of the five "Effects N Depth" controllers (CC 91–95), classified
+/// by the MIDI 1.0 *Control Change Messages — Data Bytes* document
+/// (Table 3). Each carries a `0..=127` depth/send level (`value`).
+///
+/// The two effects with a General MIDI default function — Reverb Send
+/// (CC 91, "default: Reverb Send Level — see MMA RP-023") and Chorus
+/// Send (CC 93, "default: Chorus Send Level") — are what the mixer's
+/// system effects bus (CA-024) consumes; the other three preserve the
+/// table's "formerly …" historical assignments (Tremolo / Celeste
+/// [Detune] / Phaser depth) as their documented names. Returned by
+/// [`ControlChangeEvent::effect_depth`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectDepth {
+    /// CC 91 — Effects 1 Depth, GM default **Reverb Send Level**
+    /// (formerly External Effects Depth).
+    ReverbSend(u8),
+    /// CC 92 — Effects 2 Depth (formerly Tremolo Depth).
+    Tremolo(u8),
+    /// CC 93 — Effects 3 Depth, GM default **Chorus Send Level**
+    /// (formerly Chorus Depth).
+    ChorusSend(u8),
+    /// CC 94 — Effects 4 Depth (formerly Celeste / Detune Depth).
+    Celeste(u8),
+    /// CC 95 — Effects 5 Depth (formerly Phaser Depth).
+    Phaser(u8),
+}
+
+impl EffectDepth {
+    /// The raw `0..=127` depth / send-level value, regardless of which
+    /// of the five effect slots this is.
+    pub fn level(&self) -> u8 {
+        match self {
+            EffectDepth::ReverbSend(v)
+            | EffectDepth::Tremolo(v)
+            | EffectDepth::ChorusSend(v)
+            | EffectDepth::Celeste(v)
+            | EffectDepth::Phaser(v) => *v,
+        }
+    }
+
+    /// The controller number (`91..=95`) this variant corresponds to.
+    pub fn controller(&self) -> u8 {
+        match self {
+            EffectDepth::ReverbSend(_) => 91,
+            EffectDepth::Tremolo(_) => 92,
+            EffectDepth::ChorusSend(_) => 93,
+            EffectDepth::Celeste(_) => 94,
+            EffectDepth::Phaser(_) => 95,
+        }
+    }
+}
+
 impl ControlChangeEvent {
     /// The MIDI channel index in the spec's `0..=15` range.
     pub fn channel(&self) -> u8 {
@@ -1992,6 +2044,25 @@ impl ControlChangeEvent {
             _ => return None,
         })
     }
+
+    /// Classify an "Effects N Depth" controller (CC 91–95) into a typed
+    /// [`EffectDepth`], carrying the `0..=127` depth / send-level value.
+    /// Returns `None` for any other controller number.
+    ///
+    /// CC 91 (Reverb Send) and CC 93 (Chorus Send) are the GM-default
+    /// sends the mixer's CA-024 effects bus consumes; the parse-side
+    /// classifier lets a caller surface every effect-depth edit in a
+    /// score without driving the synth.
+    pub fn effect_depth(&self) -> Option<EffectDepth> {
+        Some(match self.controller {
+            91 => EffectDepth::ReverbSend(self.value),
+            92 => EffectDepth::Tremolo(self.value),
+            93 => EffectDepth::ChorusSend(self.value),
+            94 => EffectDepth::Celeste(self.value),
+            95 => EffectDepth::Phaser(self.value),
+            _ => return None,
+        })
+    }
 }
 
 /// One Channel Mode Message (`Bn cc vv`, `cc` in `120..=127`) pinned to
@@ -2023,6 +2094,39 @@ impl ChannelModeEvent {
     /// The classified channel-mode message.
     pub fn message(&self) -> ChannelModeMessage {
         self.message
+    }
+}
+
+/// One **Effects Depth** controller (`Bn cc vv`, `cc` in `91..=95`)
+/// pinned to the absolute tick at which it fires, with the controller
+/// classified into a typed [`EffectDepth`].
+///
+/// Returned by [`SmfFile::effect_depths`] — the typed counterpart of the
+/// effects-depth subset of [`SmfFile::control_changes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EffectDepthEvent {
+    /// Cumulative delta-sum from the start of the track that carried the
+    /// controller, in division units. For format-1 SMFs this is also the
+    /// absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the controller came from.
+    pub track: usize,
+    /// The MIDI channel index in the spec's `0..=15` range.
+    pub channel: u8,
+    /// The classified effect-depth controller + its level.
+    pub depth: EffectDepth,
+}
+
+impl EffectDepthEvent {
+    /// The MIDI channel index in the spec's `0..=15` range.
+    pub fn channel(&self) -> u8 {
+        self.channel
+    }
+
+    /// The classified effect-depth controller (Reverb Send / Tremolo /
+    /// Chorus Send / Celeste / Phaser) with its `0..=127` level.
+    pub fn depth(&self) -> EffectDepth {
+        self.depth
     }
 }
 
@@ -5076,6 +5180,57 @@ impl SmfFile {
                             track: track_idx,
                             channel: *channel,
                             message,
+                        });
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **Effects Depth** controller (`Bn cc vv` with `cc`
+    /// in `91..=95`) from every track, pinned to the absolute tick at
+    /// which it fires, with each controller classified into a typed
+    /// [`EffectDepth`].
+    ///
+    /// The typed counterpart of the effects-depth subset of
+    /// [`SmfFile::control_changes`]: it keeps only CC 91–95 (Reverb Send
+    /// / Tremolo / Chorus Send / Celeste / Phaser — MIDI 1.0 *Control
+    /// Change Messages* Table 3) and filters out every other controller.
+    /// CC 91 / CC 93 are the two GM-default sends the synth's CA-024
+    /// effects bus consumes; this iterator lets a caller surface the
+    /// send automation for a score without driving the synth.
+    ///
+    /// Stable-merged by absolute tick (track 0 before track 1 at the
+    /// same tick), matching the rest of the iterator family. Returns an
+    /// empty `Vec` when no track carries an effects-depth controller.
+    /// Cost is linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn effect_depths(&self) -> Vec<EffectDepthEvent> {
+        let mut out: Vec<EffectDepthEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Channel(ChannelMessage {
+                    channel,
+                    body: ChannelBody::ControlChange { controller, value },
+                }) = &ev.kind
+                {
+                    let scratch = ControlChangeEvent {
+                        tick: abs,
+                        track: track_idx,
+                        channel: *channel,
+                        controller: *controller,
+                        value: *value,
+                    };
+                    if let Some(depth) = scratch.effect_depth() {
+                        out.push(EffectDepthEvent {
+                            tick: abs,
+                            track: track_idx,
+                            channel: *channel,
+                            depth,
                         });
                     }
                 }
@@ -15255,5 +15410,89 @@ mod tests {
         ]);
         let running = smf.to_bytes_running_status().unwrap();
         assert_eq!(parse(&running).unwrap(), smf);
+    }
+
+    // ───────────────────── effects-depth controllers (CC 91–95) ──────────────
+
+    #[test]
+    fn effect_depth_classifies_full_91_95_family() {
+        // Map controller → expected typed variant + level.
+        let cases = [
+            (91u8, EffectDepth::ReverbSend(40)),
+            (92, EffectDepth::Tremolo(40)),
+            (93, EffectDepth::ChorusSend(40)),
+            (94, EffectDepth::Celeste(40)),
+            (95, EffectDepth::Phaser(40)),
+        ];
+        for (controller, expected) in cases {
+            let cc = ControlChangeEvent {
+                tick: 0,
+                track: 0,
+                channel: 0,
+                controller,
+                value: 40,
+            };
+            let depth = cc.effect_depth().expect("CC 91-95 must classify");
+            assert_eq!(depth, expected);
+            assert_eq!(depth.level(), 40);
+            assert_eq!(depth.controller(), controller);
+        }
+    }
+
+    #[test]
+    fn effect_depth_returns_none_outside_91_95() {
+        for controller in [7u8, 10, 90, 96, 11] {
+            let cc = ControlChangeEvent {
+                tick: 0,
+                track: 0,
+                channel: 0,
+                controller,
+                value: 64,
+            };
+            assert_eq!(
+                cc.effect_depth(),
+                None,
+                "controller {controller} should not classify"
+            );
+        }
+    }
+
+    #[test]
+    fn effect_depths_iterator_filters_and_merges() {
+        // Track 0: CC 7 (volume, ignored) then CC 91 (reverb send) @20.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xB0, 0x07, 0x64]); // CC 7 = 100 — filtered out
+        t0.extend_from_slice(&encode_vlq(20));
+        t0.extend_from_slice(&[0xB0, 93, 0x50]); // CC 93 Chorus Send = 80 @20
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        // Track 1: CC 91 reverb send @5.
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(5));
+        t1.extend_from_slice(&[0xB1, 91, 0x28]); // CC 91 Reverb Send = 40 @5
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let depths = smf.effect_depths();
+        assert_eq!(depths.len(), 2, "CC 7 must be filtered out");
+        // Stable-merged by tick: the @5 reverb send sorts first.
+        assert_eq!(depths[0].tick, 5);
+        assert_eq!(depths[0].channel(), 1);
+        assert_eq!(depths[0].depth(), EffectDepth::ReverbSend(40));
+        assert_eq!(depths[1].tick, 20);
+        assert_eq!(depths[1].channel(), 0);
+        assert_eq!(depths[1].depth(), EffectDepth::ChorusSend(80));
+    }
+
+    #[test]
+    fn effect_depths_empty_when_no_effect_controllers() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xB0, 0x07, 0x64]); // only CC 7
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&t0));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.effect_depths().is_empty());
     }
 }
