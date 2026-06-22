@@ -583,8 +583,8 @@ impl ModDelay {
 struct EffectsBus {
     sample_rate: f32,
     // Stereo Schroeder reverb: a comb bank + allpass chain per side. The
-    // right side uses slightly longer delays (the classic Schroeder /
-    // Freeverb stereo spread) so the two channels decorrelate.
+    // right side uses slightly longer delays (a small stereo spread) so
+    // the two channels decorrelate.
     combs_l: Vec<Comb>,
     combs_r: Vec<Comb>,
     allpass_l: Vec<Allpass>,
@@ -601,8 +601,9 @@ struct EffectsBus {
 }
 
 impl EffectsBus {
-    /// Schroeder comb-filter delay lengths in samples at 44.1 kHz (the
-    /// classic Freeverb tuning). Scaled by the actual sample rate at
+    /// Schroeder comb-filter delay lengths in samples at 44.1 kHz — a
+    /// set of mutually-prime-ish delays chosen so the comb resonances
+    /// interleave evenly. Scaled by the actual sample rate at
     /// construction. The right channel adds a small stereo spread.
     const COMB_TUNING: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
     /// Schroeder allpass delay lengths in samples at 44.1 kHz.
