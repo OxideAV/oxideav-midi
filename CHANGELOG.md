@@ -1503,7 +1503,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - round 98 — MIDI Tuning Standard (MTS) microtuning
 - Round 95: SFZ-side filter envelope + fil_type + cutoff wiring
-- rewrite release-envelope comment to remove FluidSynth citation
+- rewrite release-envelope comment to drop a named third-party-impl reference
 - EG2 + 2-pole resonant low-pass filter on the shared SamplePlayer (round 91)
 - DLS art1/art2 articulation interpretation (round 80)
 - round 75 — MPE + RPN 1/2/5 + CA-25 master tuning + master volume SysEx
