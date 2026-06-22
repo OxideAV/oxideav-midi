@@ -340,22 +340,78 @@ impl GmEffects {
         (((val & 0x7F) as f32 - 40.0) * 0.025).exp()
     }
 
+    /// CA-024 Reverb Time default *value* for each Reverb Type, from the
+    /// "pp = 1 : Reverb Time" table: Type 0 → 44, 1 → 50, 2 → 56, 3 → 64,
+    /// 4 → 64, 8 → 50. The spec says "When a Reverb Type is selected, the
+    /// default Reverb Time from the table below for that Reverb Type
+    /// should be set." Unknown types fall back to the Type-4 (Large Hall)
+    /// default value.
+    fn reverb_type_default_time_val(reverb_type: u8) -> u8 {
+        match reverb_type & 0x7F {
+            0 => 44,
+            1 => 50,
+            2 => 56,
+            3 => 64,
+            4 => 64,
+            8 => 50,
+            _ => 64,
+        }
+    }
+
+    /// CA-024 Chorus parameter row for each Chorus Type, from the
+    /// "pp = 0 : Chorus Type" table — `(feedback, mod_rate, mod_depth,
+    /// rev_send)` as raw 7-bit values:
+    ///
+    /// | Type | Feedback | Mod Rate | Mod Depth | Rev Send |
+    /// |------|----------|----------|-----------|----------|
+    /// | 0 Chorus 1 | 0   | 3 | 5  | 0 |
+    /// | 1 Chorus 2 | 5   | 9 | 19 | 0 |
+    /// | 2 Chorus 3 | 8   | 3 | 19 | 0 |
+    /// | 3 Chorus 4 | 16  | 9 | 16 | 0 |
+    /// | 4 FB Chorus| 64  | 2 | 24 | 0 |
+    /// | 5 Flanger  | 112 | 1 | 5  | 0 |
+    ///
+    /// Unknown types fall back to the Type-2 (Chorus 3) GM2-default row.
+    fn chorus_type_default_row(chorus_type: u8) -> (u8, u8, u8, u8) {
+        match chorus_type & 0x7F {
+            0 => (0, 3, 5, 0),
+            1 => (5, 9, 19, 0),
+            2 => (8, 3, 19, 0),
+            3 => (16, 9, 16, 0),
+            4 => (64, 2, 24, 0),
+            5 => (112, 1, 5, 0),
+            _ => (8, 3, 19, 0),
+        }
+    }
+
+    /// Apply the CA-024 Chorus-table row for `chorus_type` to the
+    /// per-parameter fields (Mod Rate / Mod Depth / Feedback / Send-to-
+    /// Reverb), using the spec's per-parameter unit formulas.
+    fn apply_chorus_type_defaults(&mut self, chorus_type: u8) {
+        let (fb, mr, md, rs) = Self::chorus_type_default_row(chorus_type);
+        self.chorus_mod_rate_hz = mr as f32 * 0.122;
+        self.chorus_mod_depth_ms = (md as f32 + 1.0) / 3.2;
+        self.chorus_feedback_pct = fb as f32 * 0.763;
+        self.chorus_send_to_reverb_pct = rs as f32 * 0.787;
+    }
+
     /// CA-024 GM2 recommended initial settings: Reverb Type 4 (Large
     /// Hall), Chorus Type 2 (Chorus 3), and the per-type values the
     /// CA-024 tables list for those two types.
     fn gm2_default() -> Self {
-        Self {
+        let mut fx = Self {
             reverb_type: 4,
             // Reverb Type 4 (Large Hall) default time value = 64.
             reverb_time_s: Self::reverb_time_from_val(64),
             chorus_type: 2,
-            // Chorus Type 2 (Chorus 3) table row: Feedback 8, Mod Rate 3,
-            // Mod Depth 19, Send-to-Reverb 0.
-            chorus_mod_rate_hz: 3.0 * 0.122,
-            chorus_mod_depth_ms: (19.0 + 1.0) / 3.2,
-            chorus_feedback_pct: 8.0 * 0.763,
+            chorus_mod_rate_hz: 0.0,
+            chorus_mod_depth_ms: 0.0,
+            chorus_feedback_pct: 0.0,
             chorus_send_to_reverb_pct: 0.0,
-        }
+        };
+        // Chorus Type 2 (Chorus 3) table row.
+        fx.apply_chorus_type_defaults(2);
+        fx
     }
 }
 
@@ -1497,7 +1553,10 @@ impl Mixer {
     /// Global Parameter Control message (CA-024 reverb table). `pp` is
     /// the parameter ID, `val` the raw 7-bit value:
     ///
-    ///   * `pp = 0` → Reverb Type select (stored verbatim).
+    ///   * `pp = 0` → Reverb Type select. Per CA-024 ("When a Reverb
+    ///     Type is selected, the default Reverb Time from the table
+    ///     below for that Reverb Type should be set") this *also* resets
+    ///     the Reverb Time to that type's table default.
     ///   * `pp = 1` → Reverb Time, decoded to seconds via
     ///     `rt = exp((val - 40) * 0.025)`.
     ///
@@ -1506,7 +1565,13 @@ impl Mixer {
     /// only that parameter-value pair should be ignored").
     pub fn set_gm_reverb_param(&mut self, pp: u8, val: u8) {
         match pp {
-            0 => self.gm_effects.reverb_type = val & 0x7F,
+            0 => {
+                let ty = val & 0x7F;
+                self.gm_effects.reverb_type = ty;
+                // Selecting a Reverb Type sets its default Reverb Time.
+                self.gm_effects.reverb_time_s =
+                    GmEffects::reverb_time_from_val(GmEffects::reverb_type_default_time_val(ty));
+            }
             1 => self.gm_effects.reverb_time_s = GmEffects::reverb_time_from_val(val),
             _ => {}
         }
@@ -1516,7 +1581,10 @@ impl Mixer {
     /// Global Parameter Control message (CA-024 chorus table). `pp` is
     /// the parameter ID, `val` the raw 7-bit value:
     ///
-    ///   * `pp = 0` → Chorus Type select (stored verbatim).
+    ///   * `pp = 0` → Chorus Type select. Per CA-024 ("pp = 0 : Chorus
+    ///     Type … Sets Chorus parameters as listed below") this *also*
+    ///     loads the Mod Rate / Mod Depth / Feedback / Send-to-Reverb
+    ///     row for that type.
     ///   * `pp = 1` → Mod Rate Hz: `mr = val * 0.122`.
     ///   * `pp = 2` → Mod Depth ms: `md = (val + 1) / 3.2`.
     ///   * `pp = 3` → Feedback %: `fb = val * 0.763`.
@@ -1526,7 +1594,12 @@ impl Mixer {
     pub fn set_gm_chorus_param(&mut self, pp: u8, val: u8) {
         let v = (val & 0x7F) as f32;
         match pp {
-            0 => self.gm_effects.chorus_type = val & 0x7F,
+            0 => {
+                let ty = val & 0x7F;
+                self.gm_effects.chorus_type = ty;
+                // Selecting a Chorus Type loads its parameter row.
+                self.gm_effects.apply_chorus_type_defaults(ty);
+            }
             1 => self.gm_effects.chorus_mod_rate_hz = v * 0.122,
             2 => self.gm_effects.chorus_mod_depth_ms = (v + 1.0) / 3.2,
             3 => self.gm_effects.chorus_feedback_pct = v * 0.763,
@@ -3240,6 +3313,44 @@ mod tests {
             long > short,
             "longer reverb time should retain more tail energy: short={short}, long={long}"
         );
+    }
+
+    #[test]
+    fn reverb_type_select_sets_default_time() {
+        // CA-024: "When a Reverb Type is selected, the default Reverb
+        // Time from the table below for that Reverb Type should be set."
+        let mut m = Mixer::new();
+        // Type 0 (Small Room) default time value = 44.
+        m.set_gm_reverb_param(0, 0);
+        let expect_small = GmEffects::reverb_time_from_val(44);
+        assert!((m.gm_effects().reverb_time_s - expect_small).abs() < 1e-4);
+        assert_eq!(m.gm_effects().reverb_type, 0);
+        // Type 4 (Large Hall) default time value = 64.
+        m.set_gm_reverb_param(0, 4);
+        let expect_hall = GmEffects::reverb_time_from_val(64);
+        assert!((m.gm_effects().reverb_time_s - expect_hall).abs() < 1e-4);
+        // A subsequent explicit pp=1 still overrides the type default.
+        m.set_gm_reverb_param(1, 100);
+        let expect_long = GmEffects::reverb_time_from_val(100);
+        assert!((m.gm_effects().reverb_time_s - expect_long).abs() < 1e-4);
+    }
+
+    #[test]
+    fn chorus_type_select_loads_parameter_row() {
+        // CA-024: "pp = 0 : Chorus Type … Sets Chorus parameters as
+        // listed below." Type 4 (FB Chorus) row: FB 64, Rate 2, Depth
+        // 24, Rev Send 0.
+        let mut m = Mixer::new();
+        m.set_gm_chorus_param(0, 4);
+        let fx = m.gm_effects();
+        assert_eq!(fx.chorus_type, 4);
+        assert!((fx.chorus_mod_rate_hz - 2.0 * 0.122).abs() < 1e-4);
+        assert!((fx.chorus_mod_depth_ms - (24.0 + 1.0) / 3.2).abs() < 1e-4);
+        assert!((fx.chorus_feedback_pct - 64.0 * 0.763).abs() < 1e-3);
+        assert!((fx.chorus_send_to_reverb_pct - 0.0).abs() < 1e-4);
+        // An explicit pp=3 feedback edit still overrides the row default.
+        m.set_gm_chorus_param(3, 100);
+        assert!((m.gm_effects().chorus_feedback_pct - 100.0 * 0.763).abs() < 1e-3);
     }
 
     #[test]

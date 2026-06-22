@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 361 — Reverb/Chorus Type select loads CA-024 table defaults
+
+- `set_gm_reverb_param(0, type)` now also resets the Reverb Time to the
+  selected type's CA-024 table default — the spec says "When a Reverb
+  Type is selected, the default Reverb Time from the table below for
+  that Reverb Type should be set" (Type 0 → 44, 1 → 50, 2 → 56, 3 → 64,
+  4 → 64, 8 → 50). Previously the type select stored the type but left
+  the time at its prior value.
+- `set_gm_chorus_param(0, type)` now loads the whole Mod Rate / Mod
+  Depth / Feedback / Send-to-Reverb row for the selected Chorus Type
+  (CA-024 "pp = 0 : Chorus Type … Sets Chorus parameters as listed
+  below"; the six-row Chorus table). An explicit `pp=1..4` edit sent
+  afterward still overrides the row default.
+- New `GmEffects::reverb_type_default_time_val` /
+  `chorus_type_default_row` / `apply_chorus_type_defaults` table
+  helpers back this. Two tests: reverb type → default time (with later
+  pp=1 override), chorus type → parameter row (with later pp=3
+  override).
+
 ### Round 361 — Effects-depth controller classifier + iterator (CC 91–95)
 
 - New `smf::EffectDepth` enum + `ControlChangeEvent::effect_depth() ->
