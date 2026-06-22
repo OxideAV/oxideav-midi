@@ -217,12 +217,16 @@ impl MidiDecoder {
     /// fallback because there's no instrument-discovery plumbing in
     /// the factory signature yet.
     pub fn new(instrument: Arc<dyn Instrument>, sample_rate: u32) -> Self {
+        let mut mixer = Mixer::new();
+        // Size the system reverb / chorus delay lines for this output
+        // rate so the CA-024 effects bus runs at the right tuning.
+        mixer.set_sample_rate(sample_rate);
         Self {
             codec_id: CodecId::new(CODEC_ID_STR),
             instrument,
             sample_rate,
             scheduler: None,
-            mixer: Mixer::new(),
+            mixer,
             left: vec![0.0; FRAME_SAMPLES],
             right: vec![0.0; FRAME_SAMPLES],
             next_pts: 0,

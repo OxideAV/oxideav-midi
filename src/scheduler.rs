@@ -276,8 +276,10 @@ impl Scheduler {
                 38 => mixer.set_data_entry(channel, value, false), // RPN data LSB
                 64 => mixer.set_sustain(channel, value),
                 74 => mixer.set_timbre(channel, value), // MPE "third dimension" (CC #74)
-                96 => mixer.data_inc_dec(channel, 1),   // Data Increment (RP-018; value ignored)
-                97 => mixer.data_inc_dec(channel, -1),  // Data Decrement (RP-018; value ignored)
+                91 => mixer.channel_state_mut(channel).reverb_send = value, // CC 91 — Reverb Send (CA-024)
+                93 => mixer.channel_state_mut(channel).chorus_send = value, // CC 93 — Chorus Send (CA-024)
+                96 => mixer.data_inc_dec(channel, 1), // Data Increment (RP-018; value ignored)
+                97 => mixer.data_inc_dec(channel, -1), // Data Decrement (RP-018; value ignored)
                 100 => mixer.set_rpn_byte(channel, value, false), // RPN LSB
                 101 => mixer.set_rpn_byte(channel, value, true), // RPN MSB
                 120 | 123 => {

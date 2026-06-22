@@ -200,8 +200,20 @@ the MIDI Association *UMP Format and MIDI 2.0 Protocol* spec
   fine/coarse tune, mod-depth range, MPE config), Data Inc/Dec
   (CC 96/97), mod-wheel + MPE timbre routing, Master Volume / Balance
   / Fine / Coarse Tuning (Universal Real-Time SysEx), and GM2 Global
-  Parameter Control (reverb/chorus parameters decoded, not yet applied
-  as a DSP send).
+  Parameter Control.
+- `mixer` **system effects bus** — the GM2 Reverb + Chorus parameters
+  (CA-024) drive a real stereo DSP send, not just decoded state.
+  Per-channel **CC 91** (Reverb Send) and **CC 93** (Chorus Send)
+  scale each voice's post-pan signal into the bus. The reverb is a
+  Schroeder design (parallel feedback comb bank → series allpass
+  diffusers) whose comb feedback is computed from the CA-024 Reverb
+  Time so the −60 dB decay matches the spec; the chorus is a
+  sine-modulated delay line driven by the CA-024 Mod Rate / Mod Depth /
+  Feedback, and the chorus→reverb send (CA-024 chorus `pp=4`) routes
+  the wet chorus into the reverb input. Both sends default to 0 so a
+  dry score renders bit-identically to the pre-effects path; the delay
+  lines size to the output rate via `Mixer::set_sample_rate`, and GM
+  System On/Off flushes the tails.
 - `mixer::MpeZone` / `MpeRole` — MIDI Polyphonic Expression v1.1: MCM
   zone configuration, per-note bend / pressure / CC 74 on Member
   Channels, Member+Manager bend combining, default PB sensitivities,

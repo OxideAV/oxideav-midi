@@ -146,6 +146,19 @@ pub struct ChannelState {
     /// differently for routing of per-note vs. zone-wide CCs / Pitch
     /// Bend / Channel Pressure. `None` outside any active MPE zone.
     pub mpe_role: MpeRole,
+    /// CC 91 (Effects 1 Depth = Reverb Send Level), 0..=127. This is the
+    /// per-channel send level into the system Reverb effect; CA-024
+    /// ("Example of Recommended Practice for Reverb and Chorus
+    /// Parameters") notes "the send levels to the Reverb and Chorus
+    /// effects are controlled with Control Changes #91 and #93". The GM
+    /// Level 1 spec resets controllers to "normal" at GM-On, which we
+    /// model as send 0 (fully dry) so a synth that never touches CC 91
+    /// renders bit-identically to the pre-reverb path.
+    pub reverb_send: u8,
+    /// CC 93 (Effects 3 Depth = Chorus Send Level), 0..=127. Per-channel
+    /// send level into the system Chorus effect (CA-024, CC #93). Default
+    /// 0 (fully dry).
+    pub chorus_send: u8,
 }
 
 impl Default for ChannelState {
@@ -165,6 +178,8 @@ impl Default for ChannelState {
             channel_fine_tune_raw_14: 0x2000,
             channel_coarse_tune_semitones: 0,
             mpe_role: MpeRole::None,
+            reverb_send: 0,
+            chorus_send: 0,
         }
     }
 }
@@ -350,6 +365,355 @@ impl Default for GmEffects {
     }
 }
 
+// =========================================================================
+// System effects bus — Reverb + Chorus DSP (CA-024).
+//
+// CA-024 ("Example of Recommended Practice for Reverb and Chorus
+// Parameters, from General MIDI Level 2") defines the *parameters* of
+// the two system effects but explicitly leaves the algorithms to the
+// implementation: "The names for each Reverb Type are provided as
+// examples of reverb designs… not intended to define the effect
+// algorithms" and, for Chorus, "the modulation waveform and stereo
+// output are implementation dependent." We therefore use a textbook
+// Schroeder reverb (parallel feedback comb filters → series allpass
+// diffusers) whose decay tracks the spec's Reverb Time, and a single
+// sine-modulated delay-line chorus whose rate / depth / feedback track
+// the spec's Mod Rate / Mod Depth / Feedback. The chorus→reverb send
+// (CA-024 chorus `pp=4`) routes the wet chorus output into the reverb
+// input as the spec describes.
+// =========================================================================
+
+/// A single feedback comb filter (one of the parallel bank in the
+/// Schroeder reverb). The feedback coefficient is recomputed whenever
+/// the reverb time changes so the −60 dB decay matches CA-024 Reverb
+/// Time.
+struct Comb {
+    buf: Vec<f32>,
+    pos: usize,
+    feedback: f32,
+}
+
+impl Comb {
+    fn new(len: usize) -> Self {
+        Self {
+            buf: vec![0.0; len.max(1)],
+            pos: 0,
+            feedback: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, input: f32) -> f32 {
+        let out = self.buf[self.pos];
+        self.buf[self.pos] = input + out * self.feedback;
+        self.pos += 1;
+        if self.pos >= self.buf.len() {
+            self.pos = 0;
+        }
+        out
+    }
+
+    fn clear(&mut self) {
+        for s in self.buf.iter_mut() {
+            *s = 0.0;
+        }
+        self.pos = 0;
+    }
+}
+
+/// A Schroeder allpass diffuser (series stage after the comb bank).
+struct Allpass {
+    buf: Vec<f32>,
+    pos: usize,
+    gain: f32,
+}
+
+impl Allpass {
+    fn new(len: usize, gain: f32) -> Self {
+        Self {
+            buf: vec![0.0; len.max(1)],
+            pos: 0,
+            gain,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, input: f32) -> f32 {
+        let buffered = self.buf[self.pos];
+        let out = -input + buffered;
+        self.buf[self.pos] = input + buffered * self.gain;
+        self.pos += 1;
+        if self.pos >= self.buf.len() {
+            self.pos = 0;
+        }
+        out
+    }
+
+    fn clear(&mut self) {
+        for s in self.buf.iter_mut() {
+            *s = 0.0;
+        }
+        self.pos = 0;
+    }
+}
+
+/// A sine-modulated delay line — the chorus voice. The read position
+/// sweeps around a base delay by ±depth at the LFO rate. Linear
+/// interpolation reads the fractional tap.
+struct ModDelay {
+    buf: Vec<f32>,
+    pos: usize,
+    base_delay: f32,
+    depth: f32,
+    feedback: f32,
+    lfo_phase: f32,
+    lfo_inc: f32,
+}
+
+impl ModDelay {
+    fn new(max_len: usize) -> Self {
+        Self {
+            buf: vec![0.0; max_len.max(2)],
+            pos: 0,
+            base_delay: 0.0,
+            depth: 0.0,
+            feedback: 0.0,
+            lfo_phase: 0.0,
+            lfo_inc: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, input: f32) -> f32 {
+        let len = self.buf.len();
+        // Sine LFO in [-1, 1]; modulated delay in samples.
+        let lfo = (self.lfo_phase * std::f32::consts::TAU).sin();
+        let delay = (self.base_delay + lfo * self.depth).clamp(1.0, (len - 2) as f32);
+        // Fractional read position behind the write head.
+        let read = self.pos as f32 - delay;
+        let read = if read < 0.0 { read + len as f32 } else { read };
+        let i0 = read.floor() as usize % len;
+        let i1 = (i0 + 1) % len;
+        let frac = read - read.floor();
+        let wet = self.buf[i0] * (1.0 - frac) + self.buf[i1] * frac;
+
+        self.buf[self.pos] = input + wet * self.feedback;
+        self.pos += 1;
+        if self.pos >= len {
+            self.pos = 0;
+        }
+        self.lfo_phase += self.lfo_inc;
+        if self.lfo_phase >= 1.0 {
+            self.lfo_phase -= 1.0;
+        }
+        wet
+    }
+
+    fn clear(&mut self) {
+        for s in self.buf.iter_mut() {
+            *s = 0.0;
+        }
+        self.pos = 0;
+        self.lfo_phase = 0.0;
+    }
+}
+
+/// The system Reverb + Chorus effects bus. Voices send a per-channel
+/// portion of their signal (scaled by CC 91 / CC 93) into the two
+/// effects; the wet returns are summed into the main stereo mix. One
+/// instance lives in the [`Mixer`]; its coefficients are refreshed from
+/// the current [`GmEffects`] each chunk so a Global Parameter Control
+/// edit takes effect on the next block.
+struct EffectsBus {
+    sample_rate: f32,
+    // Stereo Schroeder reverb: a comb bank + allpass chain per side. The
+    // right side uses slightly longer delays (the classic Schroeder /
+    // Freeverb stereo spread) so the two channels decorrelate.
+    combs_l: Vec<Comb>,
+    combs_r: Vec<Comb>,
+    allpass_l: Vec<Allpass>,
+    allpass_r: Vec<Allpass>,
+    // Stereo chorus: one modulated delay per side, the right LFO 90° out
+    // of phase so the chorus widens rather than collapsing to mono.
+    chorus_l: ModDelay,
+    chorus_r: ModDelay,
+    // Per-block input accumulators (cleared each `process`).
+    reverb_in_l: Vec<f32>,
+    reverb_in_r: Vec<f32>,
+    chorus_in_l: Vec<f32>,
+    chorus_in_r: Vec<f32>,
+}
+
+impl EffectsBus {
+    /// Schroeder comb-filter delay lengths in samples at 44.1 kHz (the
+    /// classic Freeverb tuning). Scaled by the actual sample rate at
+    /// construction. The right channel adds a small stereo spread.
+    const COMB_TUNING: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+    /// Schroeder allpass delay lengths in samples at 44.1 kHz.
+    const ALLPASS_TUNING: [usize; 4] = [556, 441, 341, 225];
+    /// Right-channel stereo spread (samples at 44.1 kHz) added to every
+    /// comb / allpass delay so the two reverb sides decorrelate.
+    const STEREO_SPREAD: usize = 23;
+
+    fn new(sample_rate: u32) -> Self {
+        let sr = sample_rate.max(1) as f32;
+        let scale = sr / 44_100.0;
+        let scaled = |n: usize| ((n as f32 * scale).round() as usize).max(1);
+
+        let combs_l = Self::COMB_TUNING
+            .iter()
+            .map(|&n| Comb::new(scaled(n)))
+            .collect();
+        let combs_r = Self::COMB_TUNING
+            .iter()
+            .map(|&n| Comb::new(scaled(n + Self::STEREO_SPREAD)))
+            .collect();
+        let allpass_l = Self::ALLPASS_TUNING
+            .iter()
+            .map(|&n| Allpass::new(scaled(n), 0.5))
+            .collect();
+        let allpass_r = Self::ALLPASS_TUNING
+            .iter()
+            .map(|&n| Allpass::new(scaled(n + Self::STEREO_SPREAD), 0.5))
+            .collect();
+
+        // Chorus delay line big enough for the base delay plus the
+        // widest modulation depth CA-024 can request (Mod Depth max
+        // = (127+1)/3.2 ≈ 40 ms), with headroom.
+        let max_chorus = (sr * 0.060) as usize + 4;
+        Self {
+            sample_rate: sr,
+            combs_l,
+            combs_r,
+            allpass_l,
+            allpass_r,
+            chorus_l: ModDelay::new(max_chorus),
+            chorus_r: ModDelay::new(max_chorus),
+            reverb_in_l: Vec::new(),
+            reverb_in_r: Vec::new(),
+            chorus_in_l: Vec::new(),
+            chorus_in_r: Vec::new(),
+        }
+    }
+
+    /// Refresh comb / allpass / chorus coefficients from the current
+    /// GM2 effect parameters. Called once per `process` block.
+    fn refresh(&mut self, fx: &GmEffects) {
+        // Comb feedback for the requested −60 dB decay time:
+        //   g = 10^(−3 · delay_seconds / T60).
+        // Computed per comb so longer delay lines feed back less, which
+        // is what gives a flat, even decay regardless of delay length.
+        let t60 = fx.reverb_time_s.clamp(0.05, 12.0);
+        let set_fb = |comb: &mut Comb, sr: f32| {
+            let delay_s = comb.buf.len() as f32 / sr;
+            let g = 10f32.powf(-3.0 * delay_s / t60);
+            comb.feedback = g.clamp(0.0, 0.999);
+        };
+        for c in self.combs_l.iter_mut() {
+            set_fb(c, self.sample_rate);
+        }
+        for c in self.combs_r.iter_mut() {
+            set_fb(c, self.sample_rate);
+        }
+
+        // Chorus: base delay ~ a few ms plus the modulated sweep; the
+        // CA-024 Mod Depth is the *peak-to-peak* swing in ms, so the
+        // ± amplitude is half of it. Feedback is the spec percentage.
+        let depth_ms = fx.chorus_mod_depth_ms.max(0.0);
+        let depth_samples = (depth_ms * 0.5 / 1000.0) * self.sample_rate;
+        let base_samples = (0.012 * self.sample_rate).max(depth_samples + 2.0);
+        let rate = fx.chorus_mod_rate_hz.clamp(0.0, 20.0);
+        let inc = rate / self.sample_rate;
+        let fb = (fx.chorus_feedback_pct / 100.0).clamp(0.0, 0.95);
+        self.chorus_l.base_delay = base_samples;
+        self.chorus_l.depth = depth_samples;
+        self.chorus_l.feedback = fb;
+        self.chorus_l.lfo_inc = inc;
+        self.chorus_r.base_delay = base_samples;
+        self.chorus_r.depth = depth_samples;
+        self.chorus_r.feedback = fb;
+        self.chorus_r.lfo_inc = inc;
+        // Quarter-cycle phase offset for stereo width (set once; only
+        // matters relative to the left LFO).
+        if self.chorus_r.lfo_phase == self.chorus_l.lfo_phase {
+            self.chorus_r.lfo_phase = (self.chorus_l.lfo_phase + 0.25).fract();
+        }
+    }
+
+    /// Ensure the per-block accumulators match `n` samples and are
+    /// zeroed. Returns mutable access via the struct fields afterward.
+    fn prepare_block(&mut self, n: usize) {
+        for v in [
+            &mut self.reverb_in_l,
+            &mut self.reverb_in_r,
+            &mut self.chorus_in_l,
+            &mut self.chorus_in_r,
+        ] {
+            v.clear();
+            v.resize(n, 0.0);
+        }
+    }
+
+    /// Run the accumulated sends through the effects and add the wet
+    /// returns into the main `(left, right)` mix. `chorus_to_reverb`
+    /// is the CA-024 chorus `pp=4` send-to-reverb fraction (0..=1).
+    fn process(&mut self, left: &mut [f32], right: &mut [f32], chorus_to_reverb: f32) {
+        let n = left.len();
+        for i in 0..n {
+            // --- Chorus first, so its output can feed the reverb. ---
+            let ch_l = self.chorus_l.process(self.chorus_in_l[i]);
+            let ch_r = self.chorus_r.process(self.chorus_in_r[i]);
+
+            // --- Reverb input = direct reverb send + chorus→reverb. ---
+            let rv_in_l = self.reverb_in_l[i] + ch_l * chorus_to_reverb;
+            let rv_in_r = self.reverb_in_r[i] + ch_r * chorus_to_reverb;
+
+            let mut rv_l = 0.0;
+            for c in self.combs_l.iter_mut() {
+                rv_l += c.process(rv_in_l);
+            }
+            let mut rv_r = 0.0;
+            for c in self.combs_r.iter_mut() {
+                rv_r += c.process(rv_in_r);
+            }
+            // Normalise the comb bank sum, then diffuse through the
+            // allpass chain.
+            rv_l /= self.combs_l.len() as f32;
+            rv_r /= self.combs_r.len() as f32;
+            for a in self.allpass_l.iter_mut() {
+                rv_l = a.process(rv_l);
+            }
+            for a in self.allpass_r.iter_mut() {
+                rv_r = a.process(rv_r);
+            }
+
+            // Wet returns into the main mix. Chorus is added directly
+            // (it is itself a "wet" widening voice); reverb is the
+            // diffused tail.
+            left[i] += ch_l + rv_l;
+            right[i] += ch_r + rv_r;
+        }
+    }
+
+    fn clear(&mut self) {
+        for c in self.combs_l.iter_mut() {
+            c.clear();
+        }
+        for c in self.combs_r.iter_mut() {
+            c.clear();
+        }
+        for a in self.allpass_l.iter_mut() {
+            a.clear();
+        }
+        for a in self.allpass_r.iter_mut() {
+            a.clear();
+        }
+        self.chorus_l.clear();
+        self.chorus_r.clear();
+        self.chorus_r.lfo_phase = 0.25;
+    }
+}
+
 /// Polyphonic voice pool with stereo mixdown.
 pub struct Mixer {
     slots: [VoiceSlot; MAX_VOICES],
@@ -397,6 +761,14 @@ pub struct Mixer {
     /// Parameter Control). Defaults to the GM2 recommended initial
     /// settings; edited by the `04 05` Universal Real-Time SysEx.
     gm_effects: GmEffects,
+    /// The output sample rate the effects bus delay lines are sized for.
+    /// Defaults to [`crate::OUTPUT_SAMPLE_RATE`]; the decoder calls
+    /// [`Self::set_sample_rate`] before rendering when it differs.
+    sample_rate: u32,
+    /// The system Reverb + Chorus DSP bus (CA-024). Per-channel CC 91 /
+    /// CC 93 sends feed it; the wet returns are summed into the stereo
+    /// mix inside [`Self::mix_stereo`].
+    fx: EffectsBus,
 }
 
 impl Default for Mixer {
@@ -424,7 +796,27 @@ impl Mixer {
             mpe_upper: None,
             tuning: crate::tuning::TuningTable::new(),
             gm_effects: GmEffects::default(),
+            sample_rate: crate::OUTPUT_SAMPLE_RATE,
+            fx: EffectsBus::new(crate::OUTPUT_SAMPLE_RATE),
         }
+    }
+
+    /// Set the output sample rate the effects bus delay lines are sized
+    /// for and rebuild the bus. Call this once before rendering when the
+    /// decoder's sample rate differs from [`crate::OUTPUT_SAMPLE_RATE`];
+    /// it resets the effect tails (the delay-line lengths change), so
+    /// it must not be called mid-stream.
+    pub fn set_sample_rate(&mut self, sample_rate: u32) {
+        let sr = sample_rate.max(1);
+        if sr != self.sample_rate {
+            self.sample_rate = sr;
+            self.fx = EffectsBus::new(sr);
+        }
+    }
+
+    /// The output sample rate the effects bus is currently sized for.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     /// Borrow the per-channel state. Useful for the scheduler when it
@@ -1090,6 +1482,15 @@ impl Mixer {
     /// resets every controller to its default).
     pub fn reset_gm_effects(&mut self) {
         self.gm_effects = GmEffects::default();
+        // GM System On/Off silences everything; flush the effect tails
+        // too so a fresh section doesn't inherit the previous reverb.
+        self.fx.clear();
+    }
+
+    /// Flush the system Reverb + Chorus delay-line tails to silence
+    /// without changing their parameters. Useful at a seek / stop point.
+    pub fn clear_effects(&mut self) {
+        self.fx.clear();
     }
 
     /// Apply one GM2 Reverb-slot (`01 01`) parameter-value pair from a
@@ -1454,6 +1855,19 @@ impl Mixer {
         // `iter_mut()` loop.
         let master = self.master_volume_14 as f32 / 0x3FFF as f32;
         let (master_bal_l, master_bal_r) = self.master_balance_gains();
+
+        // --- Effects-bus send accumulators (CA-024 CC 91 / CC 93). ---
+        // The fx input vectors live on `self.fx`, but the voice loop
+        // below borrows `self.slots` mutably, so we move them out for
+        // the duration of the loop and hand them back afterwards. They
+        // are zeroed + sized here; the loop adds each voice's post-pan
+        // signal scaled by its channel's reverb / chorus send level.
+        self.fx.prepare_block(left.len());
+        let mut reverb_in_l = std::mem::take(&mut self.fx.reverb_in_l);
+        let mut reverb_in_r = std::mem::take(&mut self.fx.reverb_in_r);
+        let mut chorus_in_l = std::mem::take(&mut self.fx.chorus_in_l);
+        let mut chorus_in_r = std::mem::take(&mut self.fx.chorus_in_r);
+
         for slot in self.slots.iter_mut() {
             let stereo = slot.voice.as_ref().map(|v| v.is_stereo()).unwrap_or(false);
             let n = if let Some(v) = slot.voice.as_mut() {
@@ -1479,6 +1893,13 @@ impl Mixer {
             let pan_norm = (st.pan as f32 / 127.0).clamp(0.0, 1.0);
             let theta = pan_norm * std::f32::consts::FRAC_PI_2;
 
+            // CA-024 per-channel effect send fractions (CC 91 / CC 93).
+            // Zero when the channel never touched the controller, so a
+            // dry score bypasses the bus entirely.
+            let reverb_send = st.reverb_send as f32 / 127.0;
+            let chorus_send = st.chorus_send as f32 / 127.0;
+            let any_send = reverb_send > 0.0 || chorus_send > 0.0;
+
             if stereo {
                 // Stereo voice: keep its inherent L/R image, but still
                 // honour the channel's volume CC. Pan applies as a
@@ -1492,16 +1913,32 @@ impl Mixer {
                 let lg = vol * master * master_bal_l * self.mix_gain * l_balance;
                 let rg = vol * master * master_bal_r * self.mix_gain * r_balance;
                 for i in 0..n {
-                    left[i] += lscratch[i] * lg;
-                    right[i] += rscratch[i] * rg;
+                    let dl = lscratch[i] * lg;
+                    let dr = rscratch[i] * rg;
+                    left[i] += dl;
+                    right[i] += dr;
+                    if any_send {
+                        reverb_in_l[i] += dl * reverb_send;
+                        reverb_in_r[i] += dr * reverb_send;
+                        chorus_in_l[i] += dl * chorus_send;
+                        chorus_in_r[i] += dr * chorus_send;
+                    }
                 }
             } else {
                 let l_gain = theta.cos() * vol * master * master_bal_l * self.mix_gain;
                 let r_gain = theta.sin() * vol * master * master_bal_r * self.mix_gain;
                 for i in 0..n {
                     let s = mono[i];
-                    left[i] += s * l_gain;
-                    right[i] += s * r_gain;
+                    let dl = s * l_gain;
+                    let dr = s * r_gain;
+                    left[i] += dl;
+                    right[i] += dr;
+                    if any_send {
+                        reverb_in_l[i] += dl * reverb_send;
+                        reverb_in_r[i] += dr * reverb_send;
+                        chorus_in_l[i] += dl * chorus_send;
+                        chorus_in_r[i] += dr * chorus_send;
+                    }
                 }
             }
             active += 1;
@@ -1522,6 +1959,17 @@ impl Mixer {
             // would slot in here in a future round.
             let _ = slot.velocity_norm;
         }
+
+        // Hand the send accumulators back to the fx bus and run the
+        // Reverb + Chorus DSP, summing the wet returns into the main mix.
+        self.fx.reverb_in_l = reverb_in_l;
+        self.fx.reverb_in_r = reverb_in_r;
+        self.fx.chorus_in_l = chorus_in_l;
+        self.fx.chorus_in_r = chorus_in_r;
+        self.fx.refresh(&self.gm_effects);
+        let chorus_to_reverb = (self.gm_effects.chorus_send_to_reverb_pct / 100.0).clamp(0.0, 1.0);
+        self.fx.process(left, right, chorus_to_reverb);
+
         active
     }
 
@@ -2671,5 +3119,187 @@ mod tests {
         let (v2, bend2, _) = instrumented_voice(0.5, 1024);
         m.note_on(0, 60, 100, v2);
         assert_eq!(*bend2.lock().unwrap(), 0);
+    }
+
+    // ───────────────────────── effects bus (CA-024) ─────────────────────────
+
+    /// Sum of |sample| over a planar buffer — a cheap "is there energy
+    /// here" probe for the effect-tail tests.
+    fn energy(buf: &[f32]) -> f32 {
+        buf.iter().map(|s| s.abs()).sum()
+    }
+
+    #[test]
+    fn dry_by_default_no_reverb_or_chorus() {
+        // With both sends at their default (0), the fx bus must be a
+        // no-op: the rendered chunk equals the pre-fx dry mix exactly.
+        let mut dry = Mixer::new();
+        let mut wet = Mixer::new();
+        dry.note_on(0, 60, 100, voice(0.5, 64));
+        wet.note_on(0, 60, 100, voice(0.5, 64));
+
+        let mut dl = vec![0.0; 64];
+        let mut dr = vec![0.0; 64];
+        let mut wl = vec![0.0; 64];
+        let mut wr = vec![0.0; 64];
+        // `dry` keeps sends at 0; `wet` would too (both default 0), so
+        // they should be bit-identical.
+        dry.mix_stereo(&mut dl, &mut dr);
+        wet.mix_stereo(&mut wl, &mut wr);
+        assert_eq!(dl, wl);
+        assert_eq!(dr, wr);
+        // And there must be no tail: a follow-up silent chunk stays
+        // silent because nothing was ever fed into the delay lines.
+        let mut tl = vec![0.0; 64];
+        let mut tr = vec![0.0; 64];
+        dry.mix_stereo(&mut tl, &mut tr);
+        assert_eq!(energy(&tl), 0.0);
+        assert_eq!(energy(&tr), 0.0);
+    }
+
+    #[test]
+    fn reverb_send_produces_a_tail() {
+        // A channel with a non-zero reverb send (CC 91) should leave a
+        // decaying tail after the note has stopped sounding. The Schroeder
+        // comb delays are ~1100+ samples at 44.1 kHz, so the first echo
+        // only emerges a chunk or two after the dry note; we render in
+        // 512-sample chunks and let several elapse.
+        let mut m = Mixer::new();
+        m.channel_state_mut(0).reverb_send = 127;
+        // A short dry note (the tail must outlast it).
+        m.note_on(0, 60, 100, voice(0.5, 64));
+
+        let mut l = vec![0.0; 512];
+        let mut r = vec![0.0; 512];
+        m.mix_stereo(&mut l, &mut r);
+        assert!(energy(&l) > 0.0, "the dry note should produce output");
+
+        // Render several silent chunks; the reverb echo must appear.
+        let mut tail_energy = 0.0;
+        for _ in 0..6 {
+            let mut tl = vec![0.0; 512];
+            let mut tr = vec![0.0; 512];
+            m.mix_stereo(&mut tl, &mut tr);
+            tail_energy += energy(&tl) + energy(&tr);
+        }
+        assert!(
+            tail_energy > 0.0,
+            "reverb tail should sound after the dry note ends"
+        );
+    }
+
+    #[test]
+    fn chorus_send_produces_a_tail() {
+        // CC 93 chorus send: a modulated-delay return that lingers past
+        // the dry note. The chorus base delay is ~12 ms (~530 samples),
+        // so again we render in larger chunks.
+        let mut m = Mixer::new();
+        m.channel_state_mut(0).chorus_send = 127;
+        m.note_on(0, 60, 100, voice(0.5, 64));
+
+        let mut l = vec![0.0; 512];
+        let mut r = vec![0.0; 512];
+        m.mix_stereo(&mut l, &mut r);
+
+        let mut tail_energy = 0.0;
+        for _ in 0..4 {
+            let mut tl = vec![0.0; 512];
+            let mut tr = vec![0.0; 512];
+            m.mix_stereo(&mut tl, &mut tr);
+            tail_energy += energy(&tl) + energy(&tr);
+        }
+        assert!(
+            tail_energy > 0.0,
+            "chorus return should sound after the dry note ends"
+        );
+    }
+
+    #[test]
+    fn longer_reverb_time_decays_slower() {
+        // Compare the reverb tail energy several chunks out for a short
+        // vs. a long Reverb Time. The longer T60 must retain more energy.
+        fn tail_energy(reverb_time_val: u8) -> f32 {
+            let mut m = Mixer::new();
+            m.set_gm_reverb_param(1, reverb_time_val); // pp=1 Reverb Time
+            m.channel_state_mut(0).reverb_send = 127;
+            m.note_on(0, 60, 100, voice(0.5, 64));
+            let mut l = vec![0.0; 512];
+            let mut r = vec![0.0; 512];
+            m.mix_stereo(&mut l, &mut r); // dry + start of tail
+                                          // Run a few more chunks to let the decay separate.
+            for _ in 0..8 {
+                m.mix_stereo(&mut l, &mut r);
+            }
+            energy(&l) + energy(&r)
+        }
+        // val per CA-024 `val = ln(rt)/0.025 + 40`: smaller val → shorter
+        // time. 20 → ~0.6 s, 100 → ~7.4 s.
+        let short = tail_energy(20);
+        let long = tail_energy(100);
+        assert!(
+            long > short,
+            "longer reverb time should retain more tail energy: short={short}, long={long}"
+        );
+    }
+
+    #[test]
+    fn chorus_to_reverb_send_routes_into_reverb() {
+        // With reverb send OFF but chorus send ON and chorus→reverb
+        // send at max, the reverb still receives energy via the chorus
+        // output (CA-024 chorus pp=4). The tail should outlast a plain
+        // chorus-only tail.
+        let mut routed = Mixer::new();
+        routed.channel_state_mut(0).chorus_send = 127;
+        routed.set_gm_chorus_param(4, 127); // pp=4 Send-to-Reverb ≈ 100%
+        routed.set_gm_reverb_param(1, 100); // long reverb so it's audible
+        routed.note_on(0, 60, 100, voice(0.5, 64));
+
+        let mut l = vec![0.0; 256];
+        let mut r = vec![0.0; 256];
+        routed.mix_stereo(&mut l, &mut r);
+        // Several chunks out, reverb fed by the chorus send should still
+        // ring.
+        for _ in 0..6 {
+            routed.mix_stereo(&mut l, &mut r);
+        }
+        assert!(
+            energy(&l) + energy(&r) > 0.0,
+            "chorus→reverb send should keep the reverb ringing"
+        );
+    }
+
+    #[test]
+    fn reset_gm_effects_flushes_tail() {
+        // GM System On/Off resets the effect parameters AND silences the
+        // tails.
+        let mut m = Mixer::new();
+        m.channel_state_mut(0).reverb_send = 127;
+        m.note_on(0, 60, 100, voice(0.5, 64));
+        let mut l = vec![0.0; 64];
+        let mut r = vec![0.0; 64];
+        m.mix_stereo(&mut l, &mut r);
+        // There's a live tail now; reset must clear it.
+        m.reset_gm_effects();
+        let mut tl = vec![0.0; 64];
+        let mut tr = vec![0.0; 64];
+        // The channel send is still 127, but the dry note is gone and the
+        // delay lines were flushed, so the silent input yields silence.
+        m.mix_stereo(&mut tl, &mut tr);
+        assert_eq!(energy(&tl), 0.0);
+        assert_eq!(energy(&tr), 0.0);
+    }
+
+    #[test]
+    fn set_sample_rate_resizes_effects_bus() {
+        let mut m = Mixer::new();
+        assert_eq!(m.sample_rate(), crate::OUTPUT_SAMPLE_RATE);
+        m.set_sample_rate(48_000);
+        assert_eq!(m.sample_rate(), 48_000);
+        // The bus still renders without panicking at the new rate.
+        m.channel_state_mut(0).reverb_send = 64;
+        m.note_on(0, 60, 100, voice(0.5, 64));
+        let mut l = vec![0.0; 64];
+        let mut r = vec![0.0; 64];
+        m.mix_stereo(&mut l, &mut r);
     }
 }

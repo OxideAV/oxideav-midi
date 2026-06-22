@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 361 — GM2 Reverb + Chorus DSP send bus (CA-024)
+
+- The system Reverb + Chorus parameters decoded from the GM2 Global
+  Parameter Control SysEx (CA-024) are now **applied** as real DSP, not
+  just stored. `mixer::Mixer` gains a stereo effects bus: a Schroeder
+  reverb (parallel feedback comb bank → series allpass diffusers, comb
+  feedback derived from the CA-024 Reverb Time so the −60 dB decay
+  tracks the spec) and a sine-modulated delay-line chorus (rate / depth /
+  feedback from the CA-024 chorus table). The chorus→reverb send
+  (CA-024 chorus `pp=4`) routes the wet chorus output into the reverb
+  input.
+- New per-channel `ChannelState::reverb_send` (CC 91, Effects 1 Depth)
+  and `chorus_send` (CC 93, Effects 3 Depth), wired through the
+  scheduler's control-change dispatch. CA-024 specifies "the send levels
+  to the Reverb and Chorus effects are controlled with Control Changes
+  #91 and #93." Both default to 0 (fully dry) so a score that never
+  touches the controllers renders bit-identically to the pre-effects
+  path.
+- `Mixer::set_sample_rate()` / `sample_rate()` size the effects delay
+  lines for the output rate (the decoder calls it at construction);
+  `Mixer::clear_effects()` flushes the tails, and GM System On/Off
+  (`reset_gm_effects`) now flushes them too.
+- Tests: dry-by-default bit-identity, reverb + chorus tails outlasting
+  the dry note, longer Reverb Time retaining more tail energy,
+  chorus→reverb routing, tail flush on GM reset, and sample-rate
+  resize.
+
 ### Round 345 — typed Channel Mode Message classifier
 
 - New `ChannelModeMessage` enum + `ControlChangeEvent::channel_mode() ->
