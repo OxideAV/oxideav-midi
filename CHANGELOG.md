@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 368 — Device Control SysEx body decoder (`UniversalSysExEvent::device_control`)
+
+- New `UniversalSysExEvent::device_control()` typed body decoder for the
+  Real-Time Device Control family (`F0 7F <dev> 04 nn …`), mirroring the
+  MTC / Notation Information body decoders. Returns a `DeviceControl`
+  enum: `MasterVolume { value14 }` and `MasterBalance { value14 }` decode
+  the 14-bit lsb-first value per the MIDI 1.0 Detailed Specification
+  §"DEVICE CONTROL — MASTER VOLUME AND MASTER BALANCE" (`0x2000` =
+  balance centre, `0x3FFF` = max / hard-right).
+- `None` for non-Device-Control packets and for a correctly-classified
+  packet truncated before the value pair arrives (no half-decoded value).
+  Five tests cover Volume, Balance, the negative cases, and an
+  end-to-end parse at an absolute tick.
+
 ### Round 361 — Reverb/Chorus Type select loads CA-024 table defaults
 
 - `set_gm_reverb_param(0, type)` now also resets the Reverb Time to the

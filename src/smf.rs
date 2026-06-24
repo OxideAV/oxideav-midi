@@ -2962,6 +2962,107 @@ impl NotationTimeSignature {
     }
 }
 
+/// A decoded **Device Control** Universal Real-Time SysEx message — the
+/// `0x7F <device ID> 04 <nn> …` family that sets a receiver's global
+/// (non-channel) state. Decoded via [`UniversalSysExEvent::device_control`].
+///
+/// Table 4 (MIDI 1.0 *Universal System Exclusive Messages*) assigns
+/// Sub-ID #1 `0x04` to Device Control and lists five Sub-ID #2 members:
+///
+/// ```text
+/// F0 7F <dev> 04 01 lsb msb F7   Master Volume   (14-bit, lsb first)
+/// F0 7F <dev> 04 02 lsb msb F7   Master Balance  (14-bit, lsb first)
+/// F0 7F <dev> 04 03 lsb msb F7   Master Fine Tuning   (CA-025)
+/// F0 7F <dev> 04 04 00  msb F7   Master Coarse Tuning (CA-025)
+/// F0 7F <dev> 04 05 …       F7   Global Parameter Control (CA-024)
+/// ```
+///
+/// Master Volume / Balance pack a 14-bit value lsb-first per the MIDI
+/// 1.0 Detailed Specification §"DEVICE CONTROL — MASTER VOLUME AND
+/// MASTER BALANCE": `0x0000` = minimum / hard-left, `0x3FFF` = maximum /
+/// hard-right, `0x2000` = centre (balance). The two tuning messages
+/// follow CA-025 (Master Fine/Coarse Tuning); their semantics are
+/// decoded into signed cents / semitones by [`DeviceControl`]'s helper
+/// methods. Global Parameter Control (`0x05`) carries a
+/// variable-length slot-path + parameter body (CA-024) that this
+/// classifier surfaces as the [`GlobalParameterControl`] variant with
+/// the raw body for caller parsing — the scheduler's GM2 effect bus
+/// owns the detailed CA-024 walk.
+///
+/// [`GlobalParameterControl`]: DeviceControl::GlobalParameterControl
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceControl {
+    /// `04 01 lsb msb` — Master Volume. A 14-bit unsigned level
+    /// (`0..=0x3FFF`); `0x0000` = silence, `0x3FFF` = full scale.
+    MasterVolume {
+        /// The reassembled 14-bit value (`(msb << 7) | lsb`).
+        value14: u16,
+    },
+    /// `04 02 lsb msb` — Master Balance. A 14-bit value where
+    /// `0x0000` = hard left, `0x2000` = centre, `0x3FFF` = hard right
+    /// (M1 v4.2.1 §"DEVICE CONTROL — MASTER VOLUME AND MASTER BALANCE").
+    MasterBalance {
+        /// The reassembled 14-bit value (`(msb << 7) | lsb`).
+        value14: u16,
+    },
+    /// `04 03 lsb msb` — Master Fine Tuning (CA-025). A 14-bit value,
+    /// lsb-first; `0x2000` = no displacement. The displacement in cents
+    /// from A440 is `100/8192 × (value14 − 8192)`, spanning roughly
+    /// `−100 … +100` cents over the full `0x0000 … 0x3FFF` range. Decode
+    /// via [`fine_tuning_cents`](DeviceControl::fine_tuning_cents).
+    MasterFineTuning {
+        /// The reassembled 14-bit value (`(msb << 7) | lsb`).
+        value14: u16,
+    },
+    /// `04 04 00 msb` — Master Coarse Tuning (CA-025). The LSB is always
+    /// `0`; the MSB carries the semitone displacement with `0x40` = no
+    /// change, spanning `−64 … +63` semitones. Decode via
+    /// [`coarse_tuning_semitones`](DeviceControl::coarse_tuning_semitones).
+    MasterCoarseTuning {
+        /// Raw `msb` (semitone) byte; `0x40` = no displacement.
+        msb: u8,
+        /// Raw `lsb` byte; the spec fixes this at `0x00`.
+        lsb: u8,
+    },
+    /// `04 05 …` — Global Parameter Control (CA-024). The variable-length
+    /// slot-path + parameter-value body is surfaced verbatim (the bytes
+    /// after Sub-ID #2, trailing `F7` excluded) for callers that walk the
+    /// CA-024 structure themselves.
+    GlobalParameterControl {
+        /// The CA-024 body bytes following Sub-ID #2 (slot-path-length,
+        /// param-width, value-width, then the slot / parameter / value
+        /// fields). Empty when the packet carried no body.
+        body: Vec<u8>,
+    },
+}
+
+impl DeviceControl {
+    /// For [`MasterFineTuning`](DeviceControl::MasterFineTuning), the
+    /// displacement in cents from A440: `100/8192 × (value14 − 8192)`
+    /// per CA-025. Returns `None` for any other variant.
+    ///
+    /// `0x2000` → `0.0` cents; `0x0000` → `−100.0`; `0x3FFF` →
+    /// `+99.987…` (the CA-025 table's `100/8192 × (+8191)`).
+    pub fn fine_tuning_cents(&self) -> Option<f64> {
+        match self {
+            DeviceControl::MasterFineTuning { value14 } => {
+                Some(100.0 / 8192.0 * (*value14 as f64 - 8192.0))
+            }
+            _ => None,
+        }
+    }
+
+    /// For [`MasterCoarseTuning`](DeviceControl::MasterCoarseTuning), the
+    /// signed semitone displacement from A440 per CA-025: `msb − 64`,
+    /// spanning `−64 … +63`. Returns `None` for any other variant.
+    pub fn coarse_tuning_semitones(&self) -> Option<i8> {
+        match self {
+            DeviceControl::MasterCoarseTuning { msb, .. } => Some((*msb & 0x7F) as i8 - 64),
+            _ => None,
+        }
+    }
+}
+
 impl UniversalSysExEvent {
     /// Decode this packet as a Notation **Bar Number** message when it
     /// is one, returning the signed 14-bit bar number and its semantic
@@ -3126,6 +3227,64 @@ impl UniversalSysExEvent {
         }
         let flag_byte = *self.data.get(12)?;
         Some(MtcUserBits { groups, flag_byte })
+    }
+
+    /// Decode this packet as a **Device Control** message when it is one,
+    /// returning the typed [`DeviceControl`] variant for Master Volume,
+    /// Master Balance, Master Fine / Coarse Tuning, or Global Parameter
+    /// Control.
+    ///
+    /// Returns `None` unless the packet classifies as a Real-Time
+    /// (`0x7F`) Device Control message ([`UniversalSubId1::DeviceControl`])
+    /// *and* the verbatim payload carries the variant's declared bytes
+    /// after Sub-ID #2. A correctly-classified packet truncated before
+    /// the value pair arrives yields `None` rather than a partial value.
+    ///
+    /// Payload indexing follows the [`data`](Self::data) layout
+    /// `<realm> <device_id> <sub_id1> <sub_id2> lsb msb [F7]`, so the two
+    /// data bytes begin at index 4 (Volume / Balance / Fine: 14-bit
+    /// lsb-first; Coarse: `00 msb`). Global Parameter Control surfaces
+    /// the body bytes from index 4 onward, with a trailing `0xF7`
+    /// end-of-exclusive marker stripped when present.
+    pub fn device_control(&self) -> Option<DeviceControl> {
+        let sub_id2 = match self.classification.sub_id1 {
+            UniversalSubId1::DeviceControl(s) => s,
+            _ => return None,
+        };
+        // <realm> <device_id> <sub_id1> <sub_id2> lsb msb ...
+        let value14 = |this: &Self| -> Option<u16> {
+            let lsb = (*this.data.get(4)? & 0x7F) as u16;
+            let msb = (*this.data.get(5)? & 0x7F) as u16;
+            Some(lsb | (msb << 7))
+        };
+        match sub_id2 {
+            UniversalSubId2::DeviceControlMasterVolume => Some(DeviceControl::MasterVolume {
+                value14: value14(self)?,
+            }),
+            UniversalSubId2::DeviceControlMasterBalance => Some(DeviceControl::MasterBalance {
+                value14: value14(self)?,
+            }),
+            UniversalSubId2::DeviceControlMasterFineTuning => {
+                Some(DeviceControl::MasterFineTuning {
+                    value14: value14(self)?,
+                })
+            }
+            UniversalSubId2::DeviceControlMasterCoarseTuning => {
+                let lsb = *self.data.get(4)? & 0x7F;
+                let msb = *self.data.get(5)? & 0x7F;
+                Some(DeviceControl::MasterCoarseTuning { msb, lsb })
+            }
+            UniversalSubId2::DeviceControlGlobalParameterControl => {
+                // Body is everything after Sub-ID #2 (index 4 onward),
+                // minus a trailing EOX marker when the source file kept it.
+                let mut body: Vec<u8> = self.data.get(4..).unwrap_or(&[]).to_vec();
+                if body.last() == Some(&0xF7) {
+                    body.pop();
+                }
+                Some(DeviceControl::GlobalParameterControl { body })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -11473,6 +11632,92 @@ mod tests {
         assert_eq!(ts.primary().numerator, 6);
         assert_eq!(ts.primary().denominator(), 8);
         assert!(!ts.is_delayed());
+    }
+
+    // ───────── UniversalSysExEvent::device_control (volume / balance) ─
+
+    #[test]
+    fn device_control_decodes_master_volume_14bit() {
+        // F0 7F 7F 04 01 lsb msb F7 — 14-bit value (msb << 7) | lsb.
+        // lsb=0x00 msb=0x40 → 0x2000 (half scale).
+        let ev = make_universal(&[0x7F, 0x7F, 0x04, 0x01, 0x00, 0x40, 0xF7]);
+        assert_eq!(
+            ev.device_control(),
+            Some(DeviceControl::MasterVolume { value14: 0x2000 })
+        );
+        // Full scale: lsb=0x7F msb=0x7F → 0x3FFF.
+        let full = make_universal(&[0x7F, 0x7F, 0x04, 0x01, 0x7F, 0x7F, 0xF7]);
+        assert_eq!(
+            full.device_control(),
+            Some(DeviceControl::MasterVolume { value14: 0x3FFF })
+        );
+        // Silence: 0x0000.
+        let zero = make_universal(&[0x7F, 0x7F, 0x04, 0x01, 0x00, 0x00, 0xF7]);
+        assert_eq!(
+            zero.device_control(),
+            Some(DeviceControl::MasterVolume { value14: 0 })
+        );
+    }
+
+    #[test]
+    fn device_control_decodes_master_balance_14bit() {
+        // 0x2000 = centre per M1 v4.2.1 §"DEVICE CONTROL".
+        let centre = make_universal(&[0x7F, 0x7F, 0x04, 0x02, 0x00, 0x40, 0xF7]);
+        assert_eq!(
+            centre.device_control(),
+            Some(DeviceControl::MasterBalance { value14: 0x2000 })
+        );
+        // Hard left = 0x0000, hard right = 0x3FFF.
+        let left = make_universal(&[0x7F, 0x7F, 0x04, 0x02, 0x00, 0x00, 0xF7]);
+        assert_eq!(
+            left.device_control(),
+            Some(DeviceControl::MasterBalance { value14: 0 })
+        );
+        let right = make_universal(&[0x7F, 0x7F, 0x04, 0x02, 0x7F, 0x7F, 0xF7]);
+        assert_eq!(
+            right.device_control(),
+            Some(DeviceControl::MasterBalance { value14: 0x3FFF })
+        );
+    }
+
+    #[test]
+    fn device_control_none_for_non_device_control_packets() {
+        // GM 1 System On (Non-RT) — different sub-id1.
+        let gm_on = make_universal(&[0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        assert_eq!(gm_on.device_control(), None);
+        // RT MTC Full Message — sub-id1 0x01, not Device Control.
+        let mtc = make_universal(&[0x7F, 0x7F, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0xF7]);
+        assert_eq!(mtc.device_control(), None);
+    }
+
+    #[test]
+    fn device_control_none_when_value_pair_truncated() {
+        // Classifies as Master Volume but the msb byte never arrives.
+        let truncated = make_universal(&[0x7F, 0x7F, 0x04, 0x01, 0x40]);
+        assert_eq!(
+            truncated.classification.sub_id1,
+            UniversalSubId1::DeviceControl(UniversalSubId2::DeviceControlMasterVolume)
+        );
+        assert_eq!(truncated.device_control(), None);
+    }
+
+    #[test]
+    fn device_control_volume_via_parsed_smf_at_absolute_tick() {
+        // delta=64 F0 07 7F 7F 04 01 00 20 F7 — Master Volume 0x1000.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&encode_vlq(64));
+        events.extend_from_slice(&[0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x01, 0x00, 0x20, 0xF7]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let u = smf.universal_sysex_events();
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].tick, 64);
+        assert_eq!(
+            u[0].device_control(),
+            Some(DeviceControl::MasterVolume { value14: 0x1000 })
+        );
     }
 
     // ───────── SysExEvent::universal_classification ─────────
