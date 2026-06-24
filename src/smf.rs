@@ -3063,6 +3063,29 @@ impl DeviceControl {
     }
 }
 
+/// A decoded **Device Control** message pinned to the absolute tick (and
+/// the track) at which it fires — the element type of
+/// [`SmfFile::device_controls`].
+///
+/// Mirrors the rest of the typed absolute-tick iterator family
+/// ([`ChannelModeEvent`], [`EffectDepthEvent`], …): the [`tick`] is the
+/// per-track cumulative delta sum (also the absolute tick on the shared
+/// timebase for format-1 files), [`track`] is the source track index,
+/// and [`control`] carries the decoded [`DeviceControl`].
+///
+/// [`tick`]: Self::tick
+/// [`track`]: Self::track
+/// [`control`]: Self::control
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceControlEvent {
+    /// Absolute tick (cumulative per-track delta sum).
+    pub tick: u64,
+    /// Source [`Track`] index within [`SmfFile::tracks`].
+    pub track: usize,
+    /// The decoded Device Control message.
+    pub control: DeviceControl,
+}
+
 impl UniversalSysExEvent {
     /// Decode this packet as a Notation **Bar Number** message when it
     /// is one, returning the signed 14-bit bar number and its semantic
@@ -5395,6 +5418,42 @@ impl SmfFile {
                 }
             }
         }
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **Device Control** Universal Real-Time SysEx message
+    /// (`F0 7F <dev> 04 nn …`) from every track, pinned to the absolute
+    /// tick at which it fires, with each packet decoded into a typed
+    /// [`DeviceControl`] (Master Volume / Balance / Fine / Coarse Tuning /
+    /// Global Parameter Control).
+    ///
+    /// The typed, absolute-tick counterpart of filtering
+    /// [`SmfFile::universal_sysex_events`] for the Device Control family:
+    /// it keeps only the packets [`UniversalSysExEvent::device_control`]
+    /// decodes and drops every other Universal SysEx category. A
+    /// correctly-classified-but-truncated Device Control packet is
+    /// skipped (its `device_control()` yields `None`), so the result
+    /// never carries a half-decoded value.
+    ///
+    /// Stable-merged by absolute tick (track 0 before track 1 at the same
+    /// tick), matching the rest of the iterator family. Returns an empty
+    /// `Vec` when no track carries a Device Control message. Cost is
+    /// linear in the total event count.
+    pub fn device_controls(&self) -> Vec<DeviceControlEvent> {
+        let mut out: Vec<DeviceControlEvent> = Vec::new();
+        for ev in self.universal_sysex_events() {
+            if let Some(control) = ev.device_control() {
+                out.push(DeviceControlEvent {
+                    tick: ev.tick,
+                    track: ev.track,
+                    control,
+                });
+            }
+        }
+        // universal_sysex_events() already stable-sorts by tick; the
+        // filter preserves order, so out is already tick-ordered. A
+        // belt-and-braces stable sort keeps the contract explicit.
         out.sort_by_key(|c| c.tick);
         out
     }
@@ -11808,6 +11867,74 @@ mod tests {
         // 0x2080 = 8320 → 100/8192 × (8320 − 8192) ≈ +1.5625 cents.
         let expect = 100.0 / 8192.0 * 128.0;
         assert!((dc.fine_tuning_cents().unwrap() - expect).abs() < 1e-9);
+    }
+
+    #[test]
+    fn device_control_decodes_global_parameter_control_body() {
+        // F0 7F 7F 04 05 sw pw vw … F7 — GM2 GPC. Surface the body
+        // (sub-id2-onward) with the trailing F7 stripped.
+        // Body bytes after sub-id2: 01 01 01 01 01 00 02 01 50
+        let ev = make_universal(&[
+            0x7F, 0x7F, 0x04, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x02, 0x01, 0x50, 0xF7,
+        ]);
+        match ev.device_control().unwrap() {
+            DeviceControl::GlobalParameterControl { body } => {
+                assert_eq!(
+                    body,
+                    vec![0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x02, 0x01, 0x50]
+                );
+            }
+            other => panic!("expected GlobalParameterControl, got {other:?}"),
+        }
+    }
+
+    // ───────── SmfFile::device_controls iterator ─────────
+
+    #[test]
+    fn device_controls_iterator_merges_tracks_in_tick_order() {
+        // Two tracks: track 0 Master Volume @128, track 1 Master Fine
+        // Tuning @64. The merge is by absolute tick, so tuning (64)
+        // precedes volume (128).
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(128));
+        t0.extend_from_slice(&[0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x01, 0x00, 0x40, 0xF7]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(64));
+        t1.extend_from_slice(&[0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x03, 0x00, 0x40, 0xF7]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let dcs = smf.device_controls();
+        assert_eq!(dcs.len(), 2);
+        assert_eq!(dcs[0].tick, 64);
+        assert_eq!(dcs[0].track, 1);
+        assert_eq!(
+            dcs[0].control,
+            DeviceControl::MasterFineTuning { value14: 0x2000 }
+        );
+        assert_eq!(dcs[1].tick, 128);
+        assert_eq!(dcs[1].track, 0);
+        assert_eq!(
+            dcs[1].control,
+            DeviceControl::MasterVolume { value14: 0x2000 }
+        );
+    }
+
+    #[test]
+    fn device_controls_iterator_empty_without_device_control() {
+        // A file with only a GM 1 System On (not Device Control) yields
+        // an empty Device Control iterator.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&encode_vlq(0));
+        events.extend_from_slice(&[0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.device_controls().is_empty());
     }
 
     // ───────── SysExEvent::universal_classification ─────────

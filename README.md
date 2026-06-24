@@ -118,6 +118,18 @@ total events capped at 1 M to keep malformed input bounded.
   every compound `nn dd` pair (`is_compound()`); `denominator()` decodes
   `1 << dd`. Both return `None` on a wrong-classification packet or a
   body truncated before the declared bytes arrive.
+  `UniversalSysExEvent::device_control()` decodes the Real-Time **Device
+  Control** family (`F0 7F <dev> 04 nn …`, Table 4 Sub-ID #1 `0x04`) into
+  a typed `DeviceControl`: Master Volume / Master Balance (14-bit
+  lsb-first value, `0x2000` = balance centre), Master Fine Tuning
+  (`fine_tuning_cents()` = `100/8192 × (value14 − 8192)` per CA-025),
+  Master Coarse Tuning (`coarse_tuning_semitones()` = signed `msb − 64`,
+  `0x40` = no change), and Global Parameter Control (CA-024 body bytes
+  surfaced verbatim, trailing `F7` stripped); `None` on the wrong
+  classification or a value pair truncated mid-stream.
+  `device_controls()` is the stably-merged absolute-tick iterator over
+  that subset (one `DeviceControlEvent` per packet, track 0 before track
+  1 at the same tick).
 - **Tick → wall-clock time** — `tempo_timeline()` folds the tempo map
   against the header `Division` into a `TempoTimeline`; its
   `tick_to_seconds(tick)` resolves any absolute tick to elapsed seconds

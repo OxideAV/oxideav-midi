@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`0x40` = 0, `−64 … +63`); both `None` for the wrong variant. Four
   added tests cover the CA-025 table endpoints, truncation, and a parsed
   SMF fine-tuning value.
+- `DeviceControl::GlobalParameterControl { body }` surfaces the CA-024
+  Global Parameter Control body bytes (sub-id2-onward, trailing `F7`
+  stripped) for callers that walk the CA-024 slot-path structure
+  themselves; the scheduler's GM2 effect bus owns the detailed walk.
+- New `SmfFile::device_controls()` — the stably-merged absolute-tick
+  iterator over the Device Control subset, one `DeviceControlEvent`
+  (`tick` / `track` / decoded `DeviceControl`) per packet, matching the
+  existing `channel_mode_messages()` / `effect_depths()` iterator family.
+  Three added tests: GPC body decode, two-track tick-ordered merge, and
+  the empty-result case.
 
 ### Round 361 — Reverb/Chorus Type select loads CA-024 table defaults
 
