@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   packet truncated before the value pair arrives (no half-decoded value).
   Five tests cover Volume, Balance, the negative cases, and an
   end-to-end parse at an absolute tick.
+- `DeviceControl::MasterFineTuning { value14 }` and `MasterCoarseTuning
+  { msb, lsb }` decode the CA-025 (Master Fine/Coarse Tuning) messages.
+  `DeviceControl::fine_tuning_cents()` returns the displacement in cents
+  from A440 (`100/8192 × (value14 − 8192)`, `0x2000` = 0 cents) and
+  `coarse_tuning_semitones()` the signed `msb − 64` semitone shift
+  (`0x40` = 0, `−64 … +63`); both `None` for the wrong variant. Four
+  added tests cover the CA-025 table endpoints, truncation, and a parsed
+  SMF fine-tuning value.
 
 ### Round 361 — Reverb/Chorus Type select loads CA-024 table defaults
 

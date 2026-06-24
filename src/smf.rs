@@ -11720,6 +11720,96 @@ mod tests {
         );
     }
 
+    // ───────── UniversalSysExEvent::device_control (CA-025 tuning) ────
+
+    #[test]
+    fn device_control_decodes_master_fine_tuning_cents() {
+        // CA-025: F0 7F 7F 04 03 lsb msb F7 — 14-bit, 0x2000 = 0 cents,
+        // displacement = 100/8192 × (value − 8192).
+        // No change: lsb=0x00 msb=0x40 → 0x2000 → 0.0 cents.
+        let centre = make_universal(&[0x7F, 0x7F, 0x04, 0x03, 0x00, 0x40, 0xF7]);
+        let dc = centre.device_control().unwrap();
+        assert_eq!(dc, DeviceControl::MasterFineTuning { value14: 0x2000 });
+        assert_eq!(dc.fine_tuning_cents(), Some(0.0));
+        // CA-025 table low end: 0x0000 → 100/8192 × (−8192) = −100 cents.
+        let low = make_universal(&[0x7F, 0x7F, 0x04, 0x03, 0x00, 0x00, 0xF7]);
+        let dc_low = low.device_control().unwrap();
+        assert_eq!(dc_low, DeviceControl::MasterFineTuning { value14: 0 });
+        assert!((dc_low.fine_tuning_cents().unwrap() - (-100.0)).abs() < 1e-9);
+        // CA-025 table high end: 0x3FFF → 100/8192 × (+8191).
+        let high = make_universal(&[0x7F, 0x7F, 0x04, 0x03, 0x7F, 0x7F, 0xF7]);
+        let dc_high = high.device_control().unwrap();
+        let expect = 100.0 / 8192.0 * 8191.0;
+        assert!((dc_high.fine_tuning_cents().unwrap() - expect).abs() < 1e-9);
+        // Helper is None for a non-fine-tuning variant.
+        let vol = make_universal(&[0x7F, 0x7F, 0x04, 0x01, 0x00, 0x40, 0xF7]);
+        assert_eq!(vol.device_control().unwrap().fine_tuning_cents(), None);
+    }
+
+    #[test]
+    fn device_control_decodes_master_coarse_tuning_semitones() {
+        // CA-025: F0 7F 7F 04 04 00 msb F7 — LSB always 0, msb-64
+        // semitones. 0x40 = no change.
+        let centre = make_universal(&[0x7F, 0x7F, 0x04, 0x04, 0x00, 0x40, 0xF7]);
+        let dc = centre.device_control().unwrap();
+        assert_eq!(
+            dc,
+            DeviceControl::MasterCoarseTuning {
+                msb: 0x40,
+                lsb: 0x00
+            }
+        );
+        assert_eq!(dc.coarse_tuning_semitones(), Some(0));
+        // Low: msb=0x00 → −64 semitones.
+        let low = make_universal(&[0x7F, 0x7F, 0x04, 0x04, 0x00, 0x00, 0xF7]);
+        assert_eq!(
+            low.device_control().unwrap().coarse_tuning_semitones(),
+            Some(-64)
+        );
+        // High: msb=0x7F → +63 semitones.
+        let high = make_universal(&[0x7F, 0x7F, 0x04, 0x04, 0x00, 0x7F, 0xF7]);
+        assert_eq!(
+            high.device_control().unwrap().coarse_tuning_semitones(),
+            Some(63)
+        );
+        // Helper is None for a non-coarse-tuning variant.
+        let vol = make_universal(&[0x7F, 0x7F, 0x04, 0x01, 0x00, 0x40, 0xF7]);
+        assert_eq!(
+            vol.device_control().unwrap().coarse_tuning_semitones(),
+            None
+        );
+    }
+
+    #[test]
+    fn device_control_tuning_none_when_truncated() {
+        // Fine tuning classified but msb missing.
+        let fine = make_universal(&[0x7F, 0x7F, 0x04, 0x03, 0x10]);
+        assert_eq!(fine.device_control(), None);
+        // Coarse tuning classified but msb missing.
+        let coarse = make_universal(&[0x7F, 0x7F, 0x04, 0x04, 0x00]);
+        assert_eq!(coarse.device_control(), None);
+    }
+
+    #[test]
+    fn device_control_fine_tuning_via_parsed_smf_at_absolute_tick() {
+        // delta=48 F0 07 7F 7F 04 03 00 41 F7 — fine tuning 0x2080.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&encode_vlq(48));
+        events.extend_from_slice(&[0xF0, 0x07, 0x7F, 0x7F, 0x04, 0x03, 0x00, 0x41, 0xF7]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let u = smf.universal_sysex_events();
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].tick, 48);
+        let dc = u[0].device_control().unwrap();
+        assert_eq!(dc, DeviceControl::MasterFineTuning { value14: 0x2080 });
+        // 0x2080 = 8320 → 100/8192 × (8320 − 8192) ≈ +1.5625 cents.
+        let expect = 100.0 / 8192.0 * 128.0;
+        assert!((dc.fine_tuning_cents().unwrap() - expect).abs() < 1e-9);
+    }
+
     // ───────── SysExEvent::universal_classification ─────────
 
     fn make_sysex(payload: &[u8]) -> SysExEvent {
