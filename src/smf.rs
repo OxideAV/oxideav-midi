@@ -3688,6 +3688,85 @@ pub struct MmcCommand {
     pub operands: Vec<u8>,
 }
 
+impl MmcCommand {
+    /// Decode this command as a **LOCATE [TARGET]** (`44 06 01 hr mn sc
+    /// fr ff`) when it is one, returning the target time position as an
+    /// [`MmcStandardTime`].
+    ///
+    /// Per RP-013 §5 (Format 2 — LOCATE [TARGET]), a LOCATE TARGET carries
+    /// `<count=06> 01 hr mn sc fr ff`: a one-byte count, the `0x01`
+    /// "TARGET" sub-command, and a five-byte Standard Time Specification.
+    /// In [`operands`](MmcCommand::operands) (which excludes the `0x44`
+    /// opcode itself), this is `[06, 01, hr, mn, sc, fr, ff]`, so the
+    /// count is at index 0, the sub-command at index 1, and the five time
+    /// bytes at indices 2..=6.
+    ///
+    /// Returns `None` unless [`command`](MmcCommand::command) is
+    /// [`MmcCommandType::Locate`] and the operands carry a `0x01` TARGET
+    /// sub-command followed by all five time bytes. The LOCATE [I/F] form
+    /// (sub-command `0x00`) and a truncated body yield `None`.
+    ///
+    /// The `hr` byte packs the SMPTE frame rate in bits 5-6 and the hours
+    /// in bits 0-4, exactly as the MIDI Time Code Standard Time hours byte
+    /// (RP-013 §"STANDARD TIME CODE"); the `ff` byte is fractional frames
+    /// in 1/100-frame units.
+    pub fn locate_target(&self) -> Option<MmcStandardTime> {
+        if !matches!(self.command, MmcCommandType::Locate) {
+            return None;
+        }
+        // operands = [count, sub-command, hr, mn, sc, fr, ff]
+        if *self.operands.get(1)? != 0x01 {
+            return None; // not the TARGET sub-command
+        }
+        let hr = *self.operands.get(2)?;
+        let mn = *self.operands.get(3)?;
+        let sc = *self.operands.get(4)?;
+        let fr = *self.operands.get(5)?;
+        let ff = *self.operands.get(6)?;
+        Some(MmcStandardTime {
+            hours_raw: hr,
+            minutes: mn,
+            seconds: sc,
+            frames: fr,
+            subframes: ff,
+        })
+    }
+}
+
+/// A decoded **MMC Standard Time Specification** (`hr mn sc fr ff`), per
+/// RP-013 §"STANDARD TIME CODE".
+///
+/// The five-byte time field shared by the MMC LOCATE [TARGET] and the
+/// timecode Information Fields. The `hr` byte packs the SMPTE frame rate
+/// in bits 5-6 and the hours in bits 0-4; `ff` counts fractional frames
+/// in 1/100-frame units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MmcStandardTime {
+    /// The raw `hr` byte (`0 tt hhhhh` — type in bits 5-6, hours in bits
+    /// 0-4).
+    pub hours_raw: u8,
+    /// Minutes counter (`0..=59`).
+    pub minutes: u8,
+    /// Seconds counter (`0..=59`).
+    pub seconds: u8,
+    /// Frames counter (`0..` up to the rate's frames-per-second).
+    pub frames: u8,
+    /// Fractional frames in 1/100-frame units (`ff`).
+    pub subframes: u8,
+}
+
+impl MmcStandardTime {
+    /// The SMPTE frame rate encoded in bits 5-6 of the `hr` byte.
+    pub fn frame_rate(&self) -> FrameRate {
+        FrameRate::from_hours_byte(self.hours_raw)
+    }
+
+    /// The hours value (bits 0-4 of the `hr` byte), `0..=23`.
+    pub fn hours_count(&self) -> u8 {
+        self.hours_raw & 0x1F
+    }
+}
+
 /// The opcode of a MIDI Machine Control Command, per RP-013 §5
 /// (*Detailed Command Descriptions*).
 ///
@@ -13010,6 +13089,37 @@ mod tests {
         // F0 7F 7F 06 with no command byte — nothing to decode.
         let ev = make_universal(&[0x7F, 0x7F, 0x06]);
         assert!(ev.mmc_command().is_none());
+    }
+
+    #[test]
+    fn mmc_locate_target_decodes_standard_time() {
+        // LOCATE [TARGET]: 44 06 01 hr mn sc fr ff. hr = 0b0110_0001 =
+        // type 3 (30 non-drop) + hours 1; mn 37; sc 52; fr 16; ff 50.
+        let ev = make_universal(&[
+            0x7F, 0x7F, 0x06, 0x44, 0x06, 0x01, 0x61, 0x25, 0x34, 0x10, 0x32, 0xF7,
+        ]);
+        let cmd = ev.mmc_command().unwrap();
+        assert_eq!(cmd.command, MmcCommandType::Locate);
+        let t = cmd.locate_target().expect("decodes a LOCATE TARGET");
+        assert_eq!(t.frame_rate(), FrameRate::Fps30NonDrop);
+        assert_eq!(t.hours_count(), 1);
+        assert_eq!(t.minutes, 37);
+        assert_eq!(t.seconds, 52);
+        assert_eq!(t.frames, 16);
+        assert_eq!(t.subframes, 50);
+    }
+
+    #[test]
+    fn mmc_locate_target_none_for_interface_form_and_non_locate() {
+        // LOCATE [I/F] sub-command = 0x00, not TARGET.
+        let iface = make_universal(&[0x7F, 0x7F, 0x06, 0x44, 0x02, 0x00, 0x08, 0xF7]);
+        assert!(iface.mmc_command().unwrap().locate_target().is_none());
+        // A STOP command is not a LOCATE at all.
+        let stop = make_universal(&[0x7F, 0x7F, 0x06, 0x01, 0xF7]);
+        assert!(stop.mmc_command().unwrap().locate_target().is_none());
+        // Truncated TARGET (missing ff byte).
+        let trunc = make_universal(&[0x7F, 0x7F, 0x06, 0x44, 0x06, 0x01, 0x61, 0x25, 0x34, 0x10]);
+        assert!(trunc.mmc_command().unwrap().locate_target().is_none());
     }
 
     #[test]

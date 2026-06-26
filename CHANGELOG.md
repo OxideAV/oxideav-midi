@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 374 — MMC LOCATE [TARGET] Standard Time decoder
+
+- New `MmcCommand::locate_target()` decodes the LOCATE [TARGET] command
+  body (`44 06 01 hr mn sc fr ff`, RP-013 §5 Format 2) into an
+  `MmcStandardTime { hours_raw, minutes, seconds, frames, subframes }`.
+  `MmcStandardTime::frame_rate()` recovers the SMPTE rate from bits 5-6 of
+  the `hr` byte (shared with the MTC Standard Time encoding) and
+  `hours_count()` the hours from bits 0-4. `None` for the LOCATE [I/F]
+  form (sub-command `0x00`), a non-LOCATE command, or a truncated body.
+  3 new tests.
+- Provenance: `docs/audio/midi/recommended-practices/RP-013_v1-0_MIDI_Machine_Control_Specification_96-1-4.pdf` §"STANDARD TIME CODE".
+
 ### Round 374 — Universal SysEx round-trip fidelity test
 
 - New `round_trip_universal_sysex_families_recover_decoders` test builds a
