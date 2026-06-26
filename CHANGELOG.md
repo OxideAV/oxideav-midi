@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 374 — MIDI Machine Control command / response body decoders
+
+- New `UniversalSysExEvent::mmc_command()` decodes a Real-Time MMC
+  Command packet (`F0 7F <dev> 06 <command…> F7`, RP-013 §5) into a typed
+  `MmcCommand { command: MmcCommandType, operands: Vec<u8> }`. The byte
+  after the `0x06` `<mcc>` Sub-ID is the first command opcode (not a
+  Universal Sub-ID #2), so the decoder reads the command stream directly.
+  `MmcCommandType` names the full RP-013 §5 set (`Stop`/`Play`/`Rewind`/
+  `Locate`/`Write`/`Step`/`Resume`/…); unknown opcodes pass through as
+  `Other(u8)`. `MmcCommandType::is_motion_control()` flags the operand-
+  less transport commands (`0x01`..=`0x0D`, `Wait`, `Resume`).
+- New `UniversalSysExEvent::mmc_response()` decodes a Real-Time MMC
+  Response packet (`F0 7F <dev> 07 <info-field…> F7`, RP-013 §6) into
+  `MmcResponse { field: MmcInformationField, operands }`, typing the
+  common timecode / status Information Fields.
+- New `SmfFile::mmc_commands()` / `SmfFile::mmc_responses()` absolute-tick
+  iterators mirror the `device_controls()` merge-by-tick contract. 14 new
+  tests cover transport opcodes, `Locate` operands, high opcodes, unknown
+  pass-through, the Non-Real-Time / Device-Control negative cases,
+  truncation, and the multi-track iterator merge.
+- Provenance: `docs/audio/midi/recommended-practices/RP-013_v1-0_MIDI_Machine_Control_Specification_96-1-4.pdf`.
+
 ### Round 368 — Device Control SysEx body decoder (`UniversalSysExEvent::device_control`)
 
 - New `UniversalSysExEvent::device_control()` typed body decoder for the

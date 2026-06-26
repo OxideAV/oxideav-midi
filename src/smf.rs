@@ -3086,6 +3086,30 @@ pub struct DeviceControlEvent {
     pub control: DeviceControl,
 }
 
+/// A decoded **MMC Command** pinned to the absolute tick (and the track)
+/// at which it fires — the element type of [`SmfFile::mmc_commands`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmcCommandEvent {
+    /// Absolute tick (cumulative per-track delta sum).
+    pub tick: u64,
+    /// Source [`Track`] index within [`SmfFile::tracks`].
+    pub track: usize,
+    /// The decoded MMC Command.
+    pub command: MmcCommand,
+}
+
+/// A decoded **MMC Response** pinned to the absolute tick (and the track)
+/// at which it fires — the element type of [`SmfFile::mmc_responses`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmcResponseEvent {
+    /// Absolute tick (cumulative per-track delta sum).
+    pub tick: u64,
+    /// Source [`Track`] index within [`SmfFile::tracks`].
+    pub track: usize,
+    /// The decoded MMC Response.
+    pub response: MmcResponse,
+}
+
 impl UniversalSysExEvent {
     /// Decode this packet as a Notation **Bar Number** message when it
     /// is one, returning the signed 14-bit bar number and its semantic
@@ -3307,6 +3331,337 @@ impl UniversalSysExEvent {
                 Some(DeviceControl::GlobalParameterControl { body })
             }
             _ => None,
+        }
+    }
+
+    /// Decode this packet as a **MIDI Machine Control Command** message
+    /// (`F0 7F <device_id> 06 <command-bytes…> F7`) when it is one,
+    /// returning the typed opcode of the *first* command in the body and
+    /// the verbatim operand bytes that follow it.
+    ///
+    /// Per RP-013 (MIDI Machine Control), MMC Commands travel as a
+    /// Real-Time Universal System Exclusive with Sub-ID #1 = `0x06` (the
+    /// `<mcc>` byte). The byte following `0x06` is the first MMC command
+    /// opcode (RP-013 §5 *Detailed Command Descriptions*), not a Universal
+    /// Sub-ID #2 — so this decoder reads the command stream directly from
+    /// the [`data`](Self::data) layout `<realm> <device_id> <mcc=06>
+    /// <command> <operands…> [F7]`, taking the command opcode from index 3
+    /// and the operands from index 4 onward (trailing `0xF7` stripped).
+    ///
+    /// Returns `None` unless the packet is a Real-Time (`0x7F`) MMC
+    /// Commands packet (`realm == RealTime`, Sub-ID #1 = `0x06`) carrying
+    /// at least one command opcode after the `<mcc>` byte. A correctly-
+    /// addressed packet truncated before any opcode arrives yields `None`.
+    ///
+    /// Only the leading command is typed; a controller may pack several
+    /// commands into one packet (RP-013 §3 permits this), in which case
+    /// [`MmcCommand::operands`] carries the remaining bytes verbatim for a
+    /// caller to re-parse.
+    pub fn mmc_command(&self) -> Option<MmcCommand> {
+        // Must be Real-Time Sub-ID #1 = 0x06 (MMC Commands), distinguished
+        // from the Non-Real-Time General Information family that shares the
+        // same Sub-ID #1 value.
+        if !matches!(self.classification.realm, UniversalRealm::RealTime) {
+            return None;
+        }
+        if !matches!(
+            self.classification.sub_id1,
+            UniversalSubId1::GeneralInformationOrMmcCommands(_)
+        ) {
+            return None;
+        }
+        // <realm> <device_id> <mcc=06> <command> <operands…> [F7]
+        let opcode = *self.data.get(3)?;
+        let mut operands: Vec<u8> = self.data.get(4..).unwrap_or(&[]).to_vec();
+        if operands.last() == Some(&0xF7) {
+            operands.pop();
+        }
+        Some(MmcCommand {
+            command: MmcCommandType::from_opcode(opcode),
+            operands,
+        })
+    }
+
+    /// Decode this packet as a **MIDI Machine Control Response** message
+    /// (`F0 7F <device_id> 07 <response-bytes…> F7`) when it is one,
+    /// returning the typed Information Field opcode of the *first* response
+    /// in the body and the verbatim bytes that follow it.
+    ///
+    /// Per RP-013, MMC Responses travel as a Real-Time Universal System
+    /// Exclusive with Sub-ID #1 = `0x07` (the `<mcr>` byte). The byte
+    /// following `0x07` is the first MMC Information Field opcode (RP-013
+    /// §6 *Detailed Information Field Descriptions*), read directly from
+    /// the [`data`](Self::data) layout `<realm> <device_id> <mcr=07>
+    /// <info-field> <operands…> [F7]`.
+    ///
+    /// Returns `None` unless the packet is a Real-Time (`0x7F`) MMC
+    /// Responses packet (`realm == RealTime`, Sub-ID #1 = `0x07`) carrying
+    /// at least one Information Field opcode after the `<mcr>` byte.
+    pub fn mmc_response(&self) -> Option<MmcResponse> {
+        if !matches!(self.classification.realm, UniversalRealm::RealTime) {
+            return None;
+        }
+        if !matches!(
+            self.classification.sub_id1,
+            UniversalSubId1::FileDumpOrMmcResponses(_)
+        ) {
+            return None;
+        }
+        // <realm> <device_id> <mcr=07> <info-field> <operands…> [F7]
+        let opcode = *self.data.get(3)?;
+        let mut operands: Vec<u8> = self.data.get(4..).unwrap_or(&[]).to_vec();
+        if operands.last() == Some(&0xF7) {
+            operands.pop();
+        }
+        Some(MmcResponse {
+            field: MmcInformationField::from_opcode(opcode),
+            operands,
+        })
+    }
+}
+
+/// A decoded **MIDI Machine Control Command** — the leading opcode and
+/// operands of a Real-Time `F0 7F <dev> 06 …` packet, per RP-013
+/// (MIDI Machine Control Specification).
+///
+/// Decoded via [`UniversalSysExEvent::mmc_command`]. The `operands`
+/// vector holds every byte after the leading command opcode, with a
+/// trailing `0xF7` end-of-exclusive marker stripped when present. For
+/// the simple "real-time motion control" commands (`STOP`, `PLAY`, …)
+/// `operands` is empty; for the parameterised commands (`LOCATE`,
+/// `WRITE`, `MASKED WRITE`, …) it carries the command's argument bytes
+/// verbatim (RP-013 §5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmcCommand {
+    /// The typed opcode of the leading command in the packet.
+    pub command: MmcCommandType,
+    /// Every byte after the leading command opcode, verbatim (trailing
+    /// `0xF7` stripped). Empty for the operand-less transport commands.
+    pub operands: Vec<u8>,
+}
+
+/// The opcode of a MIDI Machine Control Command, per RP-013 §5
+/// (*Detailed Command Descriptions*).
+///
+/// The variants name the canonical RP-013 command set; an opcode the
+/// listing does not assign surfaces through [`MmcCommandType::Other`]
+/// carrying the raw byte so callers can route it to a fallback handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmcCommandType {
+    /// `0x01` — STOP.
+    Stop,
+    /// `0x02` — PLAY.
+    Play,
+    /// `0x03` — DEFERRED PLAY.
+    DeferredPlay,
+    /// `0x04` — FAST FORWARD.
+    FastForward,
+    /// `0x05` — REWIND.
+    Rewind,
+    /// `0x06` — RECORD STROBE.
+    RecordStrobe,
+    /// `0x07` — RECORD EXIT.
+    RecordExit,
+    /// `0x08` — RECORD PAUSE.
+    RecordPause,
+    /// `0x09` — PAUSE.
+    Pause,
+    /// `0x0A` — EJECT.
+    Eject,
+    /// `0x0B` — CHASE.
+    Chase,
+    /// `0x0C` — COMMAND ERROR RESET.
+    CommandErrorReset,
+    /// `0x0D` — MMC RESET.
+    MmcReset,
+    /// `0x40` — WRITE.
+    Write,
+    /// `0x41` — MASKED WRITE.
+    MaskedWrite,
+    /// `0x42` — READ.
+    Read,
+    /// `0x43` — UPDATE.
+    Update,
+    /// `0x44` — LOCATE.
+    Locate,
+    /// `0x45` — VARIABLE PLAY.
+    VariablePlay,
+    /// `0x46` — SEARCH.
+    Search,
+    /// `0x47` — SHUTTLE.
+    Shuttle,
+    /// `0x48` — STEP.
+    Step,
+    /// `0x49` — ASSIGN SYSTEM MASTER.
+    AssignSystemMaster,
+    /// `0x4A` — GENERATOR COMMAND.
+    GeneratorCommand,
+    /// `0x4B` — MIDI TIME CODE COMMAND.
+    MidiTimeCodeCommand,
+    /// `0x4C` — MOVE.
+    Move,
+    /// `0x4D` — ADD.
+    Add,
+    /// `0x4E` — SUBTRACT.
+    Subtract,
+    /// `0x4F` — DROP FRAME ADJUST.
+    DropFrameAdjust,
+    /// `0x50` — PROCEDURE.
+    Procedure,
+    /// `0x51` — EVENT.
+    Event,
+    /// `0x52` — GROUP.
+    Group,
+    /// `0x53` — COMMAND SEGMENT.
+    CommandSegment,
+    /// `0x54` — DEFERRED VARIABLE PLAY.
+    DeferredVariablePlay,
+    /// `0x55` — RECORD STROBE VARIABLE.
+    RecordStrobeVariable,
+    /// `0x7C` — WAIT.
+    Wait,
+    /// `0x7F` — RESUME.
+    Resume,
+    /// Any opcode RP-013 §5 does not assign. The raw byte is preserved.
+    Other(u8),
+}
+
+impl MmcCommandType {
+    /// Classify an MMC command opcode against RP-013 §5.
+    pub fn from_opcode(opcode: u8) -> Self {
+        match opcode {
+            0x01 => MmcCommandType::Stop,
+            0x02 => MmcCommandType::Play,
+            0x03 => MmcCommandType::DeferredPlay,
+            0x04 => MmcCommandType::FastForward,
+            0x05 => MmcCommandType::Rewind,
+            0x06 => MmcCommandType::RecordStrobe,
+            0x07 => MmcCommandType::RecordExit,
+            0x08 => MmcCommandType::RecordPause,
+            0x09 => MmcCommandType::Pause,
+            0x0A => MmcCommandType::Eject,
+            0x0B => MmcCommandType::Chase,
+            0x0C => MmcCommandType::CommandErrorReset,
+            0x0D => MmcCommandType::MmcReset,
+            0x40 => MmcCommandType::Write,
+            0x41 => MmcCommandType::MaskedWrite,
+            0x42 => MmcCommandType::Read,
+            0x43 => MmcCommandType::Update,
+            0x44 => MmcCommandType::Locate,
+            0x45 => MmcCommandType::VariablePlay,
+            0x46 => MmcCommandType::Search,
+            0x47 => MmcCommandType::Shuttle,
+            0x48 => MmcCommandType::Step,
+            0x49 => MmcCommandType::AssignSystemMaster,
+            0x4A => MmcCommandType::GeneratorCommand,
+            0x4B => MmcCommandType::MidiTimeCodeCommand,
+            0x4C => MmcCommandType::Move,
+            0x4D => MmcCommandType::Add,
+            0x4E => MmcCommandType::Subtract,
+            0x4F => MmcCommandType::DropFrameAdjust,
+            0x50 => MmcCommandType::Procedure,
+            0x51 => MmcCommandType::Event,
+            0x52 => MmcCommandType::Group,
+            0x53 => MmcCommandType::CommandSegment,
+            0x54 => MmcCommandType::DeferredVariablePlay,
+            0x55 => MmcCommandType::RecordStrobeVariable,
+            0x7C => MmcCommandType::Wait,
+            0x7F => MmcCommandType::Resume,
+            other => MmcCommandType::Other(other),
+        }
+    }
+
+    /// `true` for the operand-less "real-time motion control" transport
+    /// commands (`0x01`..=`0x0D`, plus `WAIT` / `RESUME`) that carry no
+    /// argument bytes per RP-013 §5.
+    pub fn is_motion_control(&self) -> bool {
+        matches!(
+            self,
+            MmcCommandType::Stop
+                | MmcCommandType::Play
+                | MmcCommandType::DeferredPlay
+                | MmcCommandType::FastForward
+                | MmcCommandType::Rewind
+                | MmcCommandType::RecordStrobe
+                | MmcCommandType::RecordExit
+                | MmcCommandType::RecordPause
+                | MmcCommandType::Pause
+                | MmcCommandType::Eject
+                | MmcCommandType::Chase
+                | MmcCommandType::CommandErrorReset
+                | MmcCommandType::MmcReset
+                | MmcCommandType::Wait
+                | MmcCommandType::Resume
+        )
+    }
+}
+
+/// A decoded **MIDI Machine Control Response** — the leading Information
+/// Field opcode and bytes of a Real-Time `F0 7F <dev> 07 …` packet, per
+/// RP-013 §6 (*Detailed Information Field Descriptions*).
+///
+/// Decoded via [`UniversalSysExEvent::mmc_response`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmcResponse {
+    /// The typed Information Field opcode of the leading response.
+    pub field: MmcInformationField,
+    /// Every byte after the leading Information Field opcode, verbatim
+    /// (trailing `0xF7` stripped).
+    pub operands: Vec<u8>,
+}
+
+/// An MMC Response Information Field opcode, per RP-013 §6.
+///
+/// The variants name the commonly-emitted timecode / status fields; an
+/// opcode the listing does not assign surfaces through
+/// [`MmcInformationField::Other`] carrying the raw byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmcInformationField {
+    /// `0x01` — SELECTED TIME CODE.
+    SelectedTimeCode,
+    /// `0x02` — SELECTED MASTER CODE.
+    SelectedMasterCode,
+    /// `0x03` — REQUESTED OFFSET.
+    RequestedOffset,
+    /// `0x04` — ACTUAL OFFSET.
+    ActualOffset,
+    /// `0x05` — LOCK DEVIATION.
+    LockDeviation,
+    /// `0x06` — GENERATOR TIME CODE.
+    GeneratorTimeCode,
+    /// `0x07` — MIDI TIME CODE INPUT.
+    MidiTimeCodeInput,
+    /// `0x48` — MOTION CONTROL TALLY.
+    MotionControlTally,
+    /// `0x4F` — TRACK RECORD READY.
+    TrackRecordReady,
+    /// `0x62` — TRACK MUTE.
+    TrackMute,
+    /// `0x64` — RESPONSE SEGMENT.
+    ResponseSegment,
+    /// `0x65` — FAILURE.
+    Failure,
+    /// Any opcode RP-013 §6 does not assign. The raw byte is preserved.
+    Other(u8),
+}
+
+impl MmcInformationField {
+    /// Classify an MMC Information Field opcode against RP-013 §6.
+    pub fn from_opcode(opcode: u8) -> Self {
+        match opcode {
+            0x01 => MmcInformationField::SelectedTimeCode,
+            0x02 => MmcInformationField::SelectedMasterCode,
+            0x03 => MmcInformationField::RequestedOffset,
+            0x04 => MmcInformationField::ActualOffset,
+            0x05 => MmcInformationField::LockDeviation,
+            0x06 => MmcInformationField::GeneratorTimeCode,
+            0x07 => MmcInformationField::MidiTimeCodeInput,
+            0x48 => MmcInformationField::MotionControlTally,
+            0x4F => MmcInformationField::TrackRecordReady,
+            0x62 => MmcInformationField::TrackMute,
+            0x64 => MmcInformationField::ResponseSegment,
+            0x65 => MmcInformationField::Failure,
+            other => MmcInformationField::Other(other),
         }
     }
 }
@@ -5454,6 +5809,47 @@ impl SmfFile {
         // universal_sysex_events() already stable-sorts by tick; the
         // filter preserves order, so out is already tick-ordered. A
         // belt-and-braces stable sort keeps the contract explicit.
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **MMC Command** (`F0 7F <dev> 06 …`) from every
+    /// track, pinned to the absolute tick at which it fires, in time
+    /// order. Each entry's command is decoded via
+    /// [`UniversalSysExEvent::mmc_command`]; non-MMC Universal SysEx
+    /// packets are skipped. Returns an empty `Vec` when no track carries
+    /// an MMC Command packet.
+    pub fn mmc_commands(&self) -> Vec<MmcCommandEvent> {
+        let mut out: Vec<MmcCommandEvent> = Vec::new();
+        for ev in self.universal_sysex_events() {
+            if let Some(command) = ev.mmc_command() {
+                out.push(MmcCommandEvent {
+                    tick: ev.tick,
+                    track: ev.track,
+                    command,
+                });
+            }
+        }
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **MMC Response** (`F0 7F <dev> 07 …`) from every
+    /// track, pinned to the absolute tick at which it fires, in time
+    /// order. Each entry's response is decoded via
+    /// [`UniversalSysExEvent::mmc_response`]. Returns an empty `Vec` when
+    /// no track carries an MMC Response packet.
+    pub fn mmc_responses(&self) -> Vec<MmcResponseEvent> {
+        let mut out: Vec<MmcResponseEvent> = Vec::new();
+        for ev in self.universal_sysex_events() {
+            if let Some(response) = ev.mmc_response() {
+                out.push(MmcResponseEvent {
+                    tick: ev.tick,
+                    track: ev.track,
+                    response,
+                });
+            }
+        }
         out.sort_by_key(|c| c.tick);
         out
     }
@@ -11935,6 +12331,153 @@ mod tests {
         blob.extend(track_chunk(&events));
         let smf = parse(&blob).unwrap();
         assert!(smf.device_controls().is_empty());
+    }
+
+    // ───────── UniversalSysExEvent::mmc_command / mmc_response ─────────
+
+    #[test]
+    fn mmc_command_decodes_stop_transport() {
+        // F0 7F <dev=7F> 06 <STOP=01> F7 — a motion-control command.
+        let ev = make_universal(&[0x7F, 0x7F, 0x06, 0x01, 0xF7]);
+        let cmd = ev.mmc_command().expect("classifies as MMC Command");
+        assert_eq!(cmd.command, MmcCommandType::Stop);
+        assert!(cmd.command.is_motion_control());
+        assert!(cmd.operands.is_empty());
+    }
+
+    #[test]
+    fn mmc_command_decodes_play_and_record_strobe() {
+        let play = make_universal(&[0x7F, 0x7F, 0x06, 0x02, 0xF7]);
+        assert_eq!(play.mmc_command().unwrap().command, MmcCommandType::Play);
+        let rec = make_universal(&[0x7F, 0x7F, 0x06, 0x06, 0xF7]);
+        assert_eq!(
+            rec.mmc_command().unwrap().command,
+            MmcCommandType::RecordStrobe
+        );
+    }
+
+    #[test]
+    fn mmc_command_locate_carries_operands() {
+        // LOCATE [TARGET] = 44 06 01 hr mn sc fr ff (RP-013 §5 worked
+        // form); the operands after the opcode are surfaced verbatim.
+        let ev = make_universal(&[
+            0x7F, 0x7F, 0x06, 0x44, 0x06, 0x01, 0x61, 0x25, 0x34, 0x10, 0x00, 0xF7,
+        ]);
+        let cmd = ev.mmc_command().unwrap();
+        assert_eq!(cmd.command, MmcCommandType::Locate);
+        assert!(!cmd.command.is_motion_control());
+        assert_eq!(cmd.operands, vec![0x06, 0x01, 0x61, 0x25, 0x34, 0x10, 0x00]);
+    }
+
+    #[test]
+    fn mmc_command_high_opcodes_classify() {
+        for (op, want) in [
+            (0x40u8, MmcCommandType::Write),
+            (0x48, MmcCommandType::Step),
+            (0x4B, MmcCommandType::MidiTimeCodeCommand),
+            (0x7C, MmcCommandType::Wait),
+            (0x7F, MmcCommandType::Resume),
+        ] {
+            let ev = make_universal(&[0x7F, 0x7F, 0x06, op, 0xF7]);
+            assert_eq!(ev.mmc_command().unwrap().command, want);
+        }
+    }
+
+    #[test]
+    fn mmc_command_unknown_opcode_passes_through() {
+        let ev = make_universal(&[0x7F, 0x7F, 0x06, 0x70, 0xF7]);
+        assert_eq!(
+            ev.mmc_command().unwrap().command,
+            MmcCommandType::Other(0x70)
+        );
+    }
+
+    #[test]
+    fn mmc_command_none_for_non_mmc_and_nrt_general_information() {
+        // Real-Time GM-style packet that is NOT MMC (Device Control).
+        let dc = make_universal(&[0x7F, 0x7F, 0x04, 0x01, 0x00, 0x40, 0xF7]);
+        assert!(dc.mmc_command().is_none());
+        // Non-Real-Time 0x06 = General Information (Identity), NOT MMC —
+        // shares Sub-ID #1 0x06 but lives in the 7E realm.
+        let id = make_universal(&[0x7E, 0x7F, 0x06, 0x01, 0xF7]);
+        assert!(id.mmc_command().is_none());
+    }
+
+    #[test]
+    fn mmc_command_none_when_truncated_before_opcode() {
+        // F0 7F 7F 06 with no command byte — nothing to decode.
+        let ev = make_universal(&[0x7F, 0x7F, 0x06]);
+        assert!(ev.mmc_command().is_none());
+    }
+
+    #[test]
+    fn mmc_response_decodes_selected_time_code() {
+        // F0 7F <dev> 07 <SELECTED TIME CODE=01> hr mn sc fr ff F7.
+        let ev = make_universal(&[0x7F, 0x7F, 0x07, 0x01, 0x61, 0x25, 0x34, 0x10, 0x00, 0xF7]);
+        let resp = ev.mmc_response().expect("classifies as MMC Response");
+        assert_eq!(resp.field, MmcInformationField::SelectedTimeCode);
+        assert_eq!(resp.operands, vec![0x61, 0x25, 0x34, 0x10, 0x00]);
+    }
+
+    #[test]
+    fn mmc_response_high_fields_and_unknown() {
+        let fail = make_universal(&[0x7F, 0x7F, 0x07, 0x65, 0x42, 0xF7]);
+        assert_eq!(
+            fail.mmc_response().unwrap().field,
+            MmcInformationField::Failure
+        );
+        let unk = make_universal(&[0x7F, 0x7F, 0x07, 0x71, 0xF7]);
+        assert_eq!(
+            unk.mmc_response().unwrap().field,
+            MmcInformationField::Other(0x71)
+        );
+    }
+
+    #[test]
+    fn mmc_response_none_for_command_packet() {
+        let cmd = make_universal(&[0x7F, 0x7F, 0x06, 0x01, 0xF7]);
+        assert!(cmd.mmc_response().is_none());
+    }
+
+    #[test]
+    fn mmc_commands_iterator_merges_tracks_in_tick_order() {
+        // Track 0: PLAY @128; track 1: STOP @64. Merge is by tick.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(128));
+        t0.extend_from_slice(&[0xF0, 0x05, 0x7F, 0x7F, 0x06, 0x02, 0xF7]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(64));
+        t1.extend_from_slice(&[0xF0, 0x05, 0x7F, 0x7F, 0x06, 0x01, 0xF7]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let cmds = smf.mmc_commands();
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].tick, 64);
+        assert_eq!(cmds[0].command.command, MmcCommandType::Stop);
+        assert_eq!(cmds[1].tick, 128);
+        assert_eq!(cmds[1].command.command, MmcCommandType::Play);
+    }
+
+    #[test]
+    fn mmc_responses_iterator_collects_responses() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(0));
+        t0.extend_from_slice(&[0xF0, 0x05, 0x7F, 0x7F, 0x07, 0x01, 0xF7]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&t0));
+        let smf = parse(&blob).unwrap();
+        let resps = smf.mmc_responses();
+        assert_eq!(resps.len(), 1);
+        assert_eq!(
+            resps[0].response.field,
+            MmcInformationField::SelectedTimeCode
+        );
+        assert!(smf.mmc_commands().is_empty());
     }
 
     // ───────── SysExEvent::universal_classification ─────────
