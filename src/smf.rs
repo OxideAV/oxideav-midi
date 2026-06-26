@@ -3136,6 +3136,19 @@ pub struct IdentityReplyEvent {
     pub reply: IdentityReply,
 }
 
+/// A decoded **General MIDI System** message pinned to the absolute tick
+/// (and the track) at which it fires — the element type of
+/// [`SmfFile::general_midi_system_messages`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GeneralMidiSystemEvent {
+    /// Absolute tick (cumulative per-track delta sum).
+    pub tick: u64,
+    /// Source [`Track`] index within [`SmfFile::tracks`].
+    pub track: usize,
+    /// The decoded General MIDI System message.
+    pub system: GeneralMidiSystem,
+}
+
 impl UniversalSysExEvent {
     /// Decode this packet as a Notation **Bar Number** message when it
     /// is one, returning the signed 14-bit bar number and its semantic
@@ -3623,6 +3636,35 @@ impl UniversalSysExEvent {
         let lsb = (*self.data.get(3)? & 0x7F) as u16;
         let msb = (*self.data.get(4)? & 0x7F) as u16;
         Some(lsb | (msb << 7))
+    }
+
+    /// Decode this packet as a **General MIDI System** message when it is
+    /// one, returning whether it turns GM Level 1 / Level 2 on or turns
+    /// General MIDI off.
+    ///
+    /// Per RP-003 (General MIDI System Level 1) and the General MIDI 2
+    /// specification, these messages travel as Non-Real-Time Universal
+    /// System Exclusive packets with Sub-ID #1 = `0x09` (General MIDI):
+    /// `F0 7E <dev> 09 01 F7` (GM 1 System On), `F0 7E <dev> 09 02 F7`
+    /// (GM System Off), `F0 7E <dev> 09 03 F7` (GM 2 System On). Decoded
+    /// from the packet's [`classification`](Self::classification) Sub-ID
+    /// #2; no further body bytes are read.
+    ///
+    /// Returns `None` for any packet whose Sub-ID #2 is not one of the
+    /// three defined General MIDI System values.
+    ///
+    /// [`classification`]: Self::classification
+    pub fn general_midi_system(&self) -> Option<GeneralMidiSystem> {
+        let sub2 = match self.classification.sub_id1 {
+            UniversalSubId1::GeneralMidiOrControllerDestination(s) => s,
+            _ => return None,
+        };
+        match sub2 {
+            UniversalSubId2::GeneralMidi1SystemOn => Some(GeneralMidiSystem::Level1On),
+            UniversalSubId2::GeneralMidiSystemOff => Some(GeneralMidiSystem::Off),
+            UniversalSubId2::GeneralMidi2SystemOn => Some(GeneralMidiSystem::Level2On),
+            _ => None,
+        }
     }
 }
 
@@ -4147,6 +4189,23 @@ pub struct SampleDumpHeader {
     pub loop_end: u32,
     /// The loop type (`jj`).
     pub loop_type: LoopType,
+}
+
+/// A **General MIDI System** message, per RP-003 (General MIDI System
+/// Level 1) and the General MIDI 2 specification.
+///
+/// Decoded via [`UniversalSysExEvent::general_midi_system`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneralMidiSystem {
+    /// `F0 7E <dev> 09 01 F7` — General MIDI 1 System On. The receiver
+    /// resets to the GM 1 default state (RP-003).
+    Level1On,
+    /// `F0 7E <dev> 09 02 F7` — General MIDI System Off. The receiver
+    /// leaves General MIDI mode.
+    Off,
+    /// `F0 7E <dev> 09 03 F7` — General MIDI 2 System On. The receiver
+    /// resets to the GM 2 default state.
+    Level2On,
 }
 
 /// Sub-ID #1 category of a Universal System Exclusive packet — the
@@ -6370,6 +6429,26 @@ impl SmfFile {
                     tick: ev.tick,
                     track: ev.track,
                     reply,
+                });
+            }
+        }
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **General MIDI System** message (`F0 7E <dev> 09 0n
+    /// F7`) from every track, pinned to the absolute tick at which it
+    /// fires, in time order. Each entry is decoded via
+    /// [`UniversalSysExEvent::general_midi_system`]. Returns an empty
+    /// `Vec` when no track carries a GM System On / Off packet.
+    pub fn general_midi_system_messages(&self) -> Vec<GeneralMidiSystemEvent> {
+        let mut out: Vec<GeneralMidiSystemEvent> = Vec::new();
+        for ev in self.universal_sysex_events() {
+            if let Some(system) = ev.general_midi_system() {
+                out.push(GeneralMidiSystemEvent {
+                    tick: ev.tick,
+                    track: ev.track,
+                    system,
                 });
             }
         }
@@ -13202,6 +13281,45 @@ mod tests {
         // Not a request (it's a header).
         let hdr = make_universal(&[0x7E, 0x7F, 0x01, 0x05, 0x00]);
         assert_eq!(hdr.sample_dump_request(), None);
+    }
+
+    // ───────── UniversalSysExEvent::general_midi_system ─────────
+
+    #[test]
+    fn general_midi_system_decodes_on_off_levels() {
+        let gm1 = make_universal(&[0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        assert_eq!(gm1.general_midi_system(), Some(GeneralMidiSystem::Level1On));
+        let off = make_universal(&[0x7E, 0x7F, 0x09, 0x02, 0xF7]);
+        assert_eq!(off.general_midi_system(), Some(GeneralMidiSystem::Off));
+        let gm2 = make_universal(&[0x7E, 0x7F, 0x09, 0x03, 0xF7]);
+        assert_eq!(gm2.general_midi_system(), Some(GeneralMidiSystem::Level2On));
+    }
+
+    #[test]
+    fn general_midi_system_none_for_other_packets() {
+        // Identity Reply (0x06) — not GM System.
+        let id = make_universal(&[0x7E, 0x7F, 0x06, 0x02, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(id.general_midi_system(), None);
+    }
+
+    #[test]
+    fn general_midi_system_messages_iterator_orders_by_tick() {
+        // GM1 On @0, GM System Off @48 (a reset-then-disable sequence).
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(0));
+        t0.extend_from_slice(&[0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        t0.extend_from_slice(&encode_vlq(48));
+        t0.extend_from_slice(&[0xF0, 0x05, 0x7E, 0x7F, 0x09, 0x02, 0xF7]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&t0));
+        let smf = parse(&blob).unwrap();
+        let gms = smf.general_midi_system_messages();
+        assert_eq!(gms.len(), 2);
+        assert_eq!(gms[0].tick, 0);
+        assert_eq!(gms[0].system, GeneralMidiSystem::Level1On);
+        assert_eq!(gms[1].tick, 48);
+        assert_eq!(gms[1].system, GeneralMidiSystem::Off);
     }
 
     // ───────── SysExEvent::universal_classification ─────────

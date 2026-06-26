@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 374 — General MIDI System On / Off typed decoder
+
+- New `UniversalSysExEvent::general_midi_system()` decodes the General
+  MIDI System messages (`F0 7E <dev> 09 0n F7`) into a `GeneralMidiSystem`
+  enum: `Level1On` (`0x01`, RP-003), `Off` (`0x02`), `Level2On` (`0x03`,
+  General MIDI 2). `None` for any other packet.
+- New `SmfFile::general_midi_system_messages()` absolute-tick iterator.
+  3 new tests cover the three message types, the non-GM negative, and a
+  reset-then-disable two-message ordering.
+- Provenance: `docs/audio/midi/recommended-practices/RP-003_General_MIDI_System_Level_1_Specification_96-1-4_0.1.pdf` and the General MIDI 2 specification under `docs/audio/midi/`.
+
 ### Round 374 — Sample Dump Standard header / request body decoders
 
 - New `UniversalSysExEvent::sample_dump_header()` decodes a Sample Dump
