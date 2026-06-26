@@ -3123,6 +3123,19 @@ pub struct ShowControlEvent {
     pub message: ShowControlMessage,
 }
 
+/// A decoded **Identity Reply** pinned to the absolute tick (and the
+/// track) at which it fires — the element type of
+/// [`SmfFile::identity_replies`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdentityReplyEvent {
+    /// Absolute tick (cumulative per-track delta sum).
+    pub tick: u64,
+    /// Source [`Track`] index within [`SmfFile::tracks`].
+    pub track: usize,
+    /// The decoded Identity Reply.
+    pub reply: IdentityReply,
+}
+
 impl UniversalSysExEvent {
     /// Decode this packet as a Notation **Bar Number** message when it
     /// is one, returning the signed 14-bit bar number and its semantic
@@ -3474,6 +3487,68 @@ impl UniversalSysExEvent {
             command_format: ShowControlFormat::from_byte(command_format),
             command: ShowControlCommand::from_opcode(command),
             data,
+        })
+    }
+
+    /// Decode this packet as a **General Information — Identity Reply**
+    /// message when it is one, returning the manufacturer ID, the 14-bit
+    /// device family code and family-member code, and the four software
+    /// revision bytes.
+    ///
+    /// Per the MIDI 1.0 Detailed Specification §"GENERAL INFORMATION",
+    /// the Identity Reply travels as a Non-Real-Time Universal System
+    /// Exclusive `F0 7E <device_id> 06 02 mm ff ff dd dd ss ss ss ss F7`:
+    /// Sub-ID #1 = `0x06` (General Information), Sub-ID #2 = `0x02`
+    /// (Identity Reply), then a one-byte manufacturer ID `mm` (extended to
+    /// three bytes when `mm == 0x00`), a 14-bit device family code
+    /// (`ff ff`, LSB first), a 14-bit family-member code (`dd dd`, LSB
+    /// first), and a four-byte device-specific software revision level.
+    ///
+    /// Indexing follows the [`data`](Self::data) layout `<realm=7E>
+    /// <device_id> <sub_id1=06> <sub_id2=02> mm …`, so the manufacturer ID
+    /// byte is at index 4. When `mm == 0x00`, the manufacturer ID occupies
+    /// indices 4..=6 (the three-byte extended form) and the remaining
+    /// fields shift accordingly.
+    ///
+    /// Returns `None` unless the packet is a Non-Real-Time (`0x7E`)
+    /// Identity Reply ([`UniversalSubId2::GeneralInformationIdentityReply`])
+    /// carrying all of its fixed-length fields. A correctly-classified but
+    /// truncated packet yields `None` rather than partial fields.
+    pub fn identity_reply(&self) -> Option<IdentityReply> {
+        if !matches!(
+            self.classification.sub_id1,
+            UniversalSubId1::GeneralInformationOrMmcCommands(
+                UniversalSubId2::GeneralInformationIdentityReply
+            )
+        ) {
+            return None;
+        }
+        // <realm=7E> <device_id> <sub_id1=06> <sub_id2=02> mm …
+        let mm = *self.data.get(4)?;
+        // One-byte manufacturer ID, or the three-byte extended form when
+        // the first byte is 0x00.
+        let (manufacturer, mut idx) = if mm == 0x00 {
+            let b1 = *self.data.get(5)?;
+            let b2 = *self.data.get(6)?;
+            (ManufacturerId::Extended(b1, b2), 7)
+        } else {
+            (ManufacturerId::Single(mm), 5)
+        };
+        let read = |i: usize| -> Option<u8> { self.data.get(i).copied() };
+        let family_lsb = (read(idx)? & 0x7F) as u16;
+        let family_msb = (read(idx + 1)? & 0x7F) as u16;
+        let member_lsb = (read(idx + 2)? & 0x7F) as u16;
+        let member_msb = (read(idx + 3)? & 0x7F) as u16;
+        idx += 4;
+        let mut revision = [0u8; 4];
+        for (j, slot) in revision.iter_mut().enumerate() {
+            *slot = read(idx + j)?;
+        }
+        Some(IdentityReply {
+            manufacturer,
+            family: family_lsb | (family_msb << 7),
+            family_member: member_lsb | (member_msb << 7),
+            software_revision: revision,
         })
     }
 }
@@ -3910,6 +3985,41 @@ impl ShowControlCommand {
             other => ShowControlCommand::Other(other),
         }
     }
+}
+
+/// A System Exclusive manufacturer ID, in the one-byte or three-byte
+/// extended form defined by the MIDI 1.0 Detailed Specification.
+///
+/// A non-zero leading byte is a complete one-byte ID. A `0x00` leading
+/// byte signals the three-byte extended ID space, in which case the two
+/// following bytes carry the actual ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManufacturerId {
+    /// A one-byte manufacturer ID (`mm`, `mm != 0x00`).
+    Single(u8),
+    /// A three-byte extended manufacturer ID — the leading byte was
+    /// `0x00`; the two carried bytes are the actual ID.
+    Extended(u8, u8),
+}
+
+/// A decoded **General Information — Identity Reply** message
+/// (`F0 7E <dev> 06 02 mm ff ff dd dd ss ss ss ss F7`), per the MIDI 1.0
+/// Detailed Specification §"GENERAL INFORMATION".
+///
+/// Decoded via [`UniversalSysExEvent::identity_reply`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdentityReply {
+    /// The replying device's System Exclusive manufacturer ID (`mm`, or
+    /// the three-byte extended form when `mm == 0x00`).
+    pub manufacturer: ManufacturerId,
+    /// The 14-bit device family code (`ff ff`, LSB first).
+    pub family: u16,
+    /// The 14-bit device family-member code (`dd dd`, LSB first).
+    pub family_member: u16,
+    /// The four-byte device-specific software revision level (`ss ss ss
+    /// ss`). The format is device-specific; the bytes are surfaced
+    /// verbatim.
+    pub software_revision: [u8; 4],
 }
 
 /// Sub-ID #1 category of a Universal System Exclusive packet — the
@@ -6113,6 +6223,26 @@ impl SmfFile {
                     tick: ev.tick,
                     track: ev.track,
                     message,
+                });
+            }
+        }
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **Identity Reply** (`F0 7E <dev> 06 02 …`) from every
+    /// track, pinned to the absolute tick at which it fires, in time
+    /// order. Each entry is decoded via
+    /// [`UniversalSysExEvent::identity_reply`]. Returns an empty `Vec`
+    /// when no track carries an Identity Reply packet.
+    pub fn identity_replies(&self) -> Vec<IdentityReplyEvent> {
+        let mut out: Vec<IdentityReplyEvent> = Vec::new();
+        for ev in self.universal_sysex_events() {
+            if let Some(reply) = ev.identity_reply() {
+                out.push(IdentityReplyEvent {
+                    tick: ev.tick,
+                    track: ev.track,
+                    reply,
                 });
             }
         }
@@ -12828,6 +12958,64 @@ mod tests {
         assert_eq!(msgs[0].tick, 10);
         assert_eq!(msgs[0].message.command, ShowControlCommand::Stop);
         assert_eq!(msgs[0].message.command_format, ShowControlFormat::Lighting);
+    }
+
+    // ───────── UniversalSysExEvent::identity_reply ─────────
+
+    #[test]
+    fn identity_reply_decodes_single_byte_manufacturer() {
+        // F0 7E 7F 06 02 mm=41(Roland) ff ff dd dd ss ss ss ss F7.
+        // family = 0x02 | (0x00<<7) = 2; member = 0x10 | (0x03<<7) = 0x190.
+        let ev = make_universal(&[
+            0x7E, 0x7F, 0x06, 0x02, 0x41, 0x02, 0x00, 0x10, 0x03, 0x01, 0x02, 0x03, 0x04, 0xF7,
+        ]);
+        let id = ev.identity_reply().expect("classifies as Identity Reply");
+        assert_eq!(id.manufacturer, ManufacturerId::Single(0x41));
+        assert_eq!(id.family, 2);
+        assert_eq!(id.family_member, 0x10 | (0x03 << 7));
+        assert_eq!(id.software_revision, [0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn identity_reply_decodes_extended_manufacturer() {
+        // mm = 00 → extended three-byte ID 00 21 09 (an example
+        // extended-space ID); fields shift by two bytes.
+        let ev = make_universal(&[
+            0x7E, 0x7F, 0x06, 0x02, 0x00, 0x21, 0x09, 0x7F, 0x00, 0x01, 0x00, 0x10, 0x11, 0x12,
+            0x13, 0xF7,
+        ]);
+        let id = ev.identity_reply().unwrap();
+        assert_eq!(id.manufacturer, ManufacturerId::Extended(0x21, 0x09));
+        assert_eq!(id.family, 0x7F);
+        assert_eq!(id.family_member, 1);
+        assert_eq!(id.software_revision, [0x10, 0x11, 0x12, 0x13]);
+    }
+
+    #[test]
+    fn identity_reply_none_for_identity_request_and_truncation() {
+        // Identity Request (sub-id2 = 01), not Reply.
+        let req = make_universal(&[0x7E, 0x7F, 0x06, 0x01, 0xF7]);
+        assert!(req.identity_reply().is_none());
+        // Reply truncated before all revision bytes.
+        let trunc = make_universal(&[0x7E, 0x7F, 0x06, 0x02, 0x41, 0x02, 0x00, 0x10, 0x03]);
+        assert!(trunc.identity_reply().is_none());
+    }
+
+    #[test]
+    fn identity_replies_iterator_collects() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(0));
+        t0.extend_from_slice(&[
+            0xF0, 0x0D, 0x7E, 0x7F, 0x06, 0x02, 0x41, 0x02, 0x00, 0x10, 0x03, 0x01, 0x02, 0x03,
+            0x04, 0xF7,
+        ]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&t0));
+        let smf = parse(&blob).unwrap();
+        let ids = smf.identity_replies();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].reply.manufacturer, ManufacturerId::Single(0x41));
     }
 
     // ───────── SysExEvent::universal_classification ─────────

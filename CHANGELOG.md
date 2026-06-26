@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 374 — Identity Reply body decoder (`UniversalSysExEvent::identity_reply`)
+
+- New `UniversalSysExEvent::identity_reply()` decodes a Non-Real-Time
+  General Information Identity Reply (`F0 7E <dev> 06 02 mm ff ff dd dd
+  ss ss ss ss F7`) into `IdentityReply { manufacturer, family,
+  family_member, software_revision }`. The manufacturer ID is a
+  `ManufacturerId::Single(mm)` or, when `mm == 0x00`, the three-byte
+  `ManufacturerId::Extended(b1, b2)` form, with the family / member /
+  revision fields shifting accordingly. Family and family-member codes
+  are 14-bit LSB-first.
+- New `SmfFile::identity_replies()` absolute-tick iterator. 4 new tests
+  cover the single-byte and extended manufacturer forms, the
+  Identity-Request / truncation negatives, and the iterator.
+- Provenance: `docs/audio/midi/midi-1.0/M1_v4-2-1_MIDI_1-0_Detailed_Specification_96-1-4.pdf` §"GENERAL INFORMATION".
+
 ### Round 374 — MIDI Show Control body decoder (`UniversalSysExEvent::show_control`)
 
 - New `UniversalSysExEvent::show_control()` decodes a Real-Time MIDI Show
