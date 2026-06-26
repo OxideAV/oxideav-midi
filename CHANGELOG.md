@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 374 — Universal SysEx round-trip fidelity test
+
+- New `round_trip_universal_sysex_families_recover_decoders` test builds a
+  track carrying an MMC Command, an MSC message, an Identity Reply, a GM 1
+  System On, and a Sample Dump Request, drives it through `to_bytes()` →
+  `parse()`, and asserts (a) exact structural equality and (b) that every
+  new typed body decoder recovers the same value from the re-parsed file.
+  Closes the parse→write→parse loop for the round-374 SysEx families.
+
 ### Round 374 — General MIDI System On / Off typed decoder
 
 - New `UniversalSysExEvent::general_midi_system()` decodes the General

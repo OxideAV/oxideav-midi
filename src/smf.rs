@@ -14441,6 +14441,79 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_universal_sysex_families_recover_decoders() {
+        // Build one track carrying an MMC STOP, an MSC lighting GO, an
+        // Identity Reply, a GM 1 System On, and a Sample Dump Request,
+        // each as a verbatim F0…F7 SysEx payload. Drive the whole file
+        // through to_bytes -> parse and confirm (a) exact structural
+        // equality and (b) that every typed body decoder recovers the
+        // same value it would on the hand-built packet.
+        let payloads: Vec<Vec<u8>> = vec![
+            vec![0x7F, 0x7F, 0x06, 0x01, 0xF7],       // MMC STOP
+            vec![0x7F, 0x01, 0x02, 0x01, 0x01, 0xF7], // MSC lighting GO
+            vec![
+                0x7E, 0x7F, 0x06, 0x02, 0x41, 0x02, 0x00, 0x10, 0x03, 0x01, 0x02, 0x03, 0x04, 0xF7,
+            ], // Identity Reply
+            vec![0x7E, 0x7F, 0x09, 0x01, 0xF7],       // GM1 On
+            vec![0x7E, 0x7F, 0x03, 0x7F, 0x01, 0xF7], // Sample Dump Request (255)
+        ];
+        let mut events: Vec<TrackEvent> = payloads
+            .iter()
+            .map(|p| TrackEvent {
+                delta: 5,
+                kind: Event::Sysex {
+                    escape: false,
+                    data: p.clone(),
+                },
+            })
+            .collect();
+        events.push(TrackEvent {
+            delta: 0,
+            kind: Event::Meta(MetaEvent::EndOfTrack),
+        });
+        let smf = SmfFile {
+            header: SmfHeader {
+                format: SmfFormat::SingleTrack,
+                ntrks: 1,
+                division: Division::TicksPerQuarter(96),
+            },
+            tracks: vec![Track { events }],
+        };
+        let bytes = smf.to_bytes().unwrap();
+        let parsed = parse(&bytes).unwrap();
+        assert_eq!(parsed, smf);
+
+        // Decoders recover from the re-parsed file.
+        assert_eq!(parsed.mmc_commands().len(), 1);
+        assert_eq!(
+            parsed.mmc_commands()[0].command.command,
+            MmcCommandType::Stop
+        );
+        assert_eq!(parsed.show_control_messages().len(), 1);
+        assert_eq!(
+            parsed.show_control_messages()[0].message.command,
+            ShowControlCommand::Go
+        );
+        assert_eq!(parsed.identity_replies().len(), 1);
+        assert_eq!(
+            parsed.identity_replies()[0].reply.manufacturer,
+            ManufacturerId::Single(0x41)
+        );
+        assert_eq!(parsed.general_midi_system_messages().len(), 1);
+        assert_eq!(
+            parsed.general_midi_system_messages()[0].system,
+            GeneralMidiSystem::Level1On
+        );
+        // Sample Dump Request rides the universal SysEx stream too.
+        let reqs: Vec<u16> = parsed
+            .universal_sysex_events()
+            .iter()
+            .filter_map(|e| e.sample_dump_request())
+            .collect();
+        assert_eq!(reqs, vec![255]);
+    }
+
+    #[test]
     fn round_trip_format_1_multi_track() {
         // Two-track format-1 file: tempo on track 0, a note on track 1.
         let t0 = Track {
