@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 374 — Sample Dump Standard header / request body decoders
+
+- New `UniversalSysExEvent::sample_dump_header()` decodes a Sample Dump
+  Header (`F0 7E <dev> 01 ss ss ee ff ff ff gg gg gg hh hh hh ii ii ii jj
+  F7`) into `SampleDumpHeader { sample_number, sample_format,
+  sample_period, sample_length, loop_start, loop_end, loop_type }`. The
+  21-bit numeric fields unpack their three 7-bit groups LSB-first; the
+  loop-type byte classifies into `LoopType` (`Forward` / `BackwardForward`
+  / `Off` / `Other`).
+- New `UniversalSysExEvent::sample_dump_request()` decodes a Sample Dump
+  Request (`F0 7E <dev> 03 ss ss F7`) into the requested 14-bit sample
+  number. 4 new tests cover all header fields, the loop-type variants,
+  header truncation, and the request.
+- Provenance: `docs/audio/midi/midi-1.0/M1_v4-2-1_MIDI_1-0_Detailed_Specification_96-1-4.pdf` §"DUMP HEADER" / §"DUMP REQUEST".
+
 ### Round 374 — Identity Reply body decoder (`UniversalSysExEvent::identity_reply`)
 
 - New `UniversalSysExEvent::identity_reply()` decodes a Non-Real-Time

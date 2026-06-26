@@ -3551,6 +3551,79 @@ impl UniversalSysExEvent {
             software_revision: revision,
         })
     }
+
+    /// Decode this packet as a **Sample Dump Header** when it is one,
+    /// returning the sample number, sample format (significant bits),
+    /// sample period, sample length, sustain-loop endpoints, and loop
+    /// type.
+    ///
+    /// Per the MIDI 1.0 Detailed Specification §"DUMP HEADER", a Sample
+    /// Dump Header travels as a Non-Real-Time Universal System Exclusive
+    /// `F0 7E <device_id> 01 ss ss ee ff ff ff gg gg gg hh hh hh ii ii ii
+    /// jj F7` (Sub-ID #1 = `0x01`, no Sub-ID #2): `ss ss` sample number
+    /// (LSB first), `ee` sample format in significant bits (8..=28),
+    /// `ff ff ff` sample period in nanoseconds (21-bit, LSB-first 7-bit
+    /// groups), `gg gg gg` sample length in words, `hh hh hh` sustain-loop
+    /// start word, `ii ii ii` sustain-loop end word, `jj` loop type
+    /// (`0x00` forward, `0x01` backward/forward, `0x7F` loop off).
+    ///
+    /// Indexing follows the [`data`](Self::data) layout `<realm=7E>
+    /// <device_id> <sub_id1=01> ss …`, so the first sample-number byte is
+    /// at index 3. Multi-byte numeric fields pack their 7-bit groups LSB
+    /// first.
+    ///
+    /// Returns `None` unless the packet is a Non-Real-Time (`0x7E`) Sample
+    /// Dump Header ([`UniversalSubId1::SampleDumpHeader`]) carrying all of
+    /// its fixed-length fields. A truncated packet yields `None`.
+    pub fn sample_dump_header(&self) -> Option<SampleDumpHeader> {
+        if !matches!(
+            self.classification.sub_id1,
+            UniversalSubId1::SampleDumpHeader
+        ) {
+            return None;
+        }
+        let b = |i: usize| -> Option<u32> { self.data.get(i).map(|v| (*v & 0x7F) as u32) };
+        // <realm=7E> <device_id> <sub_id1=01> ss ss ee ff×3 gg×3 hh×3 ii×3 jj
+        let sample_number = (b(3)? | (b(4)? << 7)) as u16;
+        let sample_format = b(5)? as u8;
+        let triple =
+            |i: usize| -> Option<u32> { Some(b(i)? | (b(i + 1)? << 7) | (b(i + 2)? << 14)) };
+        let sample_period = triple(6)?;
+        let sample_length = triple(9)?;
+        let loop_start = triple(12)?;
+        let loop_end = triple(15)?;
+        let loop_type = *self.data.get(18)? & 0x7F;
+        Some(SampleDumpHeader {
+            sample_number,
+            sample_format,
+            sample_period,
+            sample_length,
+            loop_start,
+            loop_end,
+            loop_type: LoopType::from_byte(loop_type),
+        })
+    }
+
+    /// Decode this packet as a **Sample Dump Request** when it is one,
+    /// returning the requested sample number.
+    ///
+    /// Per the MIDI 1.0 Detailed Specification §"DUMP REQUEST", a Sample
+    /// Dump Request travels as a Non-Real-Time Universal System Exclusive
+    /// `F0 7E <device_id> 03 ss ss F7` (Sub-ID #1 = `0x03`, no Sub-ID #2):
+    /// `ss ss` is the requested sample number (LSB first). Returns `None`
+    /// unless the packet is a Sample Dump Request carrying both bytes.
+    pub fn sample_dump_request(&self) -> Option<u16> {
+        if !matches!(
+            self.classification.sub_id1,
+            UniversalSubId1::SampleDumpRequest
+        ) {
+            return None;
+        }
+        // <realm=7E> <device_id> <sub_id1=03> ss ss
+        let lsb = (*self.data.get(3)? & 0x7F) as u16;
+        let msb = (*self.data.get(4)? & 0x7F) as u16;
+        Some(lsb | (msb << 7))
+    }
 }
 
 /// A decoded **MIDI Machine Control Command** — the leading opcode and
@@ -4020,6 +4093,60 @@ pub struct IdentityReply {
     /// ss`). The format is device-specific; the bytes are surfaced
     /// verbatim.
     pub software_revision: [u8; 4],
+}
+
+/// The loop type byte (`jj`) of a Sample Dump Header, per the MIDI 1.0
+/// Detailed Specification §"DUMP HEADER".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoopType {
+    /// `0x00` — forward only.
+    Forward,
+    /// `0x01` — backward / forward (bidirectional).
+    BackwardForward,
+    /// `0x7F` — loop off.
+    Off,
+    /// Any other byte (reserved for future definition). The raw value is
+    /// preserved.
+    Other(u8),
+}
+
+impl LoopType {
+    /// Classify a Sample Dump Header loop-type byte.
+    pub fn from_byte(byte: u8) -> Self {
+        match byte {
+            0x00 => LoopType::Forward,
+            0x01 => LoopType::BackwardForward,
+            0x7F => LoopType::Off,
+            other => LoopType::Other(other),
+        }
+    }
+}
+
+/// A decoded **Sample Dump Header** (`F0 7E <dev> 01 ss ss ee ff ff ff
+/// gg gg gg hh hh hh ii ii ii jj F7`), per the MIDI 1.0 Detailed
+/// Specification §"DUMP HEADER".
+///
+/// Decoded via [`UniversalSysExEvent::sample_dump_header`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SampleDumpHeader {
+    /// The sample number (`ss ss`, 14-bit LSB-first).
+    pub sample_number: u16,
+    /// The sample format — the number of significant bits per sample word
+    /// (`ee`, 8..=28).
+    pub sample_format: u8,
+    /// The sample period (1 / sample rate) in nanoseconds (`ff ff ff`,
+    /// 21-bit LSB-first).
+    pub sample_period: u32,
+    /// The sample length in words (`gg gg gg`, 21-bit LSB-first).
+    pub sample_length: u32,
+    /// The sustain-loop start point word number (`hh hh hh`, 21-bit
+    /// LSB-first).
+    pub loop_start: u32,
+    /// The sustain-loop end point word number (`ii ii ii`, 21-bit
+    /// LSB-first).
+    pub loop_end: u32,
+    /// The loop type (`jj`).
+    pub loop_type: LoopType,
 }
 
 /// Sub-ID #1 category of a Universal System Exclusive packet — the
@@ -13016,6 +13143,65 @@ mod tests {
         let ids = smf.identity_replies();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].reply.manufacturer, ManufacturerId::Single(0x41));
+    }
+
+    // ───────── UniversalSysExEvent::sample_dump_header / request ─────────
+
+    #[test]
+    fn sample_dump_header_decodes_all_fields() {
+        // sample 5 (05 00); format 16 bits (10); period 0x010000 ns
+        //   → 21-bit LSB groups: 0x010000 = 65536 = 00 00 04 (0|0<<7|4<<14);
+        // length 0x000200 = 512 = 00 04 00; loop_start 0x000100 = 256
+        //   = 00 02 00; loop_end 0x000200 = 512 = 00 04 00; jj = 01.
+        let ev = make_universal(&[
+            0x7E, 0x7F, 0x01, 0x05, 0x00, 0x10, // ss ss ee
+            0x00, 0x00, 0x04, // ff ff ff (period = 65536)
+            0x00, 0x04, 0x00, // gg gg gg (length = 512)
+            0x00, 0x02, 0x00, // hh hh hh (loop start = 256)
+            0x00, 0x04, 0x00, // ii ii ii (loop end = 512)
+            0x01, // jj (backward/forward)
+            0xF7,
+        ]);
+        let h = ev
+            .sample_dump_header()
+            .expect("classifies as Sample Dump Header");
+        assert_eq!(h.sample_number, 5);
+        assert_eq!(h.sample_format, 16);
+        assert_eq!(h.sample_period, 65536);
+        assert_eq!(h.sample_length, 512);
+        assert_eq!(h.loop_start, 256);
+        assert_eq!(h.loop_end, 512);
+        assert_eq!(h.loop_type, LoopType::BackwardForward);
+    }
+
+    #[test]
+    fn sample_dump_header_loop_type_variants() {
+        let mk = |jj: u8| {
+            let mut p = vec![0x7E, 0x7F, 0x01, 0x00, 0x00, 0x08];
+            p.extend_from_slice(&[0u8; 12]); // period+length+start+end
+            p.push(jj);
+            p.push(0xF7);
+            make_universal(&p).sample_dump_header().unwrap().loop_type
+        };
+        assert_eq!(mk(0x00), LoopType::Forward);
+        assert_eq!(mk(0x7F), LoopType::Off);
+        assert_eq!(mk(0x40), LoopType::Other(0x40));
+    }
+
+    #[test]
+    fn sample_dump_header_none_when_truncated() {
+        let trunc = make_universal(&[0x7E, 0x7F, 0x01, 0x05, 0x00, 0x10, 0x00]);
+        assert!(trunc.sample_dump_header().is_none());
+    }
+
+    #[test]
+    fn sample_dump_request_decodes_sample_number() {
+        // F0 7E 7F 03 ss=7F ss=01 F7 → 0x7F | (1<<7) = 0xFF = 255.
+        let ev = make_universal(&[0x7E, 0x7F, 0x03, 0x7F, 0x01, 0xF7]);
+        assert_eq!(ev.sample_dump_request(), Some(255));
+        // Not a request (it's a header).
+        let hdr = make_universal(&[0x7E, 0x7F, 0x01, 0x05, 0x00]);
+        assert_eq!(hdr.sample_dump_request(), None);
     }
 
     // ───────── SysExEvent::universal_classification ─────────
