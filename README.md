@@ -130,6 +130,25 @@ total events capped at 1 M to keep malformed input bounded.
   `device_controls()` is the stably-merged absolute-tick iterator over
   that subset (one `DeviceControlEvent` per packet, track 0 before track
   1 at the same tick).
+- **Transport / device control SysEx** — `mmc_command()` /
+  `mmc_response()` decode the Real-Time **MIDI Machine Control** families
+  (`F0 7F <dev> 06|07 …`, RP-013) into typed `MmcCommandType`
+  (`Stop`/`Play`/`Locate`/`Write`/`Resume`/…) and `MmcInformationField`
+  opcodes plus verbatim operands; `MmcCommand::locate_target()` decodes
+  the LOCATE [TARGET] body into an `MmcStandardTime` (`frame_rate()` +
+  `hours_count()`). `show_control()` decodes **MIDI Show Control**
+  (`F0 7F <dev> 02 <fmt> <cmd> …`, RP-002-014) into a `ShowControlFormat`
+  / `ShowControlCommand` (`Go`/`Stop`/`Resume`/…). `identity_reply()`
+  decodes the Non-RT **Identity Reply** (`F0 7E <dev> 06 02 mm ff ff dd
+  dd ss ss ss ss F7`) into manufacturer (single / three-byte extended),
+  14-bit family + member codes, and the four revision bytes.
+  `general_midi_system()` maps GM System On/Off (`F0 7E <dev> 09 0n F7`,
+  RP-003 / GM2) to `GeneralMidiSystem`. `sample_dump_header()` /
+  `sample_dump_request()` decode the Sample Dump Standard header (21-bit
+  LSB-first fields + `LoopType`) and request. Each has a stably-merged
+  absolute-tick iterator (`mmc_commands()`, `mmc_responses()`,
+  `show_control_messages()`, `identity_replies()`,
+  `general_midi_system_messages()`).
 - **Tick → wall-clock time** — `tempo_timeline()` folds the tempo map
   against the header `Division` into a `TempoTimeline`; its
   `tick_to_seconds(tick)` resolves any absolute tick to elapsed seconds
