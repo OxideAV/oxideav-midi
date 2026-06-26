@@ -3110,6 +3110,19 @@ pub struct MmcResponseEvent {
     pub response: MmcResponse,
 }
 
+/// A decoded **MIDI Show Control** message pinned to the absolute tick
+/// (and the track) at which it fires — the element type of
+/// [`SmfFile::show_control_messages`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShowControlEvent {
+    /// Absolute tick (cumulative per-track delta sum).
+    pub tick: u64,
+    /// Source [`Track`] index within [`SmfFile::tracks`].
+    pub track: usize,
+    /// The decoded MIDI Show Control message.
+    pub message: ShowControlMessage,
+}
+
 impl UniversalSysExEvent {
     /// Decode this packet as a Notation **Bar Number** message when it
     /// is one, returning the signed 14-bit bar number and its semantic
@@ -3418,6 +3431,51 @@ impl UniversalSysExEvent {
             operands,
         })
     }
+
+    /// Decode this packet as a **MIDI Show Control** message
+    /// (`F0 7F <device_id> 02 <command_format> <command> <data> F7`) when
+    /// it is one, returning the Command Format, the typed Command opcode,
+    /// and the verbatim data bytes that follow.
+    ///
+    /// Per RP-002-014 (MIDI Show Control), MSC messages travel as a
+    /// Real-Time Universal System Exclusive with Sub-ID #1 = `0x02`
+    /// (`<msc>`). The byte following `0x02` is the `<command_format>`
+    /// (RP-002-014 §4.1, Table 1 — Lighting, Sound, Machinery, …) and the
+    /// next byte is the `<command>` (RP-002-014 §5, GO / STOP / RESUME /
+    /// TIMED_GO / …); these are *not* Universal Sub-ID #2 bytes, so this
+    /// decoder reads them directly from the [`data`](Self::data) layout
+    /// `<realm> <device_id> <msc=02> <command_format> <command> <data…>
+    /// [F7]`, taking the command format from index 3, the command from
+    /// index 4, and the data bytes from index 5 onward (trailing `0xF7`
+    /// stripped).
+    ///
+    /// Returns `None` unless the packet is a Real-Time (`0x7F`) MIDI Show
+    /// Control packet (`realm == RealTime`, Sub-ID #1 = `0x02`) carrying
+    /// at least the command-format and command bytes. A packet truncated
+    /// before the command byte arrives yields `None`.
+    pub fn show_control(&self) -> Option<ShowControlMessage> {
+        if !matches!(self.classification.realm, UniversalRealm::RealTime) {
+            return None;
+        }
+        if !matches!(
+            self.classification.sub_id1,
+            UniversalSubId1::MidiShowControl(_)
+        ) {
+            return None;
+        }
+        // <realm> <device_id> <msc=02> <command_format> <command> <data…> [F7]
+        let command_format = *self.data.get(3)?;
+        let command = *self.data.get(4)?;
+        let mut data: Vec<u8> = self.data.get(5..).unwrap_or(&[]).to_vec();
+        if data.last() == Some(&0xF7) {
+            data.pop();
+        }
+        Some(ShowControlMessage {
+            command_format: ShowControlFormat::from_byte(command_format),
+            command: ShowControlCommand::from_opcode(command),
+            data,
+        })
+    }
 }
 
 /// A decoded **MIDI Machine Control Command** — the leading opcode and
@@ -3662,6 +3720,194 @@ impl MmcInformationField {
             0x64 => MmcInformationField::ResponseSegment,
             0x65 => MmcInformationField::Failure,
             other => MmcInformationField::Other(other),
+        }
+    }
+}
+
+/// A decoded **MIDI Show Control** message — the Command Format, Command
+/// opcode, and data bytes of a Real-Time `F0 7F <dev> 02 …` packet, per
+/// RP-002-014 (MIDI Show Control Specification).
+///
+/// Decoded via [`UniversalSysExEvent::show_control`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShowControlMessage {
+    /// The Command Format (`<command_format>`, RP-002-014 §4.1) — the
+    /// equipment category the command addresses.
+    pub command_format: ShowControlFormat,
+    /// The Command opcode (`<command>`, RP-002-014 §5).
+    pub command: ShowControlCommand,
+    /// Every byte after the command opcode, verbatim (trailing `0xF7`
+    /// stripped). The internal structure depends on the command (cue
+    /// number / list / path ASCII fields, timecode, etc.).
+    pub data: Vec<u8>,
+}
+
+/// A MIDI Show Control **Command Format** byte, per RP-002-014 §4.1
+/// (Table 1).
+///
+/// The variants name the General-category formats and the All-types
+/// broadcast format; the per-category Specific formats and any value the
+/// table does not assign surface through [`ShowControlFormat::Other`]
+/// carrying the raw byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShowControlFormat {
+    /// `0x00` — reserved for extensions.
+    Extensions,
+    /// `0x01` — Lighting (General Category).
+    Lighting,
+    /// `0x10` — Sound (General Category).
+    Sound,
+    /// `0x20` — Machinery (General Category).
+    Machinery,
+    /// `0x30` — Video (General Category).
+    Video,
+    /// `0x40` — Projection (General Category).
+    Projection,
+    /// `0x50` — Process Control (General Category).
+    ProcessControl,
+    /// `0x60` — Pyrotechnics (General Category).
+    Pyrotechnics,
+    /// `0x7F` — All-types (system-wide broadcast).
+    AllTypes,
+    /// Any Command Format value not one of the General-category /
+    /// All-types codes above (the Specific formats and reserved values).
+    /// The raw byte is preserved.
+    Other(u8),
+}
+
+impl ShowControlFormat {
+    /// Classify a Command Format byte against RP-002-014 §4.1 Table 1.
+    pub fn from_byte(byte: u8) -> Self {
+        match byte {
+            0x00 => ShowControlFormat::Extensions,
+            0x01 => ShowControlFormat::Lighting,
+            0x10 => ShowControlFormat::Sound,
+            0x20 => ShowControlFormat::Machinery,
+            0x30 => ShowControlFormat::Video,
+            0x40 => ShowControlFormat::Projection,
+            0x50 => ShowControlFormat::ProcessControl,
+            0x60 => ShowControlFormat::Pyrotechnics,
+            0x7F => ShowControlFormat::AllTypes,
+            other => ShowControlFormat::Other(other),
+        }
+    }
+}
+
+/// A MIDI Show Control **Command** opcode, per RP-002-014 §5.
+///
+/// The variants name the defined command set; an opcode the listing does
+/// not assign surfaces through [`ShowControlCommand::Other`] carrying the
+/// raw byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShowControlCommand {
+    /// `0x01` — GO.
+    Go,
+    /// `0x02` — STOP.
+    Stop,
+    /// `0x03` — RESUME.
+    Resume,
+    /// `0x04` — TIMED_GO.
+    TimedGo,
+    /// `0x05` — LOAD.
+    Load,
+    /// `0x06` — SET.
+    Set,
+    /// `0x07` — FIRE.
+    Fire,
+    /// `0x08` — ALL_OFF.
+    AllOff,
+    /// `0x09` — RESTORE.
+    Restore,
+    /// `0x0A` — RESET.
+    Reset,
+    /// `0x0B` — GO_OFF.
+    GoOff,
+    /// `0x10` — GO/JAM_CLOCK.
+    GoJamClock,
+    /// `0x11` — STANDBY_+.
+    StandbyPlus,
+    /// `0x12` — STANDBY_-.
+    StandbyMinus,
+    /// `0x13` — SEQUENCE_+.
+    SequencePlus,
+    /// `0x14` — SEQUENCE_-.
+    SequenceMinus,
+    /// `0x15` — START_CLOCK.
+    StartClock,
+    /// `0x16` — STOP_CLOCK.
+    StopClock,
+    /// `0x17` — ZERO_CLOCK.
+    ZeroClock,
+    /// `0x18` — SET_CLOCK.
+    SetClock,
+    /// `0x19` — MTC_CHASE_ON.
+    MtcChaseOn,
+    /// `0x1A` — MTC_CHASE_OFF.
+    MtcChaseOff,
+    /// `0x1B` — OPEN_CUE_LIST.
+    OpenCueList,
+    /// `0x1C` — CLOSE_CUE_LIST.
+    CloseCueList,
+    /// `0x1D` — OPEN_CUE_PATH.
+    OpenCuePath,
+    /// `0x1E` — CLOSE_CUE_PATH.
+    CloseCuePath,
+    /// `0x20` — STANDBY (two-phase commit).
+    Standby,
+    /// `0x21` — STANDING_BY.
+    StandingBy,
+    /// `0x22` — GO_2PC.
+    Go2Pc,
+    /// `0x23` — COMPLETE.
+    Complete,
+    /// `0x24` — CANCEL.
+    Cancel,
+    /// `0x25` — CANCELLED.
+    Cancelled,
+    /// `0x26` — ABORT.
+    Abort,
+    /// Any opcode RP-002-014 §5 does not assign. The raw byte is preserved.
+    Other(u8),
+}
+
+impl ShowControlCommand {
+    /// Classify a Command opcode against RP-002-014 §5.
+    pub fn from_opcode(opcode: u8) -> Self {
+        match opcode {
+            0x01 => ShowControlCommand::Go,
+            0x02 => ShowControlCommand::Stop,
+            0x03 => ShowControlCommand::Resume,
+            0x04 => ShowControlCommand::TimedGo,
+            0x05 => ShowControlCommand::Load,
+            0x06 => ShowControlCommand::Set,
+            0x07 => ShowControlCommand::Fire,
+            0x08 => ShowControlCommand::AllOff,
+            0x09 => ShowControlCommand::Restore,
+            0x0A => ShowControlCommand::Reset,
+            0x0B => ShowControlCommand::GoOff,
+            0x10 => ShowControlCommand::GoJamClock,
+            0x11 => ShowControlCommand::StandbyPlus,
+            0x12 => ShowControlCommand::StandbyMinus,
+            0x13 => ShowControlCommand::SequencePlus,
+            0x14 => ShowControlCommand::SequenceMinus,
+            0x15 => ShowControlCommand::StartClock,
+            0x16 => ShowControlCommand::StopClock,
+            0x17 => ShowControlCommand::ZeroClock,
+            0x18 => ShowControlCommand::SetClock,
+            0x19 => ShowControlCommand::MtcChaseOn,
+            0x1A => ShowControlCommand::MtcChaseOff,
+            0x1B => ShowControlCommand::OpenCueList,
+            0x1C => ShowControlCommand::CloseCueList,
+            0x1D => ShowControlCommand::OpenCuePath,
+            0x1E => ShowControlCommand::CloseCuePath,
+            0x20 => ShowControlCommand::Standby,
+            0x21 => ShowControlCommand::StandingBy,
+            0x22 => ShowControlCommand::Go2Pc,
+            0x23 => ShowControlCommand::Complete,
+            0x24 => ShowControlCommand::Cancel,
+            0x25 => ShowControlCommand::Cancelled,
+            0x26 => ShowControlCommand::Abort,
+            other => ShowControlCommand::Other(other),
         }
     }
 }
@@ -5847,6 +6093,26 @@ impl SmfFile {
                     tick: ev.tick,
                     track: ev.track,
                     response,
+                });
+            }
+        }
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **MIDI Show Control** message (`F0 7F <dev> 02 …`)
+    /// from every track, pinned to the absolute tick at which it fires,
+    /// in time order. Each entry is decoded via
+    /// [`UniversalSysExEvent::show_control`]. Returns an empty `Vec` when
+    /// no track carries an MSC packet.
+    pub fn show_control_messages(&self) -> Vec<ShowControlEvent> {
+        let mut out: Vec<ShowControlEvent> = Vec::new();
+        for ev in self.universal_sysex_events() {
+            if let Some(message) = ev.show_control() {
+                out.push(ShowControlEvent {
+                    tick: ev.tick,
+                    track: ev.track,
+                    message,
                 });
             }
         }
@@ -12478,6 +12744,90 @@ mod tests {
             MmcInformationField::SelectedTimeCode
         );
         assert!(smf.mmc_commands().is_empty());
+    }
+
+    // ───────── UniversalSysExEvent::show_control ─────────
+
+    #[test]
+    fn show_control_decodes_lighting_go() {
+        // F0 7F <dev=01> 02 <fmt=lighting=01> <GO=01> F7 (RP-002-014 §1.2).
+        let ev = make_universal(&[0x7F, 0x01, 0x02, 0x01, 0x01, 0xF7]);
+        let msc = ev.show_control().expect("classifies as MSC");
+        assert_eq!(msc.command_format, ShowControlFormat::Lighting);
+        assert_eq!(msc.command, ShowControlCommand::Go);
+        assert!(msc.data.is_empty());
+    }
+
+    #[test]
+    fn show_control_go_with_cue_number_data() {
+        // GO with a cue-number ASCII field "127" = 0x31 0x32 0x37.
+        let ev = make_universal(&[0x7F, 0x01, 0x02, 0x01, 0x01, 0x31, 0x32, 0x37, 0xF7]);
+        let msc = ev.show_control().unwrap();
+        assert_eq!(msc.command, ShowControlCommand::Go);
+        assert_eq!(msc.data, vec![0x31, 0x32, 0x37]);
+    }
+
+    #[test]
+    fn show_control_command_formats_classify() {
+        for (b, want) in [
+            (0x00u8, ShowControlFormat::Extensions),
+            (0x10, ShowControlFormat::Sound),
+            (0x20, ShowControlFormat::Machinery),
+            (0x30, ShowControlFormat::Video),
+            (0x40, ShowControlFormat::Projection),
+            (0x50, ShowControlFormat::ProcessControl),
+            (0x60, ShowControlFormat::Pyrotechnics),
+            (0x7F, ShowControlFormat::AllTypes),
+            (0x02, ShowControlFormat::Other(0x02)),
+        ] {
+            let ev = make_universal(&[0x7F, 0x7F, 0x02, b, 0x01, 0xF7]);
+            assert_eq!(ev.show_control().unwrap().command_format, want);
+        }
+    }
+
+    #[test]
+    fn show_control_commands_classify() {
+        for (op, want) in [
+            (0x02u8, ShowControlCommand::Stop),
+            (0x03, ShowControlCommand::Resume),
+            (0x04, ShowControlCommand::TimedGo),
+            (0x0B, ShowControlCommand::GoOff),
+            (0x10, ShowControlCommand::GoJamClock),
+            (0x17, ShowControlCommand::ZeroClock),
+            (0x1B, ShowControlCommand::OpenCueList),
+            (0x20, ShowControlCommand::Standby),
+            (0x26, ShowControlCommand::Abort),
+            (0x77, ShowControlCommand::Other(0x77)),
+        ] {
+            let ev = make_universal(&[0x7F, 0x01, 0x02, 0x01, op, 0xF7]);
+            assert_eq!(ev.show_control().unwrap().command, want);
+        }
+    }
+
+    #[test]
+    fn show_control_none_for_non_msc_and_truncated() {
+        // MMC (Sub-ID #1 = 0x06), not MSC.
+        let mmc = make_universal(&[0x7F, 0x7F, 0x06, 0x01, 0xF7]);
+        assert!(mmc.show_control().is_none());
+        // Truncated before the command byte.
+        let trunc = make_universal(&[0x7F, 0x01, 0x02, 0x01]);
+        assert!(trunc.show_control().is_none());
+    }
+
+    #[test]
+    fn show_control_messages_iterator_collects() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(10));
+        t0.extend_from_slice(&[0xF0, 0x06, 0x7F, 0x01, 0x02, 0x01, 0x02, 0xF7]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&t0));
+        let smf = parse(&blob).unwrap();
+        let msgs = smf.show_control_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].tick, 10);
+        assert_eq!(msgs[0].message.command, ShowControlCommand::Stop);
+        assert_eq!(msgs[0].message.command_format, ShowControlFormat::Lighting);
     }
 
     // ───────── SysExEvent::universal_classification ─────────

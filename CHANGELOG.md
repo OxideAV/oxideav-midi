@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 374 — MIDI Show Control body decoder (`UniversalSysExEvent::show_control`)
+
+- New `UniversalSysExEvent::show_control()` decodes a Real-Time MIDI Show
+  Control packet (`F0 7F <dev> 02 <command_format> <command> <data> F7`,
+  RP-002-014) into `ShowControlMessage { command_format, command, data }`.
+  The bytes after the `0x02` `<msc>` Sub-ID are the Command Format and
+  Command (not Universal Sub-ID #2), so the decoder reads them directly.
+- `ShowControlFormat` names the General-category formats (Lighting / Sound
+  / Machinery / Video / Projection / Process Control / Pyrotechnics) plus
+  All-types (`0x7F`); Specific formats pass through as `Other(u8)`.
+  `ShowControlCommand` names the full RP-002-014 §5 command set (`Go` …
+  `Abort`, `0x01`..=`0x0B`, `0x10`..=`0x1E`, `0x20`..=`0x26`); unknown
+  opcodes pass through as `Other(u8)`.
+- New `SmfFile::show_control_messages()` absolute-tick iterator. 6 new
+  tests cover Lighting GO, the cue-number data field, every command-format
+  and command classification, the non-MSC / truncation negatives, and the
+  iterator merge.
+- Provenance: `docs/audio/midi/recommended-practices/RP-002-014_v1-1-1_MIDI_Show_Control_Specification_96-1-4.pdf`.
+
 ### Round 374 — MIDI Machine Control command / response body decoders
 
 - New `UniversalSysExEvent::mmc_command()` decodes a Real-Time MMC
