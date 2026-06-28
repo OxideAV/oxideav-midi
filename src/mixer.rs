@@ -53,6 +53,14 @@ pub fn pitch_bend_to_cents(value: u16, range_cents: u16) -> i32 {
 /// Number of MIDI channels — fixed by the spec, not configurable.
 pub const NUM_CHANNELS: usize = 16;
 
+/// Gain applied to a note struck while the Soft Pedal (CC 67) is down.
+/// The MIDI 1.0 spec describes CC 67 as a switch ("≤63 off, ≥64 on")
+/// without prescribing a depth; `0.667` (≈ −3.5 dB) is a moderate
+/// *una corda* attenuation that audibly softens the note without
+/// muting it. Captured per-voice at note-on so already-sounding notes
+/// are unaffected.
+pub const SOFT_PEDAL_GAIN: f32 = 0.667;
+
 /// One slot in the voice pool.
 struct VoiceSlot {
     /// The active voice, or `None` if the slot is free.
@@ -83,6 +91,13 @@ struct VoiceSlot {
     /// Per-voice gain folded in from velocity (already applied inside
     /// the voice) plus channel volume / pan. Pulled at mix time.
     velocity_norm: f32,
+    /// Static per-note gain captured at note-on, applied multiplicatively
+    /// at mix time *in addition* to the channel volume / expression /
+    /// master gains. `1.0` for a normally-struck note; the Soft Pedal
+    /// (CC 67) sets it below 1.0 for notes struck while the pedal is
+    /// down. Because it is captured once at note-on it never changes a
+    /// note already sounding.
+    note_gain: f32,
 }
 
 impl VoiceSlot {
@@ -96,6 +111,7 @@ impl VoiceSlot {
             released: false,
             age: 0,
             velocity_norm: 0.0,
+            note_gain: 1.0,
         }
     }
 }
@@ -128,6 +144,13 @@ pub struct ChannelState {
     /// set is tracked per-voice on the slot, not here); this flag just
     /// records the pedal position for `note_off` to consult.
     pub sostenuto: bool,
+    /// CC 67 (Soft Pedal / *una corda*). `true` while the pedal is
+    /// depressed (value >= 64). On a real instrument it shifts the action
+    /// so fewer / softer strings sound; the synth models it as a gain
+    /// reduction applied to notes **struck while the pedal is down**.
+    /// Notes already sounding are unaffected — the attenuation is captured
+    /// per-voice at note-on, so this flag only gates the capture.
+    pub soft_pedal: bool,
     /// Live pitch-bend value as the raw 14-bit MIDI scalar
     /// (`0..=16383`). Centre is `0x2000`. Map to cents via
     /// `(value - 0x2000) * pitch_bend_range_cents / 8192`.
@@ -197,6 +220,7 @@ impl Default for ChannelState {
             pan: 64,
             sustain: false,
             sostenuto: false,
+            soft_pedal: false,
             pitch_bend: 0x2000,
             pitch_bend_range_cents: 200,
             channel_pressure: 0,
@@ -1155,15 +1179,18 @@ impl Mixer {
         self.channels[ch].rpn = 0x3FFF; // RPN/NRPN selector → null
         self.channels[ch].pitch_bend = 0x2000; // centre
 
-        // Lift the Sostenuto pedal first (CC 66), then Sustain (CC 64):
-        // a held pedal must release on RAC. Using the setters runs the
-        // deferred-release re-evaluation so any held voices fire.
+        // Pedals (CC 64/65/66/67) → off. Lift the Sostenuto pedal first
+        // (CC 66), then Sustain (CC 64): a held pedal must release on RAC.
+        // Using the setters runs the deferred-release re-evaluation so any
+        // held voices fire. The Soft Pedal just clears (it only gates
+        // future strikes, so there is nothing live to re-apply).
         if self.channels[ch].sostenuto {
             self.set_sostenuto(channel, 0);
         }
         if self.channels[ch].sustain {
             self.set_sustain(channel, 0);
         }
+        self.channels[ch].soft_pedal = false;
         // Re-apply the centred bend to every held voice on this channel.
         self.set_pitch_bend(channel, 0x2000);
         // Clear mod-wheel depth on held voices.
@@ -1895,6 +1922,18 @@ impl Mixer {
         }
     }
 
+    /// Apply CC 67 (Soft Pedal / *una corda*). Records the pedal position
+    /// on the channel state; the attenuation is captured per-voice at
+    /// note-on (a note struck while the pedal is down renders at
+    /// [`SOFT_PEDAL_GAIN`], one struck with it up at unity). Notes already
+    /// sounding when the pedal moves are unaffected — on a real piano the
+    /// pedal shifts the action for the *next* strike, not the current
+    /// vibration.
+    pub fn set_soft_pedal(&mut self, channel: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].soft_pedal = value >= 64;
+    }
+
     /// Allocate a voice slot. If the pool is full, preempt the oldest
     /// slot (smallest `age`). Returns the index of the chosen slot.
     fn pick_slot(&mut self) -> usize {
@@ -2018,6 +2057,9 @@ impl Mixer {
             released: false,
             age,
             velocity_norm: (velocity as f32 / 127.0).clamp(0.0, 1.0),
+            // Soft Pedal (CC 67): a note struck while the pedal is down is
+            // attenuated; one struck with it up renders at unity.
+            note_gain: if st.soft_pedal { SOFT_PEDAL_GAIN } else { 1.0 },
         };
     }
 
@@ -2118,11 +2160,13 @@ impl Mixer {
             // Per-channel volume / pan + universal master volume +
             // master balance (master state hoisted out of the loop).
             let st = self.channels[slot.channel as usize % NUM_CHANNELS];
-            // CC 7 (Channel Volume) × CC 11 (Expression). Expression is a
+            // CC 7 (Channel Volume) × CC 11 (Expression) × the per-note
+            // Soft-Pedal (CC 67) gain captured at note-on. Expression is a
             // percentage of Channel Volume (MIDI 1.0 Control Change table),
             // so the two multiply: a full-Volume channel still dips with
-            // Expression, and Expression at 127 is transparent.
-            let vol = (st.volume as f32 / 127.0) * (st.expression as f32 / 127.0);
+            // Expression, and Expression at 127 is transparent. The note
+            // gain is 1.0 unless the Soft Pedal was down at strike time.
+            let vol = (st.volume as f32 / 127.0) * (st.expression as f32 / 127.0) * slot.note_gain;
             // Constant-power pan: θ in [0, π/2], left = cos(θ), right = sin(θ).
             let pan_norm = (st.pan as f32 / 127.0).clamp(0.0, 1.0);
             let theta = pan_norm * std::f32::consts::FRAC_PI_2;
@@ -2629,6 +2673,69 @@ mod tests {
         m.set_sustain(0, 0); // sustain up — now release
         let _ = m.mix_stereo(&mut l, &mut r);
         assert_eq!(m.live_voice_count(), 0);
+    }
+
+    #[test]
+    fn soft_pedal_attenuates_notes_struck_while_down() {
+        let mut m = Mixer::new();
+        m.channel_state_mut(0).pan = 0; // hard left for a clean read
+        m.set_soft_pedal(0, 127); // pedal down
+        m.note_on(0, 60, 100, voice(0.5, 64));
+        let mut ls = vec![0.0f32; 16];
+        let mut rs = vec![0.0f32; 16];
+        m.mix_stereo(&mut ls, &mut rs);
+
+        let mut m2 = Mixer::new();
+        m2.channel_state_mut(0).pan = 0;
+        // pedal up — full gain.
+        m2.note_on(0, 60, 100, voice(0.5, 64));
+        let mut lf = vec![0.0f32; 16];
+        let mut rf = vec![0.0f32; 16];
+        m2.mix_stereo(&mut lf, &mut rf);
+
+        let expected = lf[0] * SOFT_PEDAL_GAIN;
+        assert!(
+            (ls[0] - expected).abs() < 1e-5,
+            "soft-pedal note {} != expected {} (full {})",
+            ls[0],
+            expected,
+            lf[0],
+        );
+    }
+
+    #[test]
+    fn soft_pedal_does_not_change_already_sounding_notes() {
+        // A note struck with the pedal up keeps full gain even if the
+        // pedal goes down afterward.
+        let mut m = Mixer::new();
+        m.channel_state_mut(0).pan = 0;
+        m.note_on(0, 60, 100, voice(0.5, 1024)); // struck pedal-up
+        m.set_soft_pedal(0, 127); // pedal down AFTER
+        let mut ls = vec![0.0f32; 16];
+        let mut rs = vec![0.0f32; 16];
+        m.mix_stereo(&mut ls, &mut rs);
+
+        let mut m2 = Mixer::new();
+        m2.channel_state_mut(0).pan = 0;
+        m2.note_on(0, 60, 100, voice(0.5, 1024));
+        let mut lf = vec![0.0f32; 16];
+        let mut rf = vec![0.0f32; 16];
+        m2.mix_stereo(&mut lf, &mut rf);
+        assert!(
+            (ls[0] - lf[0]).abs() < 1e-6,
+            "already-sounding note must keep full gain ({} vs {})",
+            ls[0],
+            lf[0],
+        );
+    }
+
+    #[test]
+    fn reset_all_controllers_clears_soft_pedal() {
+        let mut m = Mixer::new();
+        m.set_soft_pedal(0, 127);
+        assert!(m.channel_state_mut(0).soft_pedal);
+        m.reset_all_controllers(0);
+        assert!(!m.channel_state_mut(0).soft_pedal, "RAC lifts soft pedal");
     }
 
     #[test]

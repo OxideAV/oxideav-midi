@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 378 — synth Soft Pedal (CC 67, una corda)
+
+- New `Mixer::set_soft_pedal(channel, value)` models CC 67: a note struck
+  while the pedal is down renders at the `SOFT_PEDAL_GAIN` (≈ −3.5 dB)
+  *una corda* attenuation, captured per-voice at note-on (new `VoiceSlot::
+  note_gain` folded into the mix-time gain alongside Volume × Expression).
+  Notes already sounding when the pedal moves are unaffected — the pedal
+  shifts the action for the next strike, not the current vibration. Reset
+  All Controllers clears it (RP-015 resets the pedals). The scheduler
+  routes CC 67. 3 new tests (struck-while-down attenuation, already-
+  sounding immunity, RAC clear).
+- Provenance: `docs/audio/midi/midi-1.0/Control-Change-Messages-Data-Bytes.pdf`
+  (CC 67 = Soft Pedal On/Off).
+
 ### Round 378 — synth Sostenuto Pedal (CC 66)
 
 - New `Mixer::set_sostenuto(channel, value)` models the Sostenuto pedal
