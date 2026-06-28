@@ -273,6 +273,8 @@ impl Scheduler {
                 6 => mixer.set_data_entry(channel, value, true), // RPN data MSB
                 7 => mixer.channel_state_mut(channel).volume = value,
                 10 => mixer.channel_state_mut(channel).pan = value,
+                11 => mixer.channel_state_mut(channel).expression = value, // CC 11 — Expression
+
                 38 => mixer.set_data_entry(channel, value, false), // RPN data LSB
                 64 => mixer.set_sustain(channel, value),
                 74 => mixer.set_timbre(channel, value), // MPE "third dimension" (CC #74)

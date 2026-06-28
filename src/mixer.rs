@@ -96,6 +96,13 @@ pub struct ChannelState {
     pub program: u8,
     /// CC 7 (Channel Volume), 0..=127. Default 100 per GM.
     pub volume: u8,
+    /// CC 11 (Expression Controller), 0..=127. Default 127 (= full /
+    /// "no attenuation"). The MIDI 1.0 spec defines Expression as a
+    /// *percentage of Channel Volume*: the audible gain is
+    /// `volume × expression / 127²`, so Expression lets a sequence
+    /// shape dynamics inside the headroom Volume reserves. RP-015's
+    /// Reset All Controllers restores it to 127.
+    pub expression: u8,
     /// CC 10 (Pan), 0..=127. 64 = centre. Default 64.
     pub pan: u8,
     /// CC 64 (Sustain Pedal). `true` while the pedal is depressed
@@ -166,6 +173,7 @@ impl Default for ChannelState {
         Self {
             program: 0,
             volume: 100,
+            expression: 127,
             pan: 64,
             sustain: false,
             pitch_bend: 0x2000,
@@ -1962,7 +1970,11 @@ impl Mixer {
             // Per-channel volume / pan + universal master volume +
             // master balance (master state hoisted out of the loop).
             let st = self.channels[slot.channel as usize % NUM_CHANNELS];
-            let vol = st.volume as f32 / 127.0;
+            // CC 7 (Channel Volume) × CC 11 (Expression). Expression is a
+            // percentage of Channel Volume (MIDI 1.0 Control Change table),
+            // so the two multiply: a full-Volume channel still dips with
+            // Expression, and Expression at 127 is transparent.
+            let vol = (st.volume as f32 / 127.0) * (st.expression as f32 / 127.0);
             // Constant-power pan: θ in [0, π/2], left = cos(θ), right = sin(θ).
             let pan_norm = (st.pan as f32 / 127.0).clamp(0.0, 1.0);
             let theta = pan_norm * std::f32::consts::FRAC_PI_2;
@@ -2209,6 +2221,60 @@ mod tests {
             "L/R ratio {} too far from unity at pan=64",
             ratio,
         );
+    }
+
+    #[test]
+    fn expression_scales_channel_volume_multiplicatively() {
+        // Two channels, identical voice + volume; channel 1 at half
+        // Expression should render ~half the amplitude of channel 0 at
+        // full Expression. Expression is a percentage of Channel Volume,
+        // so the gains multiply.
+        let mut m = Mixer::new();
+        // Hard-left pan on both so we read the left channel cleanly
+        // without the constant-power pan factor muddying the ratio.
+        m.channel_state_mut(0).pan = 0;
+        m.channel_state_mut(1).pan = 0;
+        m.channel_state_mut(0).expression = 127; // transparent
+        m.channel_state_mut(1).expression = 64; // ~half
+        m.note_on(0, 60, 100, voice(0.5, 64));
+        let mut l0 = vec![0.0f32; 16];
+        let mut r0 = vec![0.0f32; 16];
+        m.mix_stereo(&mut l0, &mut r0);
+        let mut m2 = Mixer::new();
+        m2.channel_state_mut(0).pan = 0;
+        m2.channel_state_mut(0).expression = 64;
+        m2.note_on(0, 60, 100, voice(0.5, 64));
+        let mut l1 = vec![0.0f32; 16];
+        let mut r1 = vec![0.0f32; 16];
+        m2.mix_stereo(&mut l1, &mut r1);
+        // l1 should be (64/127) of l0.
+        let expected = l0[0] * (64.0 / 127.0);
+        assert!(
+            (l1[0] - expected).abs() < 1e-5,
+            "expression-scaled {} != expected {}",
+            l1[0],
+            expected,
+        );
+    }
+
+    #[test]
+    fn expression_default_is_transparent() {
+        // A fresh channel defaults Expression to 127, so it must render
+        // identically to one with Expression explicitly set to 127.
+        let mut m = Mixer::new();
+        m.channel_state_mut(0).pan = 0;
+        m.note_on(0, 60, 100, voice(0.5, 64));
+        let mut la = vec![0.0f32; 16];
+        let mut ra = vec![0.0f32; 16];
+        m.mix_stereo(&mut la, &mut ra);
+        let mut m2 = Mixer::new();
+        m2.channel_state_mut(0).pan = 0;
+        m2.channel_state_mut(0).expression = 127;
+        m2.note_on(0, 60, 100, voice(0.5, 64));
+        let mut lb = vec![0.0f32; 16];
+        let mut rb = vec![0.0f32; 16];
+        m2.mix_stereo(&mut lb, &mut rb);
+        assert_eq!(la[0], lb[0]);
     }
 
     #[test]

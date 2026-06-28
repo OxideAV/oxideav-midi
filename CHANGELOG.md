@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 378 — synth CC 11 Expression Controller
+
+- The mixer now tracks **CC 11 (Expression Controller)** per channel and
+  folds it into the mix-time gain. Expression is a *percentage of Channel
+  Volume* per the MIDI 1.0 Control Change table, so the two multiply
+  (`volume × expression / 127²`); a sequence can shape dynamics inside the
+  headroom Channel Volume reserves. `ChannelState::expression` defaults to
+  127 (transparent) so a score that never sends CC 11 renders identically
+  to the pre-Expression path. The scheduler routes CC 11 to the new field.
+  2 new mixer tests (multiplicative scaling vs. a half-Expression channel;
+  default-127 transparency).
+- Provenance: `docs/audio/midi/midi-1.0/Control-Change-Messages-Data-Bytes.pdf`
+  (CC 11 = Expression Controller).
+
 ### Round 374 — MMC LOCATE [TARGET] Standard Time decoder
 
 - New `MmcCommand::locate_target()` decodes the LOCATE [TARGET] command
