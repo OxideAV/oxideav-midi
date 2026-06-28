@@ -1103,6 +1103,57 @@ impl Mixer {
         }
     }
 
+    /// Reset All Controllers (Channel Mode message CC 121) for one
+    /// channel, per **RP-015 "Response to Reset All Controllers"**. The
+    /// recommended practice prescribes exactly which controllers move
+    /// and which are left untouched:
+    ///
+    ///   * **Reset:** Expression (CC 11) → 127; Modulation (CC 1) → 0;
+    ///     the Pedals (CC 64 Sustain, 65 Portamento, 66 Sostenuto,
+    ///     67 Soft) → 0; the RPN / NRPN selector LSB+MSB (CC 98–101) →
+    ///     null (0x3FFF); Pitch Bend → centre (0x2000); Channel Pressure
+    ///     → 0; Polyphonic Pressure on every sounding note → 0.
+    ///   * **Do NOT reset:** Bank Select, Channel Volume (CC 7), Pan
+    ///     (CC 10), Program, the Effect Controllers (CC 91–95), the
+    ///     Sound Controllers (CC 70–79), other channel-mode messages,
+    ///     and the *values* of registered / non-registered parameters
+    ///     (the pitch-bend range, channel fine / coarse tune, mod-depth
+    ///     range stay where they were — only the *selector* resets).
+    ///
+    /// Re-applies the now-centred bend / cleared mod-wheel / cleared
+    /// pressure to every held voice so the change is audible immediately,
+    /// and lifts the sustain pedal (releasing any voices it was holding).
+    pub fn reset_all_controllers(&mut self, channel: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        // Switch controllers + continuous controllers reset to their
+        // RP-015 ideal initial state. We touch the channel-state fields
+        // directly, then re-route the audible ones through their setters.
+        self.channels[ch].expression = 127;
+        self.channels[ch].mod_wheel = 0;
+        self.channels[ch].channel_pressure = 0;
+        self.channels[ch].rpn = 0x3FFF; // RPN/NRPN selector → null
+        self.channels[ch].pitch_bend = 0x2000; // centre
+
+        // Lift sustain (CC 64): a held pedal must release on RAC. Use the
+        // setter so any sustained voices actually fire their release.
+        if self.channels[ch].sustain {
+            self.set_sustain(channel, 0);
+        }
+        // Re-apply the centred bend to every held voice on this channel.
+        self.set_pitch_bend(channel, 0x2000);
+        // Clear mod-wheel depth on held voices.
+        self.reapply_mod_wheel_for_channel(channel);
+        // Clear channel + poly pressure on held voices.
+        self.set_channel_pressure(channel, 0);
+        for slot in self.slots.iter_mut() {
+            if slot.channel == channel {
+                if let Some(voice) = slot.voice.as_mut() {
+                    voice.set_pressure(0.0);
+                }
+            }
+        }
+    }
+
     /// Combine MPE Member + Manager channel pressures into a single
     /// 0..=1 pressure scalar. We pick the larger of the two per
     /// Appendix D's "implementor-defined combining" — taking the max
@@ -2275,6 +2326,74 @@ mod tests {
         let mut rb = vec![0.0f32; 16];
         m2.mix_stereo(&mut lb, &mut rb);
         assert_eq!(la[0], lb[0]);
+    }
+
+    #[test]
+    fn reset_all_controllers_restores_rp015_state() {
+        let mut m = Mixer::new();
+        // Drive a channel away from its initial state across every
+        // controller RP-015 touches + a couple it must NOT touch.
+        m.channel_state_mut(0).expression = 40;
+        m.channel_state_mut(0).mod_wheel = 90;
+        m.channel_state_mut(0).channel_pressure = 70;
+        m.channel_state_mut(0).pitch_bend = 0x3000;
+        m.channel_state_mut(0).rpn = 0; // a selected RPN
+        m.set_sustain(0, 127); // pedal down
+                               // Things RP-015 must preserve:
+        m.channel_state_mut(0).volume = 50;
+        m.channel_state_mut(0).pan = 20;
+        m.channel_state_mut(0).program = 12;
+        m.channel_state_mut(0).reverb_send = 80;
+        m.channel_state_mut(0).pitch_bend_range_cents = 1200; // RPN-0 *value*
+
+        m.reset_all_controllers(0);
+        let st = *m.channel_state_mut(0);
+        // Reset:
+        assert_eq!(st.expression, 127, "expression → 127");
+        assert_eq!(st.mod_wheel, 0, "mod wheel → 0");
+        assert_eq!(st.channel_pressure, 0, "channel pressure → 0");
+        assert_eq!(st.pitch_bend, 0x2000, "pitch bend → centre");
+        assert_eq!(st.rpn, 0x3FFF, "RPN/NRPN selector → null");
+        assert!(!st.sustain, "sustain pedal lifted");
+        // Preserved:
+        assert_eq!(st.volume, 50, "volume preserved");
+        assert_eq!(st.pan, 20, "pan preserved");
+        assert_eq!(st.program, 12, "program preserved");
+        assert_eq!(st.reverb_send, 80, "reverb send preserved");
+        assert_eq!(
+            st.pitch_bend_range_cents, 1200,
+            "RPN value (bend range) preserved — only the selector resets",
+        );
+    }
+
+    #[test]
+    fn reset_all_controllers_lifts_sustain_and_releases_voices() {
+        let mut m = Mixer::new();
+        m.set_sustain(0, 127); // pedal down
+        m.note_on(0, 60, 100, voice(0.5, 1024));
+        m.note_off(0, 60); // held by sustain
+        let mut l = vec![0.0f32; 16];
+        let mut r = vec![0.0f32; 16];
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 1, "voice held by sustain");
+        m.reset_all_controllers(0); // RP-015 lifts the pedal
+        let _ = m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 0, "RAC released the sustained voice");
+    }
+
+    #[test]
+    fn reset_all_controllers_recenters_held_voice_bend() {
+        let mut m = Mixer::new();
+        let (v, bend, _press) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        m.set_pitch_bend(0, 0x3000); // bend up
+        assert_ne!(*bend.lock().unwrap(), 0, "voice picked up the bend");
+        m.reset_all_controllers(0);
+        assert_eq!(
+            *bend.lock().unwrap(),
+            0,
+            "RAC recentred the bend on the held voice",
+        );
     }
 
     #[test]

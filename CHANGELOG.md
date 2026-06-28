@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 378 — synth Reset All Controllers (CC 121, RP-015)
+
+- New `Mixer::reset_all_controllers(channel)` implements the RP-015
+  "Response to Reset All Controllers" recommended practice exactly: it
+  resets Expression (→ 127), Modulation (→ 0), the Pedals (Sustain /
+  Portamento / Sostenuto / Soft → 0), the RPN/NRPN selector (→ null),
+  Pitch Bend (→ centre), and Channel + Polyphonic Pressure (→ 0), while
+  leaving Bank Select, Channel Volume, Pan, Program, the Effect
+  Controllers, the Sound Controllers, and the *values* of registered /
+  non-registered parameters untouched. Lifting Sustain fires the release
+  on any voices the pedal was holding, and the centred bend / cleared
+  mod-wheel / cleared pressure re-apply to every held voice immediately.
+  The scheduler routes CC 121 to it. 3 new tests (full RP-015 reset +
+  preserve list, sustain-release, held-voice bend recentre).
+- Provenance: `docs/audio/midi/recommended-practices/rp15.pdf` (RP-015).
+
 ### Round 378 — synth CC 11 Expression Controller
 
 - The mixer now tracks **CC 11 (Expression Controller)** per channel and

@@ -288,6 +288,7 @@ impl Scheduler {
                     // CC 120 = All Sound Off, CC 123 = All Notes Off.
                     mixer.all_notes_off();
                 }
+                121 => mixer.reset_all_controllers(channel), // CC 121 — Reset All Controllers (RP-015)
                 _ => { /* other CCs not modelled */ }
             },
             ChannelBody::PolyAftertouch { key, pressure } => {
