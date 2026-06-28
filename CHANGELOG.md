@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 378 — synth Sostenuto Pedal (CC 66)
+
+- New `Mixer::set_sostenuto(channel, value)` models the Sostenuto pedal
+  per the MIDI 1.0 Control Change table: on press it **captures** only the
+  notes that are still sounding at that instant; a later NoteOff on a
+  captured voice defers its release until the pedal lifts, while notes
+  started *after* the press are unaffected. Sostenuto and Sustain (CC 64)
+  hold independently — a deferred voice releases only when **both** pedals
+  are up, via the shared `release_deferred_voices` re-evaluation. The
+  `VoiceSlot` gains a `sostenuto_captured` flag and a `released` marker
+  (still-held vs. release-tail). Reset All Controllers and `all_notes_off`
+  clear the new state; the scheduler routes CC 66. 4 new tests (capture
+  semantics, post-press exclusion, still-held survival across lift, and
+  Sustain+Sostenuto independence).
+- Provenance: `docs/audio/midi/midi-1.0/Control-Change-Messages-Data-Bytes.pdf`
+  (CC 66 = Sostenuto On/Off).
+
 ### Round 378 — synth Reset All Controllers (CC 121, RP-015)
 
 - New `Mixer::reset_all_controllers(channel)` implements the RP-015

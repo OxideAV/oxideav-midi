@@ -66,6 +66,18 @@ struct VoiceSlot {
     /// `true` once a `NoteOff` arrived but the channel sustain pedal
     /// (CC 64) was held — release is deferred until the pedal lifts.
     sustained: bool,
+    /// `true` when the Sostenuto pedal (CC 66) was depressed *while this
+    /// voice was already sounding*. Per the MIDI 1.0 Control Change
+    /// table, Sostenuto holds only the notes that were down at the moment
+    /// the pedal went on; a NoteOff on such a voice defers release until
+    /// the pedal lifts (independent of CC 64). Notes started after the
+    /// pedal is down are never captured.
+    sostenuto_captured: bool,
+    /// `true` once the voice has been told to `release()` (its NoteOff
+    /// has been honoured). Distinguishes a still-held note from one
+    /// running through its release tail — Sostenuto only captures
+    /// still-held notes.
+    released: bool,
     /// Monotonic allocation counter — smallest = oldest.
     age: u64,
     /// Per-voice gain folded in from velocity (already applied inside
@@ -80,6 +92,8 @@ impl VoiceSlot {
             channel: 0,
             key: 0,
             sustained: false,
+            sostenuto_captured: false,
+            released: false,
             age: 0,
             velocity_norm: 0.0,
         }
@@ -108,6 +122,12 @@ pub struct ChannelState {
     /// CC 64 (Sustain Pedal). `true` while the pedal is depressed
     /// (value >= 64); the mixer holds note-offs until it lifts.
     pub sustain: bool,
+    /// CC 66 (Sostenuto Pedal). `true` while the pedal is depressed
+    /// (value >= 64). Unlike Sustain, Sostenuto only holds notes that
+    /// were *already sounding* when the pedal went down (the captured
+    /// set is tracked per-voice on the slot, not here); this flag just
+    /// records the pedal position for `note_off` to consult.
+    pub sostenuto: bool,
     /// Live pitch-bend value as the raw 14-bit MIDI scalar
     /// (`0..=16383`). Centre is `0x2000`. Map to cents via
     /// `(value - 0x2000) * pitch_bend_range_cents / 8192`.
@@ -176,6 +196,7 @@ impl Default for ChannelState {
             expression: 127,
             pan: 64,
             sustain: false,
+            sostenuto: false,
             pitch_bend: 0x2000,
             pitch_bend_range_cents: 200,
             channel_pressure: 0,
@@ -1134,8 +1155,12 @@ impl Mixer {
         self.channels[ch].rpn = 0x3FFF; // RPN/NRPN selector → null
         self.channels[ch].pitch_bend = 0x2000; // centre
 
-        // Lift sustain (CC 64): a held pedal must release on RAC. Use the
-        // setter so any sustained voices actually fire their release.
+        // Lift the Sostenuto pedal first (CC 66), then Sustain (CC 64):
+        // a held pedal must release on RAC. Using the setters runs the
+        // deferred-release re-evaluation so any held voices fire.
+        if self.channels[ch].sostenuto {
+            self.set_sostenuto(channel, 0);
+        }
         if self.channels[ch].sustain {
             self.set_sustain(channel, 0);
         }
@@ -1797,14 +1822,74 @@ impl Mixer {
         let now = value >= 64;
         self.channels[ch].sustain = now;
         if was && !now {
-            // Pedal lifted — release every voice on this channel whose
-            // note-off was being held by sustain.
+            // Pedal lifted — re-evaluate every deferred voice on the
+            // channel. A voice still captured by an active Sostenuto
+            // pedal stays held (the two pedals hold independently).
+            self.release_deferred_voices(channel);
+        }
+    }
+
+    /// Release every voice on `channel` whose NoteOff has arrived
+    /// (`sustained == true`) but is no longer held by either pedal: the
+    /// Sustain pedal must be up AND the voice must not be captured by a
+    /// currently-down Sostenuto pedal. Called after either pedal lifts.
+    fn release_deferred_voices(&mut self, channel: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let sustain = self.channels[ch].sustain;
+        let sostenuto = self.channels[ch].sostenuto;
+        for slot in self.slots.iter_mut() {
+            if slot.channel != channel || !slot.sustained {
+                continue;
+            }
+            let held_by_sostenuto = sostenuto && slot.sostenuto_captured;
+            if sustain || held_by_sostenuto {
+                continue; // still held by a pedal
+            }
+            if let Some(v) = slot.voice.as_mut() {
+                v.release();
+            }
+            slot.sustained = false;
+            slot.sostenuto_captured = false;
+            slot.released = true;
+        }
+    }
+
+    /// Apply CC 66 (Sostenuto pedal). On press (value ≥ 64) the pedal
+    /// **captures** every voice on `channel` that is currently still
+    /// sounding (note held, not yet released): those voices' note-offs
+    /// are deferred until the pedal lifts, exactly like Sustain but
+    /// scoped to the notes down at press time. Notes started afterward
+    /// are not captured. On lift (value < 64) every captured voice whose
+    /// note-off has since arrived is released; voices still held by their
+    /// own NoteOn (or by the Sustain pedal) keep sounding.
+    pub fn set_sostenuto(&mut self, channel: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let was = self.channels[ch].sostenuto;
+        let now = value >= 64;
+        self.channels[ch].sostenuto = now;
+        if !was && now {
+            // Pedal pressed — capture currently-held voices on the
+            // channel (still sounding, NoteOff not yet received).
             for slot in self.slots.iter_mut() {
-                if slot.channel == channel && slot.sustained {
-                    if let Some(v) = slot.voice.as_mut() {
-                        v.release();
-                    }
-                    slot.sustained = false;
+                if slot.channel == channel
+                    && slot.voice.is_some()
+                    && !slot.released
+                    && !slot.sustained
+                {
+                    slot.sostenuto_captured = true;
+                }
+            }
+        } else if was && !now {
+            // Pedal lifted — release captured voices whose NoteOff
+            // arrived while the pedal was down (unless the Sustain pedal
+            // is now holding them). The shared helper re-evaluates both
+            // pedals; it also clears `sostenuto_captured` on the voices
+            // it releases. Captured voices whose NoteOff has NOT yet
+            // arrived keep sounding and simply lose their capture flag.
+            self.release_deferred_voices(channel);
+            for slot in self.slots.iter_mut() {
+                if slot.channel == channel {
+                    slot.sostenuto_captured = false;
                 }
             }
         }
@@ -1926,24 +2011,34 @@ impl Mixer {
             channel,
             key,
             sustained: false,
+            // A note started while the Sostenuto pedal is already down is
+            // NOT captured — Sostenuto only holds notes that were down at
+            // pedal-press time.
+            sostenuto_captured: false,
+            released: false,
             age,
             velocity_norm: (velocity as f32 / 127.0).clamp(0.0, 1.0),
         };
     }
 
     /// Trigger release on every slot matching `(channel, key)` that
-    /// hasn't already been released. If sustain is held on the channel,
-    /// the slot is marked `sustained` and its release is deferred until
-    /// the pedal lifts.
+    /// hasn't already been released. The release is **deferred** (the
+    /// slot's `sustained` flag is set as the defer marker) when either
+    /// the Sustain pedal (CC 64) is held on the channel *or* the voice
+    /// was captured by the Sostenuto pedal (CC 66); otherwise the
+    /// voice's release fires immediately. Sustain and Sostenuto hold
+    /// independently — the pedal that releases last owns the actual
+    /// `release()`.
     pub fn note_off(&mut self, channel: u8, key: u8) {
         let sustain = self.channels[channel as usize % NUM_CHANNELS].sustain;
         for slot in self.slots.iter_mut() {
             if slot.channel == channel && slot.key == key {
                 if let Some(v) = slot.voice.as_mut() {
-                    if sustain {
+                    if sustain || slot.sostenuto_captured {
                         slot.sustained = true;
                     } else {
                         v.release();
+                        slot.released = true;
                     }
                 }
             }
@@ -1956,6 +2051,8 @@ impl Mixer {
         for slot in self.slots.iter_mut() {
             slot.voice = None;
             slot.sustained = false;
+            slot.sostenuto_captured = false;
+            slot.released = false;
         }
     }
 
@@ -2456,6 +2553,80 @@ mod tests {
         // Voice is still alive — sustained.
         assert_eq!(m.live_voice_count(), 1);
         m.set_sustain(0, 0); // pedal up — fires release
+        let _ = m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 0);
+    }
+
+    #[test]
+    fn sostenuto_holds_notes_down_at_press_time() {
+        let mut m = Mixer::new();
+        m.note_on(0, 60, 100, voice(0.5, 1024)); // note already down
+        m.set_sostenuto(0, 127); // pedal captures it
+        m.note_off(0, 60); // would-be release, deferred
+        let mut l = vec![0.0f32; 16];
+        let mut r = vec![0.0f32; 16];
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 1, "captured note still sounding");
+        m.set_sostenuto(0, 0); // pedal up — release
+        let _ = m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 0, "sostenuto-lift released it");
+    }
+
+    #[test]
+    fn sostenuto_does_not_capture_notes_started_after_press() {
+        let mut m = Mixer::new();
+        m.set_sostenuto(0, 127); // pedal down first
+        m.note_on(0, 60, 100, voice(0.5, 1024)); // started AFTER press
+        m.note_off(0, 60); // not captured → releases immediately
+        let mut l = vec![0.0f32; 16];
+        let mut r = vec![0.0f32; 16];
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(
+            m.live_voice_count(),
+            0,
+            "note started after pedal-press is not held by sostenuto",
+        );
+    }
+
+    #[test]
+    fn sostenuto_lift_keeps_still_held_notes() {
+        // A captured note whose NoteOff hasn't arrived must keep sounding
+        // after the pedal lifts (it loses capture but its own NoteOn
+        // still holds it).
+        let mut m = Mixer::new();
+        m.note_on(0, 60, 100, voice(0.5, 1024));
+        m.set_sostenuto(0, 127); // capture
+        m.set_sostenuto(0, 0); // lift before any NoteOff
+        let mut l = vec![0.0f32; 16];
+        let mut r = vec![0.0f32; 16];
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 1, "still-held note survives lift");
+        m.note_off(0, 60); // now release normally
+        let _ = m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 0);
+    }
+
+    #[test]
+    fn sustain_and_sostenuto_hold_independently() {
+        // Both pedals down, NoteOff arrives. Lifting Sostenuto must NOT
+        // release while Sustain still holds; lifting Sustain then does.
+        let mut m = Mixer::new();
+        m.note_on(0, 60, 100, voice(0.5, 1024));
+        m.set_sostenuto(0, 127); // capture
+        m.set_sustain(0, 127); // sustain too
+        m.note_off(0, 60); // deferred by both
+        let mut l = vec![0.0f32; 16];
+        let mut r = vec![0.0f32; 16];
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 1);
+        m.set_sostenuto(0, 0); // sostenuto up — sustain still holds
+        let _ = m.mix_stereo(&mut l, &mut r);
+        assert_eq!(
+            m.live_voice_count(),
+            1,
+            "sustain still holds after sostenuto lifts",
+        );
+        m.set_sustain(0, 0); // sustain up — now release
         let _ = m.mix_stereo(&mut l, &mut r);
         assert_eq!(m.live_voice_count(), 0);
     }
