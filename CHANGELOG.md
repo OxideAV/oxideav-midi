@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 378 — synth Portamento (CC 5 / 65 / 84)
+
+- The mixer now performs portamento pitch glides. `set_portamento` (CC 65
+  on/off), `set_portamento_time` (CC 5), and `set_portamento_control`
+  (CC 84) track the per-channel glide state; a note struck with portamento
+  active starts displaced by `(from_key − target_key) × 100` cents and
+  glides linearly to the target over a CC 5-controlled span
+  (`PORTAMENTO_MAX_MS` at CC 5 = 127), advanced per rendered block by
+  `advance_portamento` and summed with the live channel bend / tuning via
+  `reapply_pitch_for_slot`. The glide **source** is the pending CC 84
+  Portamento Control key (always glides, ignoring CC 65, and resets after
+  one note-on per the MIDI 1.0 spec) or, when CC 65 is on, the channel's
+  previously-played key. Drum channel (10) never glides; CC 5 = 0 or a
+  same-key repeat is instantaneous. Reset All Controllers clears the CC 65
+  switch + pending CC 84 source. Scheduler routes CC 5 / 65 / 84. 5 new
+  tests (off = no glide, on glides from previous note with a mid-trajectory
+  + settle check, CC 84 glides ignoring on/off, CC 84 one-note reset, zero
+  time = instant). The exact CC 5 → glide-time curve is implementation-
+  defined per the spec; the chosen linear ms map is documented on
+  `PORTAMENTO_MAX_MS`.
+- Provenance: `docs/audio/midi/midi-1.0/M1_v4-2-1_MIDI_1-0_Detailed_Specification_96-1-4.pdf`
+  §"PORTAMENTO CONTROLLER" + `Control-Change-Messages-Data-Bytes.pdf`
+  (CC 5 / 65 / 84).
+
 ### Round 378 — synth All Sound Off / All Notes Off split (CC 120/123-127)
 
 - The scheduler previously conflated CC 120 (All Sound Off) and CC 123

@@ -61,6 +61,17 @@ pub const NUM_CHANNELS: usize = 16;
 /// are unaffected.
 pub const SOFT_PEDAL_GAIN: f32 = 0.667;
 
+/// Maximum portamento glide span, in milliseconds, mapped from CC 5 =
+/// 127. The MIDI 1.0 spec leaves the Portamento-Time curve
+/// implementation-defined ("at the rate set by the portamento time
+/// controller"); the mixer uses a simple linear map
+/// `time_ms = CC5 / 127 × PORTAMENTO_MAX_MS`, so CC 5 = 0 glides
+/// instantaneously and CC 5 = 127 takes a full second. The glide
+/// duration is independent of the interval — a per-semitone *rate*
+/// would also be spec-compliant, but a fixed span is the more common
+/// musical behaviour and keeps the mapping monotonic in CC 5.
+pub const PORTAMENTO_MAX_MS: f32 = 1000.0;
+
 /// One slot in the voice pool.
 struct VoiceSlot {
     /// The active voice, or `None` if the slot is free.
@@ -98,6 +109,18 @@ struct VoiceSlot {
     /// down. Because it is captured once at note-on it never changes a
     /// note already sounding.
     note_gain: f32,
+    /// Portamento (CC 5 / 65 / 84) glide state. When a note is struck
+    /// with portamento active, its pitch starts displaced by
+    /// `glide_offset_cents` (= `(from_key − to_key) × 100`) and the
+    /// offset is driven linearly toward 0 over `glide_total_samples`,
+    /// `glide_remaining_samples` counting down each rendered block. The
+    /// offset is summed with the channel pitch-bend / tuning each block
+    /// so the glide and a live bend coexist. `glide_remaining_samples ==
+    /// 0` means no active glide (the offset is held at its final value,
+    /// normally 0).
+    glide_offset_cents: f32,
+    glide_step_cents_per_sample: f32,
+    glide_remaining_samples: u32,
 }
 
 impl VoiceSlot {
@@ -112,6 +135,9 @@ impl VoiceSlot {
             age: 0,
             velocity_norm: 0.0,
             note_gain: 1.0,
+            glide_offset_cents: 0.0,
+            glide_step_cents_per_sample: 0.0,
+            glide_remaining_samples: 0,
         }
     }
 }
@@ -151,6 +177,24 @@ pub struct ChannelState {
     /// Notes already sounding are unaffected — the attenuation is captured
     /// per-voice at note-on, so this flag only gates the capture.
     pub soft_pedal: bool,
+    /// CC 65 (Portamento On/Off). `true` while ≥ 64. When on, a new
+    /// note-on glides its pitch from the previously-played note on the
+    /// channel ([`Self::portamento_last_key`]) to the new note's pitch
+    /// over the [`Self::portamento_time`]-controlled duration.
+    pub portamento_on: bool,
+    /// CC 5 (Portamento Time), 0..=127. Controls the glide duration; the
+    /// MIDI 1.0 spec leaves the exact curve implementation-defined, so the
+    /// mixer maps it to a millisecond span (see `PORTAMENTO_MAX_MS`).
+    /// Default 0 (instantaneous).
+    pub portamento_time: u8,
+    /// The MIDI key of the most recent note-on on this channel, used as
+    /// the glide *source* when CC 65 is on. `None` until the first note.
+    pub portamento_last_key: Option<u8>,
+    /// Pending CC 84 (Portamento Control) source key. Set by a CC 84
+    /// message and consumed by the *next* note-on (which then glides from
+    /// this key regardless of CC 65, per the MIDI 1.0 spec), after which
+    /// it resets to `None`.
+    pub portamento_ctrl_source: Option<u8>,
     /// Live pitch-bend value as the raw 14-bit MIDI scalar
     /// (`0..=16383`). Centre is `0x2000`. Map to cents via
     /// `(value - 0x2000) * pitch_bend_range_cents / 8192`.
@@ -221,6 +265,10 @@ impl Default for ChannelState {
             sustain: false,
             sostenuto: false,
             soft_pedal: false,
+            portamento_on: false,
+            portamento_time: 0,
+            portamento_last_key: None,
+            portamento_ctrl_source: None,
             pitch_bend: 0x2000,
             pitch_bend_range_cents: 200,
             channel_pressure: 0,
@@ -1191,6 +1239,13 @@ impl Mixer {
             self.set_sustain(channel, 0);
         }
         self.channels[ch].soft_pedal = false;
+        // Portamento pedal (CC 65) is in RP-015's pedal-reset list. Clear
+        // the on/off switch and the pending CC 84 control source; leave
+        // the CC 5 time and the last-played key (not controllers RP-015
+        // enumerates, and the last key is glide-source bookkeeping, not a
+        // controller value).
+        self.channels[ch].portamento_on = false;
+        self.channels[ch].portamento_ctrl_source = None;
         // Re-apply the centred bend to every held voice on this channel.
         self.set_pitch_bend(channel, 0x2000);
         // Clear mod-wheel depth on held voices.
@@ -1934,6 +1989,125 @@ impl Mixer {
         self.channels[ch].soft_pedal = value >= 64;
     }
 
+    /// Apply CC 65 (Portamento On/Off). When on (value ≥ 64) a new
+    /// note-on glides from the channel's previously-played note; the
+    /// glide source / time live on the channel state and are consumed at
+    /// note-on.
+    pub fn set_portamento(&mut self, channel: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].portamento_on = value >= 64;
+    }
+
+    /// Apply CC 5 (Portamento Time). Stored raw on the channel; mapped to
+    /// a glide span at note-on via [`PORTAMENTO_MAX_MS`].
+    pub fn set_portamento_time(&mut self, channel: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].portamento_time = value & 0x7F;
+    }
+
+    /// Apply CC 84 (Portamento Control). Sets the explicit glide *source*
+    /// key for the **next** note-on on this channel (consumed and reset
+    /// after that note, per the MIDI 1.0 spec). A note following CC 84
+    /// glides from `source` regardless of the CC 65 on/off state.
+    pub fn set_portamento_control(&mut self, channel: u8, source_key: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].portamento_ctrl_source = Some(source_key & 0x7F);
+    }
+
+    /// Compute the glide setup for a note-on at `target_key` on `ch`,
+    /// returning `(offset_cents, total_samples)` when a glide should run
+    /// or `None` for an immediate (non-gliding) attack. Consumes the
+    /// pending CC 84 source and updates the last-played key. The glide
+    /// source is, in priority order: the pending CC 84 control source
+    /// (always glides, ignoring CC 65), else — when CC 65 is on — the
+    /// previously-played key on the channel.
+    fn portamento_glide_for(&mut self, ch: usize, target_key: u8) -> Option<(f32, u32)> {
+        let st = &mut self.channels[ch];
+        let from_key = if let Some(src) = st.portamento_ctrl_source.take() {
+            // CC 84: glide from the explicit source, ignoring CC 65.
+            Some(src)
+        } else if st.portamento_on {
+            st.portamento_last_key
+        } else {
+            None
+        };
+        let time = st.portamento_time;
+        // Record this note as the source for the next glide.
+        st.portamento_last_key = Some(target_key);
+        let from = from_key?;
+        if from == target_key || time == 0 {
+            // Same key or zero time → nothing to glide.
+            return None;
+        }
+        let offset_cents = (from as f32 - target_key as f32) * 100.0;
+        let ms = (time as f32 / 127.0) * PORTAMENTO_MAX_MS;
+        let total_samples = ((ms / 1000.0) * self.sample_rate as f32).round() as u32;
+        if total_samples == 0 {
+            return None;
+        }
+        Some((offset_cents, total_samples))
+    }
+
+    /// Advance every active portamento glide by `block_samples` rendered
+    /// samples, re-applying the combined (channel bend/tune + glide)
+    /// pitch to each gliding voice. Called once per `mix_stereo` block.
+    fn advance_portamento(&mut self, block_samples: u32) {
+        if block_samples == 0 {
+            return;
+        }
+        for idx in 0..self.slots.len() {
+            if self.slots[idx].glide_remaining_samples == 0 {
+                continue;
+            }
+            let step = self.slots[idx].glide_step_cents_per_sample;
+            let advanced = block_samples.min(self.slots[idx].glide_remaining_samples);
+            let slot = &mut self.slots[idx];
+            slot.glide_remaining_samples -= advanced;
+            if slot.glide_remaining_samples == 0 {
+                slot.glide_offset_cents = 0.0; // settled exactly on target
+            } else {
+                slot.glide_offset_cents += step * advanced as f32;
+            }
+            self.reapply_pitch_for_slot(idx);
+        }
+    }
+
+    /// Recompute and push the combined pitch (channel bend + tuning +
+    /// this slot's glide offset) to one slot's voice. Mirrors the
+    /// note-on composition so a gliding voice tracks live bend changes.
+    fn reapply_pitch_for_slot(&mut self, idx: usize) {
+        let (channel, key, glide) = {
+            let s = &self.slots[idx];
+            (s.channel, s.key, s.glide_offset_cents)
+        };
+        let ch = channel as usize % NUM_CHANNELS;
+        let st = self.channels[ch];
+        let is_drum = ch == 9;
+        let mut cents = Self::compose_pitch_cents(
+            &st,
+            st.pitch_bend,
+            st.pitch_bend_range_cents,
+            self.master_fine_tune_cents,
+            self.master_coarse_tune_semitones,
+            is_drum,
+        );
+        if let MpeRole::Member(zone_kind) = st.mpe_role {
+            let mgr = match zone_kind {
+                MpeZoneKind::Lower => 0,
+                MpeZoneKind::Upper => 15,
+            };
+            let mgr_state = self.channels[mgr];
+            cents += pitch_bend_to_cents(mgr_state.pitch_bend, mgr_state.pitch_bend_range_cents);
+        }
+        if !is_drum {
+            cents += self.tuning.offset_cents(channel, key).round() as i32;
+        }
+        cents += glide.round() as i32;
+        if let Some(v) = self.slots[idx].voice.as_mut() {
+            v.set_pitch_bend_cents(cents);
+        }
+    }
+
     /// Allocate a voice slot. If the pool is full, preempt the oldest
     /// slot (smallest `age`). Returns the index of the chosen slot.
     fn pick_slot(&mut self) -> usize {
@@ -1982,6 +2156,7 @@ impl Mixer {
                         if v.exclusive_class() == new_class {
                             slot.voice = None;
                             slot.sustained = false;
+                            slot.glide_remaining_samples = 0;
                         }
                     }
                 }
@@ -2018,8 +2193,26 @@ impl Mixer {
         if !is_drum {
             cents += self.tuning.offset_cents(channel, key).round() as i32;
         }
-        if cents != 0 {
-            voice.set_pitch_bend_cents(cents);
+        // Portamento (CC 5 / 65 / 84): compute the glide for this note-on
+        // (also updates the channel's last-played key + consumes a pending
+        // CC 84 source). Drum channels never glide — a drum key is a
+        // distinct sound, not a pitch. When a glide is set up the voice
+        // starts displaced by `glide_offset` and `advance_portamento`
+        // drives it toward the target each rendered block.
+        let glide = if is_drum {
+            self.channels[ch].portamento_last_key = Some(key);
+            self.channels[ch].portamento_ctrl_source = None;
+            None
+        } else {
+            self.portamento_glide_for(ch, key)
+        };
+        let (glide_offset_cents, glide_step, glide_remaining) = match glide {
+            Some((offset, total)) => (offset, -offset / total as f32, total),
+            None => (0.0, 0.0, 0),
+        };
+        let initial_cents = cents + glide_offset_cents.round() as i32;
+        if initial_cents != 0 {
+            voice.set_pitch_bend_cents(initial_cents);
         }
         // Compose Member + Manager channel pressure for MPE; otherwise
         // just hand the channel's value through.
@@ -2060,6 +2253,9 @@ impl Mixer {
             // Soft Pedal (CC 67): a note struck while the pedal is down is
             // attenuated; one struck with it up renders at unity.
             note_gain: if st.soft_pedal { SOFT_PEDAL_GAIN } else { 1.0 },
+            glide_offset_cents,
+            glide_step_cents_per_sample: glide_step,
+            glide_remaining_samples: glide_remaining,
         };
     }
 
@@ -2095,6 +2291,7 @@ impl Mixer {
             slot.sustained = false;
             slot.sostenuto_captured = false;
             slot.released = false;
+            slot.glide_remaining_samples = 0;
         }
     }
 
@@ -2111,6 +2308,7 @@ impl Mixer {
                 slot.sustained = false;
                 slot.sostenuto_captured = false;
                 slot.released = false;
+                slot.glide_remaining_samples = 0;
             }
         }
     }
@@ -2289,6 +2487,11 @@ impl Mixer {
         self.fx.refresh(&self.gm_effects);
         let chorus_to_reverb = (self.gm_effects.chorus_send_to_reverb_pct / 100.0).clamp(0.0, 1.0);
         self.fx.process(left, right, chorus_to_reverb);
+
+        // Advance any active portamento glides by this block's length so
+        // the next block reflects the time consumed. Done after rendering
+        // so the just-rendered block used this block's start offset.
+        self.advance_portamento(left.len() as u32);
 
         active
     }
@@ -2837,6 +3040,90 @@ mod tests {
         let mut r = vec![0.0f32; 16];
         let _ = m.mix_stereo(&mut l, &mut r);
         assert_eq!(m.live_voice_count(), 0, "released via the note-off path");
+    }
+
+    #[test]
+    fn portamento_off_means_no_glide() {
+        let mut m = Mixer::new();
+        m.note_on(0, 60, 100, voice(0.5, 1024));
+        let (v, bend, _p) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 64, 100, v); // no CC 65 → immediate, no glide
+        assert_eq!(*bend.lock().unwrap(), 0, "no portamento → note at pitch");
+    }
+
+    #[test]
+    fn portamento_on_glides_from_previous_note() {
+        let mut m = Mixer::new();
+        // 1 kHz sample rate so the 1 s glide (CC5=127) is 1000 samples.
+        m.set_sample_rate(1000);
+        m.set_portamento(0, 127); // CC 65 on
+        m.set_portamento_time(0, 127); // CC 5 = max → 1000 ms
+        m.note_on(0, 60, 100, voice(0.5, 100_000)); // source = #60
+        let (v, bend, _p) = instrumented_voice(0.5, 100_000);
+        m.note_on(0, 64, 100, v); // target #64, 4 semitones up
+                                  // Voice starts 4 semitones BELOW target = −400 cents.
+        assert_eq!(
+            *bend.lock().unwrap(),
+            -400,
+            "glide starts at the source-note displacement",
+        );
+        // Render ~500 ms (half the glide) → offset should be ~−200 cents.
+        let mut l = vec![0.0f32; 500];
+        let mut r = vec![0.0f32; 500];
+        m.mix_stereo(&mut l, &mut r);
+        let mid = *bend.lock().unwrap();
+        assert!(
+            (-260..=-140).contains(&mid),
+            "half-way glide ~−200 cents, got {}",
+            mid,
+        );
+        // Render the rest → glide settles exactly on target (0 cents).
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(*bend.lock().unwrap(), 0, "glide settles on target pitch");
+    }
+
+    #[test]
+    fn portamento_control_cc84_glides_ignoring_onoff() {
+        // CC 84 forces a glide from an explicit source even with CC 65 off.
+        let mut m = Mixer::new();
+        m.set_sample_rate(1000);
+        m.set_portamento_time(0, 127); // 1 s span
+        m.set_portamento_control(0, 60); // glide from #60
+        let (v, bend, _p) = instrumented_voice(0.5, 100_000);
+        m.note_on(0, 72, 100, v); // target #72 = one octave above
+        assert_eq!(
+            *bend.lock().unwrap(),
+            -1200,
+            "CC 84 glides from #60 to #72 (−1200 cents start)",
+        );
+    }
+
+    #[test]
+    fn portamento_control_resets_after_one_note() {
+        let mut m = Mixer::new();
+        m.set_sample_rate(1000);
+        m.set_portamento_time(0, 127);
+        m.set_portamento_control(0, 60);
+        m.note_on(0, 72, 100, voice(0.5, 100_000)); // consumes CC 84
+                                                    // A second note with no CC 84 and CC 65 off must NOT glide.
+        let (v, bend, _p) = instrumented_voice(0.5, 100_000);
+        m.note_on(0, 67, 100, v);
+        assert_eq!(
+            *bend.lock().unwrap(),
+            0,
+            "CC 84 only affects the next note-on",
+        );
+    }
+
+    #[test]
+    fn portamento_zero_time_is_instant() {
+        let mut m = Mixer::new();
+        m.set_portamento(0, 127);
+        m.set_portamento_time(0, 0); // zero time → no glide
+        m.note_on(0, 60, 100, voice(0.5, 1024));
+        let (v, bend, _p) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 64, 100, v);
+        assert_eq!(*bend.lock().unwrap(), 0, "zero portamento time = instant");
     }
 
     #[test]

@@ -270,6 +270,7 @@ impl Scheduler {
             }
             ChannelBody::ControlChange { controller, value } => match controller {
                 1 => mixer.set_mod_wheel(channel, value), // CC 1 — Modulation Wheel
+                5 => mixer.set_portamento_time(channel, value), // CC 5 — Portamento Time
                 6 => mixer.set_data_entry(channel, value, true), // RPN data MSB
                 7 => mixer.channel_state_mut(channel).volume = value,
                 10 => mixer.channel_state_mut(channel).pan = value,
@@ -277,8 +278,10 @@ impl Scheduler {
 
                 38 => mixer.set_data_entry(channel, value, false), // RPN data LSB
                 64 => mixer.set_sustain(channel, value),
-                66 => mixer.set_sostenuto(channel, value), // CC 66 — Sostenuto Pedal
+                65 => mixer.set_portamento(channel, value), // CC 65 — Portamento On/Off
+                66 => mixer.set_sostenuto(channel, value),  // CC 66 — Sostenuto Pedal
                 67 => mixer.set_soft_pedal(channel, value), // CC 67 — Soft Pedal
+                84 => mixer.set_portamento_control(channel, value), // CC 84 — Portamento Control
 
                 74 => mixer.set_timbre(channel, value), // MPE "third dimension" (CC #74)
                 91 => mixer.channel_state_mut(channel).reverb_send = value, // CC 91 — Reverb Send (CA-024)
