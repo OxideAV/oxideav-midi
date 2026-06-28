@@ -240,6 +240,25 @@ the MIDI Association *UMP Format and MIDI 2.0 Protocol* spec
   (CC 96/97), mod-wheel + MPE timbre routing, Master Volume / Balance
   / Fine / Coarse Tuning (Universal Real-Time SysEx), and GM2 Global
   Parameter Control.
+- `mixer` **continuous controllers + pedals** — **CC 11 Expression**
+  multiplies Channel Volume at mix time (Expression is a percentage of
+  Volume per the MIDI 1.0 Control Change table; default 127 = transparent).
+  **CC 121 Reset All Controllers** follows RP-015 exactly — Expression →
+  127, Modulation → 0, Pedals → 0, RPN/NRPN selector → null, Pitch Bend →
+  centre, Channel + Poly Pressure → 0, while Volume / Pan / Program / Bank
+  / Effects / Sound-Controllers and the RPN parameter *values* are
+  preserved. The **CC 64 Sustain**, **CC 66 Sostenuto**, and **CC 67 Soft**
+  pedals are modelled distinctly: Sostenuto captures only notes sounding at
+  press time and holds independently of Sustain (a deferred note releases
+  only when both pedals lift); the Soft pedal (*una corda*) attenuates
+  notes struck while it is down, captured per-voice so sounding notes are
+  unaffected. **CC 5 / 65 / 84 Portamento** glides a new note's pitch from
+  the previously-played key (CC 65 on) or an explicit CC 84 source over a
+  CC 5-controlled span, advanced per render block and summed with the live
+  bend. **CC 120 All Sound Off** (immediate hard cut, ignoring pedals) and
+  **CC 123-127 All Notes Off / Omni / Mono / Poly** (normal release,
+  honouring pedals) are split per the Channel Mode table; **CC 122 Local
+  Control** is a recognised no-op.
 - `mixer` **system effects bus** — the GM2 Reverb + Chorus parameters
   (CA-024) drive a real stereo DSP send, not just decoded state.
   Per-channel **CC 91** (Reverb Send) and **CC 93** (Chorus Send)
@@ -259,9 +278,12 @@ the MIDI Association *UMP Format and MIDI 2.0 Protocol* spec
   PKP drop on Members, and sounding-note reset on reconfiguration.
 - `scheduler` — merges every track into one time-ordered stream,
   converts ticks → samples against tempo + division, and dispatches
-  events into the mixer at the right sample. Wires the Universal
-  SysEx surface (GM 1/2 System On/Off, Master Volume/Balance/Tuning,
-  MIDI Tuning Standard, Data Inc/Dec, GM2 GPC).
+  events into the mixer at the right sample. Routes the channel-voice
+  controllers (Expression, Portamento CC 5/65/84, the Sustain / Sostenuto
+  / Soft pedals, Reset All Controllers, and the All Sound Off / All Notes
+  Off channel-mode family) plus the Universal SysEx surface (GM 1/2 System
+  On/Off, Master Volume/Balance/Tuning, MIDI Tuning Standard, Data Inc/Dec,
+  GM2 GPC).
 - `tuning` — MIDI Tuning Standard (MTS) microtuning state + Universal
   SysEx decoders (key-based + scale/octave tables, signed cents added
   to equal temperament; drum channel exempt).
