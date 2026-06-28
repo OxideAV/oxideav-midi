@@ -1044,6 +1044,9 @@ impl Mixer {
                                 total +=
                                     self.tuning.offset_cents(slot.channel, slot.key).round() as i32;
                             }
+                            // Preserve an in-progress portamento glide on
+                            // this voice — a live bend sums with the glide.
+                            total += slot.glide_offset_cents.round() as i32;
                             voice.set_pitch_bend_cents(total);
                         }
                     }
@@ -1092,6 +1095,9 @@ impl Mixer {
                             total +=
                                 self.tuning.offset_cents(slot.channel, slot.key).round() as i32;
                         }
+                        // Preserve an in-progress portamento glide on this
+                        // voice — a live bend sums with the glide offset.
+                        total += slot.glide_offset_cents.round() as i32;
                         voice.set_pitch_bend_cents(total);
                     }
                 }
@@ -3112,6 +3118,30 @@ mod tests {
             *bend.lock().unwrap(),
             0,
             "CC 84 only affects the next note-on",
+        );
+    }
+
+    #[test]
+    fn pitch_bend_during_glide_preserves_glide_offset() {
+        // A live pitch-bend mid-glide must SUM with the glide offset, not
+        // clobber it.
+        let mut m = Mixer::new();
+        m.set_sample_rate(1000);
+        m.set_portamento(0, 127);
+        m.set_portamento_time(0, 127); // 1000-sample glide
+        m.note_on(0, 60, 100, voice(0.5, 100_000));
+        let (v, bend, _p) = instrumented_voice(0.5, 100_000);
+        m.note_on(0, 64, 100, v); // glide start = −400 cents
+        assert_eq!(*bend.lock().unwrap(), -400);
+        // Apply a +1 semitone bend (range default 200 cents, value
+        // 0x2000 + half-range → +100 cents). Use 0x3000 = +1024/2048 of
+        // the +200-cent half → +100 cents.
+        m.set_pitch_bend(0, 0x3000);
+        // Glide offset (−400) is still in effect, plus the +100 bend.
+        assert_eq!(
+            *bend.lock().unwrap(),
+            -300,
+            "bend (+100) summed with glide (−400) = −300, glide not lost",
         );
     }
 

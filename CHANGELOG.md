@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 378 — synth pitch-bend / portamento coexistence fix
+
+- `Mixer::set_pitch_bend` now sums each voice's in-progress portamento
+  glide offset into the pitch it pushes, so a live pitch-bend arriving
+  mid-glide no longer clobbers the glide (both the non-MPE and MPE-Manager
+  broadcast paths). New regression test asserts a +100-cent bend during a
+  −400-cent glide lands at −300 cents.
+
 ### Round 378 — synth Portamento (CC 5 / 65 / 84)
 
 - The mixer now performs portamento pitch glides. `set_portamento` (CC 65
