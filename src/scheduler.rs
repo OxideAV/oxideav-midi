@@ -287,11 +287,24 @@ impl Scheduler {
                 97 => mixer.data_inc_dec(channel, -1), // Data Decrement (RP-018; value ignored)
                 100 => mixer.set_rpn_byte(channel, value, false), // RPN LSB
                 101 => mixer.set_rpn_byte(channel, value, true), // RPN MSB
-                120 | 123 => {
-                    // CC 120 = All Sound Off, CC 123 = All Notes Off.
-                    mixer.all_notes_off();
-                }
+                // CC 120 = All Sound Off — immediate hard cut, ignoring
+                // the pedals.
+                120 => mixer.all_sound_off(channel),
                 121 => mixer.reset_all_controllers(channel), // CC 121 — Reset All Controllers (RP-015)
+                // CC 122 = Local Control On/Off. It connects/disconnects a
+                // device's local keyboard from its tone generator; for an
+                // internal software synth there is no local keyboard, so we
+                // recognise it as a no-op (the SMF classifier still surfaces
+                // it for sequencers that care).
+                122 => { /* Local Control — no local keyboard to gate */ }
+                // CC 123 = All Notes Off; CC 124/125 = Omni Off/On (+ all
+                // notes off); CC 126/127 = Mono/Poly On (+ all notes off).
+                // Every one of these channel-mode messages turns the
+                // channel's notes off via the normal release path per the
+                // MIDI 1.0 Channel Mode table. Omni/Mono/Poly voice-mode
+                // selection beyond the implied All-Notes-Off is not modelled
+                // (the synth is always polyphonic + omni-off).
+                123..=127 => mixer.all_notes_off_channel(channel),
                 _ => { /* other CCs not modelled */ }
             },
             ChannelBody::PolyAftertouch { key, pressure } => {

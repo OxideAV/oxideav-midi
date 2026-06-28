@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 378 — synth All Sound Off / All Notes Off split (CC 120/123-127)
+
+- The scheduler previously conflated CC 120 (All Sound Off) and CC 123
+  (All Notes Off) into a single global hard-stop. They are now distinct
+  **per-channel** Channel Mode messages per the MIDI 1.0 table:
+  `Mixer::all_sound_off(channel)` silences the channel's voices
+  immediately (no release, ignoring the Sustain / Sostenuto pedals — the
+  "kill now" panic), while `Mixer::all_notes_off_channel(channel)` turns
+  the channel's notes off via the normal release envelope and honours a
+  held pedal exactly as an explicit Note Off would. CC 124/125 (Omni
+  Off/On) and CC 126/127 (Mono/Poly On) route to All-Notes-Off per their
+  "+ all notes off" definition; CC 122 (Local Control) is recognised as a
+  no-op (no local keyboard to gate in a software synth). 4 new tests
+  (immediate-cut vs. sustain, release-path vs. sustain, per-channel
+  scope, release-path note-off).
+- Provenance: `docs/audio/midi/midi-1.0/Control-Change-Messages-Data-Bytes.pdf`
+  (Channel Mode Messages 120-127).
+
 ### Round 378 — synth Soft Pedal (CC 67, una corda)
 
 - New `Mixer::set_soft_pedal(channel, value)` models CC 67: a note struck

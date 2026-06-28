@@ -2098,6 +2098,48 @@ impl Mixer {
         }
     }
 
+    /// **All Sound Off** (Channel Mode message CC 120) for one channel.
+    /// Per the MIDI 1.0 Channel Mode table this silences every voice on
+    /// the channel **immediately** — no release envelope, ignoring the
+    /// Sustain / Sostenuto pedals. The slots become free at once. This is
+    /// the "kill the sound now" panic, distinct from All Notes Off which
+    /// lets voices run through their release.
+    pub fn all_sound_off(&mut self, channel: u8) {
+        for slot in self.slots.iter_mut() {
+            if slot.channel == channel {
+                slot.voice = None;
+                slot.sustained = false;
+                slot.sostenuto_captured = false;
+                slot.released = false;
+            }
+        }
+    }
+
+    /// **All Notes Off** (Channel Mode message CC 123) for one channel.
+    /// Per the MIDI 1.0 Channel Mode table this is equivalent to sending
+    /// a Note Off for every key currently held on the channel: voices run
+    /// through their normal **release** envelope rather than being cut.
+    /// The Sustain (CC 64) and Sostenuto (CC 66) pedals are honoured — a
+    /// note held by a depressed pedal stays held until the pedal lifts,
+    /// exactly as an explicit Note Off would.
+    pub fn all_notes_off_channel(&mut self, channel: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let sustain = self.channels[ch].sustain;
+        for slot in self.slots.iter_mut() {
+            if slot.channel != channel || slot.released {
+                continue;
+            }
+            if let Some(v) = slot.voice.as_mut() {
+                if sustain || slot.sostenuto_captured {
+                    slot.sustained = true; // deferred by a pedal
+                } else {
+                    v.release();
+                    slot.released = true;
+                }
+            }
+        }
+    }
+
     /// Mix every live voice into a planar stereo `(left, right)` slice
     /// pair. Both buffers must be the same length. Existing buffer
     /// contents are **overwritten** (not added to) so the caller can
@@ -2736,6 +2778,65 @@ mod tests {
         assert!(m.channel_state_mut(0).soft_pedal);
         m.reset_all_controllers(0);
         assert!(!m.channel_state_mut(0).soft_pedal, "RAC lifts soft pedal");
+    }
+
+    #[test]
+    fn all_sound_off_cuts_immediately_ignoring_sustain() {
+        let mut m = Mixer::new();
+        m.set_sustain(0, 127); // pedal down
+        m.note_on(0, 60, 100, voice(0.5, 1024));
+        m.note_off(0, 60); // held by sustain
+        let mut l = vec![0.0f32; 16];
+        let mut r = vec![0.0f32; 16];
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 1);
+        m.all_sound_off(0); // CC 120 — immediate cut, ignoring pedal
+        assert_eq!(m.live_voice_count(), 0, "All Sound Off frees slots at once");
+    }
+
+    #[test]
+    fn all_notes_off_channel_respects_sustain() {
+        let mut m = Mixer::new();
+        m.set_sustain(0, 127); // pedal down
+        m.note_on(0, 60, 100, voice(0.5, 1024));
+        m.all_notes_off_channel(0); // CC 123 — release path, deferred
+        let mut l = vec![0.0f32; 16];
+        let mut r = vec![0.0f32; 16];
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(
+            m.live_voice_count(),
+            1,
+            "All Notes Off honours the held sustain pedal",
+        );
+        m.set_sustain(0, 0); // pedal up — now releases
+        let _ = m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 0);
+    }
+
+    #[test]
+    fn channel_mode_messages_are_per_channel() {
+        let mut m = Mixer::new();
+        m.note_on(0, 60, 100, voice(0.5, 1024));
+        m.note_on(1, 62, 100, voice(0.5, 1024));
+        m.all_sound_off(0); // only channel 0
+        assert_eq!(
+            m.live_voice_count(),
+            1,
+            "All Sound Off on ch0 left ch1 untouched",
+        );
+    }
+
+    #[test]
+    fn all_notes_off_channel_releases_held_note() {
+        // No pedal: All Notes Off releases the still-held note via the
+        // normal release envelope (ConstVoice goes done on release).
+        let mut m = Mixer::new();
+        m.note_on(0, 60, 100, voice(0.5, 1024));
+        m.all_notes_off_channel(0);
+        let mut l = vec![0.0f32; 16];
+        let mut r = vec![0.0f32; 16];
+        let _ = m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 0, "released via the note-off path");
     }
 
     #[test]
