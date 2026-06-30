@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 381 — synth hot-path: skip the effects bus on the dry path
+
+- `Mixer::mix_stereo` now gates the entire Reverb + Chorus effects bus
+  behind a latched `EffectsBus::active` flag. While every channel's
+  reverb / chorus send (CC 91 / CC 93) is zero the bus delay lines are
+  provably all-zero, so the per-sample send accumulation **and** the
+  Schroeder comb/allpass reverb + modulated-delay chorus DSP (including a
+  per-sample `sin` in each chorus `ModDelay`) are skipped — their wet
+  return into the mix would be exactly `0.0`. The first non-zero send
+  latches the bus on and it stays on so the reverb/chorus tail still
+  rings out after the sends fall back to zero; `reset_gm_effects` /
+  GM-reset paths call `EffectsBus::clear`, which re-zeroes the state and
+  the flag.
+- Measured on the `benches/synth_render.rs` dense 8-channel / 32-voice
+  dry SF2 score: best-of-9 wall clock 87.6 ms → 66.3 ms (≈24 % faster).
+  Output is **bit-identical** — every `--corpus` PCM FNV-1a hash is
+  unchanged.
+- New regression test `fx_gate_inactive_blocks_leave_no_residue` proves
+  the skip is exactly equivalent to running the DSP over all-zero input:
+  a mixer that rendered several dry idle blocks before its first
+  reverb-send note produces byte-identical output, from the send note
+  onward, to a freshly-constructed mixer.
+
 ### Round 378 — synth pitch-bend / portamento coexistence fix
 
 - `Mixer::set_pitch_bend` now sums each voice's in-progress portamento

@@ -699,6 +699,14 @@ struct EffectsBus {
     reverb_in_r: Vec<f32>,
     chorus_in_l: Vec<f32>,
     chorus_in_r: Vec<f32>,
+    /// Latched "the bus has work to do" flag. Starts `false` (all delay
+    /// lines are zeroed at construction) and flips to `true` the first
+    /// time any channel carries a non-zero reverb / chorus send. While
+    /// `false`, the comb / allpass / chorus state is provably all-zero
+    /// and every send accumulator would be all-zero, so running the
+    /// effects DSP would add exactly `0.0` to the dry mix — the mixer
+    /// skips the whole bus instead. Reset to `false` by [`Self::clear`].
+    active: bool,
 }
 
 impl EffectsBus {
@@ -751,6 +759,7 @@ impl EffectsBus {
             reverb_in_r: Vec::new(),
             chorus_in_l: Vec::new(),
             chorus_in_r: Vec::new(),
+            active: false,
         }
     }
 
@@ -869,6 +878,9 @@ impl EffectsBus {
         self.chorus_l.clear();
         self.chorus_r.clear();
         self.chorus_r.lfo_phase = 0.25;
+        // All delay lines are now exactly zero, so the bus is silent
+        // again until the next non-zero send re-arms it.
+        self.active = false;
     }
 }
 
@@ -2374,17 +2386,43 @@ impl Mixer {
         let master = self.master_volume_14 as f32 / 0x3FFF as f32;
         let (master_bal_l, master_bal_r) = self.master_balance_gains();
 
-        // --- Effects-bus send accumulators (CA-024 CC 91 / CC 93). ---
+        // --- Effects-bus activation gate. ---
+        // The Reverb + Chorus bus only contributes signal once a channel
+        // carries a non-zero send (CA-024 CC 91 / CC 93). Before that the
+        // bus input is all-zero *and* its delay lines start zeroed, so the
+        // wet returns it would add are exactly `0.0`. Latch `fx.active`
+        // the first time any channel shows a send and keep it set so the
+        // reverb tail still rings out after the sends drop back to zero;
+        // while it stays clear we skip the per-sample send accumulation
+        // and the whole effects DSP. `reset_gm_effects` / GM-reset paths
+        // call `fx.clear()`, which re-zeroes the state and the flag.
+        if !self.fx.active {
+            let sends_present = self
+                .channels
+                .iter()
+                .any(|c| c.reverb_send > 0 || c.chorus_send > 0);
+            self.fx.active |= sends_present;
+        }
+        let fx_active = self.fx.active;
+
         // The fx input vectors live on `self.fx`, but the voice loop
         // below borrows `self.slots` mutably, so we move them out for
         // the duration of the loop and hand them back afterwards. They
         // are zeroed + sized here; the loop adds each voice's post-pan
-        // signal scaled by its channel's reverb / chorus send level.
-        self.fx.prepare_block(left.len());
-        let mut reverb_in_l = std::mem::take(&mut self.fx.reverb_in_l);
-        let mut reverb_in_r = std::mem::take(&mut self.fx.reverb_in_r);
-        let mut chorus_in_l = std::mem::take(&mut self.fx.chorus_in_l);
-        let mut chorus_in_r = std::mem::take(&mut self.fx.chorus_in_r);
+        // signal scaled by its channel's reverb / chorus send level. When
+        // the bus is inactive they stay empty (the accumulation is
+        // skipped) so no allocation / zero-fill happens on the dry path.
+        let (mut reverb_in_l, mut reverb_in_r, mut chorus_in_l, mut chorus_in_r) = if fx_active {
+            self.fx.prepare_block(left.len());
+            (
+                std::mem::take(&mut self.fx.reverb_in_l),
+                std::mem::take(&mut self.fx.reverb_in_r),
+                std::mem::take(&mut self.fx.chorus_in_l),
+                std::mem::take(&mut self.fx.chorus_in_r),
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
 
         for slot in self.slots.iter_mut() {
             let stereo = slot.voice.as_ref().map(|v| v.is_stereo()).unwrap_or(false);
@@ -2422,7 +2460,7 @@ impl Mixer {
             // dry score bypasses the bus entirely.
             let reverb_send = st.reverb_send as f32 / 127.0;
             let chorus_send = st.chorus_send as f32 / 127.0;
-            let any_send = reverb_send > 0.0 || chorus_send > 0.0;
+            let any_send = fx_active && (reverb_send > 0.0 || chorus_send > 0.0);
 
             if stereo {
                 // Stereo voice: keep its inherent L/R image, but still
@@ -2486,13 +2524,18 @@ impl Mixer {
 
         // Hand the send accumulators back to the fx bus and run the
         // Reverb + Chorus DSP, summing the wet returns into the main mix.
-        self.fx.reverb_in_l = reverb_in_l;
-        self.fx.reverb_in_r = reverb_in_r;
-        self.fx.chorus_in_l = chorus_in_l;
-        self.fx.chorus_in_r = chorus_in_r;
-        self.fx.refresh(&self.gm_effects);
-        let chorus_to_reverb = (self.gm_effects.chorus_send_to_reverb_pct / 100.0).clamp(0.0, 1.0);
-        self.fx.process(left, right, chorus_to_reverb);
+        // Skipped entirely on the dry path (no sends ever seen): the bus
+        // state is provably zero there, so its wet return is `0.0`.
+        if fx_active {
+            self.fx.reverb_in_l = reverb_in_l;
+            self.fx.reverb_in_r = reverb_in_r;
+            self.fx.chorus_in_l = chorus_in_l;
+            self.fx.chorus_in_r = chorus_in_r;
+            self.fx.refresh(&self.gm_effects);
+            let chorus_to_reverb =
+                (self.gm_effects.chorus_send_to_reverb_pct / 100.0).clamp(0.0, 1.0);
+            self.fx.process(left, right, chorus_to_reverb);
+        }
 
         // Advance any active portamento glides by this block's length so
         // the next block reflects the time consumed. Done after rendering
@@ -4195,6 +4238,57 @@ mod tests {
             long > short,
             "longer reverb time should retain more tail energy: short={short}, long={long}"
         );
+    }
+
+    #[test]
+    fn fx_gate_inactive_blocks_leave_no_residue() {
+        // The effects-bus activation latch skips the Reverb + Chorus DSP
+        // while every channel send is zero. This must be *exactly*
+        // equivalent to running the DSP over an all-zero input: a mixer
+        // that rendered several dry (no-send) blocks before its first
+        // reverb-send note has to produce byte-identical output, from the
+        // send-note onward, to a freshly-constructed mixer that strikes
+        // the same note. Any residue left in the comb / allpass / chorus
+        // state by the skipped path — or a coefficient drift — would
+        // diverge the two.
+        let warm = |prewarm_blocks: usize| -> (Vec<f32>, Vec<f32>) {
+            let mut m = Mixer::new();
+            // Optional dry idle blocks exercise the inactive gate.
+            for _ in 0..prewarm_blocks {
+                let mut l = vec![0.0; 512];
+                let mut r = vec![0.0; 512];
+                m.mix_stereo(&mut l, &mut r);
+            }
+            // Now arm a reverb send and strike a note; capture several
+            // chunks so the comb tail (first echo ~1100 samples out) is
+            // fully represented.
+            m.channel_state_mut(0).reverb_send = 100;
+            m.note_on(0, 60, 100, voice(0.5, 96));
+            let mut acc_l = Vec::new();
+            let mut acc_r = Vec::new();
+            for _ in 0..8 {
+                let mut l = vec![0.0; 512];
+                let mut r = vec![0.0; 512];
+                m.mix_stereo(&mut l, &mut r);
+                acc_l.extend_from_slice(&l);
+                acc_r.extend_from_slice(&r);
+            }
+            (acc_l, acc_r)
+        };
+
+        let (fresh_l, fresh_r) = warm(0);
+        let (prewarmed_l, prewarmed_r) = warm(5);
+        assert_eq!(
+            fresh_l, prewarmed_l,
+            "dry idle blocks must leave the fx bus bit-identical to a fresh one (L)"
+        );
+        assert_eq!(
+            fresh_r, prewarmed_r,
+            "dry idle blocks must leave the fx bus bit-identical to a fresh one (R)"
+        );
+        // Sanity: the captured signal is actually non-trivial (so the
+        // equality above isn't comparing two silent buffers).
+        assert!(energy(&fresh_l) + energy(&fresh_r) > 0.0);
     }
 
     #[test]

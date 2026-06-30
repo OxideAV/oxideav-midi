@@ -321,6 +321,17 @@ wall-clock harness over a dense 8-channel / 32-voice score through an
 in-memory SF2 bank, plus a `--corpus` PCM-hash mode and a `--spin
 SECS` sampling-profiler loop.
 
+The Reverb + Chorus effects bus carries a latched activation gate: while
+every channel's reverb / chorus send (CC 91 / CC 93) is zero, the bus
+delay lines are provably all-zero, so the mixer skips the per-sample
+send accumulation **and** the whole Schroeder reverb + modulated-chorus
+DSP — their wet return would be exactly `0.0`. The first non-zero send
+latches the bus on (and it stays on so a tail still rings out after the
+sends drop). On the dry dense-score profile this removes the comb /
+allpass / chorus inner loops entirely, cutting the SMF→PCM wall clock by
+~24 % (87.6 → 66.3 ms here) with bit-identical PCM (corpus hashes
+unchanged).
+
 ## License
 
 MIT — see `LICENSE`.
