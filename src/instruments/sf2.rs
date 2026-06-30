@@ -1934,10 +1934,52 @@ impl Voice for Sf2Voice {
         let total = out.len();
         let mut env_buf = [0.0f32; ENV_RUN];
         let mut base = 0usize;
+        // The mod-env → pitch routing and the filter presence are fixed
+        // for the whole call (neither `filter` nor `mod_env_to_pitch_cents`
+        // is mutated by the render loop), so the choice between the
+        // mod-env / filter slow path and the bare sample-playback fast
+        // path is hoisted out of the per-sample loop. The fast path omits
+        // only operations that are provable no-ops in that configuration
+        // (mod-env level unused, no biquad), so its output is identical to
+        // the slow path — the SF2 corpus PCM hashes are unchanged.
+        let simple = self.filter.is_none() && self.mod_env_to_pitch_cents == 0;
         while base < total {
             let n = (total - base).min(ENV_RUN);
             self.envelope_run(self.elapsed, &mut env_buf[..n]);
             let chunk = &mut out[base..base + n];
+
+            if simple {
+                // ---- Fast path: no filter, no mod-env→pitch routing. ----
+                let gain = self.amplitude * self.pressure_gain;
+                let releasing = self.release_pos.is_some();
+                for (j, (slot, &env)) in chunk.iter_mut().zip(&env_buf[..n]).enumerate() {
+                    if releasing && env <= 0.0 {
+                        self.done = true;
+                        return base + j;
+                    }
+                    if self.phase >= self.end as f64 {
+                        if self.loops {
+                            let over = self.phase - self.end_loop as f64;
+                            let loop_len = (self.end_loop as f64 - self.start_loop as f64).max(1.0);
+                            self.phase = self.start_loop as f64 + over.rem_euclid(loop_len);
+                        } else {
+                            self.done = true;
+                            return base + j;
+                        }
+                    } else if self.loops && self.phase >= self.end_loop as f64 {
+                        let over = self.phase - self.end_loop as f64;
+                        let loop_len = (self.end_loop as f64 - self.start_loop as f64).max(1.0);
+                        self.phase = self.start_loop as f64 + over.rem_euclid(loop_len);
+                    }
+                    *slot = self.fetch(self.phase) * env * gain;
+                    self.phase += self.phase_inc;
+                    self.elapsed = self.elapsed.wrapping_add(1);
+                }
+                base += n;
+                continue;
+            }
+
+            // ---- Slow path: mod-env → pitch and/or filter active. ----
             for (j, (slot, &env)) in chunk.iter_mut().zip(&env_buf[..n]).enumerate() {
                 // Envelope ran fully out post-release? Voice is done.
                 if self.release_pos.is_some() && env <= 0.0 {
@@ -3867,6 +3909,80 @@ mod tests {
         for (k, &got) in buf.iter().enumerate() {
             let want = v.envelope_at(t0.wrapping_add(k as u32));
             assert_eq!(got.to_bits(), want.to_bits(), "wrap env diverged at k={k}");
+        }
+    }
+
+    /// The render fast path (no filter, no mod-env→pitch) is selected
+    /// per call, so its output must be independent of how the requested
+    /// span is chunked across `render` calls: rendering one 4096-sample
+    /// block has to be byte-identical to rendering eight 512-sample
+    /// blocks of the same voice, including across the internal `ENV_RUN`
+    /// (256-sample) burst seams and the loop-wrap points.
+    #[test]
+    fn fast_path_render_is_chunk_size_independent() {
+        // A looping voice with a default ("open") filter and no mod-env
+        // routing → takes the fast path. The non-integer pitch ratio
+        // drives the phase walk through fractional positions and across
+        // the loop boundary several times within the window.
+        let plan = SamplePlan {
+            start: 0,
+            end: 20,
+            start_loop: 4,
+            end_loop: 20,
+            sample_rate: 22_050,
+            loops: true,
+            pitch_ratio: 1.0,
+            semitones: 7,
+            fine_cents: 13,
+            env: EnvParams {
+                delay_tc: -7000,
+                attack_tc: -4000,
+                hold_tc: -5000,
+                decay_tc: -1500,
+                sustain_cb: 100,
+                release_tc: -2500,
+            },
+            mod_env: ModEnvParams::default(),
+            mod_env_to_pitch_cents: 0,
+            mod_env_to_filter_cents: 0,
+            initial_filter_fc_cents: 13_500, // open → no biquad → fast path
+            initial_filter_q_cb: 0,
+            initial_attenuation_cb: 0,
+            exclusive_class: 0,
+            stereo_pair: None,
+        };
+        // A ramp sample so divergence anywhere is visible in the output.
+        let data: Arc<[i32]> = Arc::from(
+            (0i32..20)
+                .map(|i| i * 400_000)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+
+        // Confirm the fast path is actually exercised.
+        let probe = Sf2Voice::from_plan(data.clone(), &plan, 100, 44_100);
+        assert!(
+            probe.filter.is_none() && plan.mod_env_to_pitch_cents == 0,
+            "this fixture must select the render fast path"
+        );
+
+        const TOTAL: usize = 4096;
+        let mut one = Sf2Voice::from_plan(data.clone(), &plan, 100, 44_100);
+        let mut whole = vec![0.0f32; TOTAL];
+        one.render(&mut whole);
+
+        let mut many = Sf2Voice::from_plan(data, &plan, 100, 44_100);
+        let mut pieced = vec![0.0f32; TOTAL];
+        for blk in pieced.chunks_mut(512) {
+            many.render(blk);
+        }
+
+        for (k, (&a, &b)) in whole.iter().zip(pieced.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "fast-path render diverged with chunk size at sample {k}: {a} vs {b}"
+            );
         }
     }
 }

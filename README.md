@@ -332,6 +332,15 @@ allpass / chorus inner loops entirely, cutting the SMF→PCM wall clock by
 ~24 % (87.6 → 66.3 ms here) with bit-identical PCM (corpus hashes
 unchanged).
 
+`Sf2Voice::render` additionally hoists the mod-env→pitch / filter
+decision out of the per-sample loop: those routings are fixed for a
+whole render call, so the loop splits once into a slow path (filter
+and/or mod-env pitch active) and a bare sample-playback fast path that
+drops the per-sample mod-env evaluation, the filter-coefficient drift
+check, and the biquad `filter_step`. On the dry SF2 dense score this
+takes the wall clock to ~55 ms (≈37 % under the round-378 baseline),
+again with every `--corpus` PCM hash unchanged.
+
 ## License
 
 MIT — see `LICENSE`.

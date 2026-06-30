@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 381 — synth hot-path: SF2 voice render fast path
+
+- `Sf2Voice::render` now hoists the mod-env→pitch / filter decision out
+  of the per-sample loop. Both `self.filter` presence and
+  `mod_env_to_pitch_cents` are fixed for the whole call, so the loop
+  splits once into a slow path (mod-env pitch routing and/or biquad
+  filter active) and a bare sample-playback fast path that omits the
+  per-sample mod-env evaluation, the filter-coefficient drift check, and
+  the `filter_step` biquad — all provable no-ops in that configuration.
+- Dense dry SF2 bench: best-of-7 ~65 ms → ~55 ms after this change
+  (~37 % faster than the round-378 baseline of 87.6 ms cumulatively).
+  Output is bit-identical — every `--corpus` PCM hash unchanged.
+- New test `fast_path_render_is_chunk_size_independent` asserts the fast
+  path is byte-identical whether a span is rendered as one 4096-sample
+  block or eight 512-sample blocks (covering the internal `ENV_RUN`
+  burst seams and loop-wrap points).
+
 ### Round 381 — synth hot-path: skip the effects bus on the dry path
 
 - `Mixer::mix_stereo` now gates the entire Reverb + Chorus effects bus
