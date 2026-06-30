@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-midi/compare/v0.0.4...v0.0.5) - 2026-06-30
+
+### Other
+
+- SF2 voice render fast path for the no-filter/no-mod-pitch case
+- skip Reverb+Chorus effects bus on the dry path (~24% faster)
+- sum portamento glide offset into live pitch-bend
+- README — document round-378 synth controllers + pedals + portamento
+- portamento glide (CC 5 / 65 / 84)
+- split All Sound Off (CC 120) from All Notes Off (CC 123)
+- Soft Pedal (CC 67) per-note una corda attenuation
+- Sostenuto Pedal (CC 66) with Sustain independence
+- Reset All Controllers (CC 121) per RP-015
+- CC 11 Expression Controller folded into mix-time gain
+- README — document round-374 transport / device-control SysEx decoders
+- MMC LOCATE [TARGET] Standard Time decoder (RP-013)
+- round-trip fidelity test for round-374 Universal SysEx families
+- General MIDI System On/Off typed decoder (RP-003 / GM2)
+- Sample Dump Standard header + request body decoders
+- General Information Identity Reply body decoder
+- MIDI Show Control body decoder (RP-002-014)
+- MIDI Machine Control command + response body decoders (RP-013)
+- Device Control GPC body variant + device_controls() iterator
+- Device Control decoder — Master Fine + Coarse Tuning (CA-025)
+- Device Control SysEx body decoder — Master Volume + Master Balance
+- neutralize residual third-party-impl name in r361 scrub entry
+- paraphrase reverb-tuning comment (drop named-impl reference)
+- Reverb/Chorus Type select loads CA-024 table defaults
+- typed Effects-Depth controller classifier + iterator (CC 91-95)
+- apply GM2 Reverb + Chorus as a real DSP send bus (CA-024)
+- end-to-end stream integration tests + README section
+- MIDI 1.0 <-> MIDI 2.0 Channel Voice default-mode translation
+- Universal MIDI Packet container + MIDI 1.0/2.0 message decode
+- typed Channel Mode Message classifier — channel_mode() + channel_mode_messages()
+- multi-packet SysEx reassembly — reassembled_sysex_messages()
+- SmfBuilder / TrackBuilder — assemble files from absolute-tick events
+- running-status writer — to_bytes_running_status() compresses consecutive same-status channel events
+- midi r337: Notation Information Bar Number + Time Signature SysEx body decoders
+- decode RT MTC User Bits Message body (MtcUserBits)
+- UniversalSysExEvent::mtc_full_message() — RT MTC Full Message body decoder
+- SmfFile tick → wall-clock-seconds conversion (TempoTimeline)
+- SmfFile::parameter_data_entries() — RPN / NRPN Data Entry pump decoder
+- refresh to current status, drop per-round changelog cruft
+
 ### Round 381 — synth hot-path: SF2 voice render fast path
 
 - `Sf2Voice::render` now hoists the mod-env→pitch / filter decision out
