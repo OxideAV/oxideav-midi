@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 389 — smf CA-019 Sample Dump Extensions decoders
+
+- `UniversalSysExEvent::sample_dump_extension()` decodes the five
+  CA-019 sub-commands riding Non-Real-Time Sub-ID #1 = `0x05` into a
+  typed `SampleDumpExtension`: the **Extended Dump Header** (`05` —
+  fixed-point 28-bit integer + fractional Hz sample *rate* replacing
+  the base header's period, 35-bit five-byte sample/loop word counts
+  lifting the 2 MB limit, the ten-value `ExtendedLoopType` vocabulary
+  with release / backward / one-shot modes, and the channel count;
+  `sample_rate_hz()` reassembles the fixed-point rate), **Extended
+  Loop Point Transmission** (`06`, `0x3FFF` = delete-all) and
+  **Request** (`07`, `0x3FFF` = request-all), and **Sample Name
+  Transmission** (`03`, language-tag + name with `name_lossy()`) /
+  **Request** (`04`). Multi-byte fields apply the Sample Dump
+  Standard's LSB-first convention uniformly (documented — CA-019
+  leaves its `ss ss` fields un-annotated and its example prose reads
+  MSB-first; the Standard's convention wins). Truncated packets and
+  the Real-Time `0x05` realm (MTC Cueing) yield `None`.
+- `SmfFile::sample_dump_extensions()` is the time-ordered iterator.
+- 6 new tests, including CA-019's "Test Sample" name-transmission
+  worked example, a 44100.5 Hz / 2³³-word extended header, loop
+  point transmission + request, truncation + realm rejection, and the
+  iterator.
+- Provenance: `docs/audio/midi/recommended-practices/ca19.pdf`.
+
 ### Round 389 — smf CA-018 / CA-028 File Reference decoder
 
 - `UniversalSysExEvent::file_reference()` decodes the Universal

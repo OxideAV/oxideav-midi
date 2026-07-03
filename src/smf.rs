@@ -3382,6 +3382,19 @@ pub struct FileReferenceEvent {
     pub reference: FileReference,
 }
 
+/// A decoded **Sample Dump Extensions** message (CA-019) pinned to the
+/// absolute tick (and the track) at which it fires — the element type
+/// of [`SmfFile::sample_dump_extensions`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SampleDumpExtensionEvent {
+    /// Absolute tick (cumulative per-track delta sum).
+    pub tick: u64,
+    /// Source [`Track`] index within [`SmfFile::tracks`].
+    pub track: usize,
+    /// The decoded Sample Dump Extensions message.
+    pub extension: SampleDumpExtension,
+}
+
 impl UniversalSysExEvent {
     /// Decode this packet as a Notation **Bar Number** message when it
     /// is one, returning the signed 14-bit bar number and its semantic
@@ -4075,6 +4088,104 @@ impl UniversalSysExEvent {
             data,
         })
     }
+
+    /// Decode this packet as a **Sample Dump Extensions** message
+    /// (CA-019) when it is one, returning the typed sub-command:
+    /// Extended Dump Header (`05`), Extended Loop Point Transmission
+    /// (`06`) / Request (`07`), or Sample Name Transmission (`03`) /
+    /// Request (`04`).
+    ///
+    /// Per CA-019 these travel as Universal Non-Real-Time SysEx with
+    /// Sub-ID #1 = `0x05` (Sample Dump Extensions). Multi-byte numeric
+    /// fields pack 7-bit groups LSB-first (the Sample Dump Standard
+    /// convention; CA-019 annotates its rate / length / loop-number
+    /// fields explicitly): the extended header carries 28-bit
+    /// integer + fractional Hz rate fields and 35-bit (five-byte)
+    /// length / loop words, lifting the base header's 2 MB / period
+    /// limits.
+    ///
+    /// Returns `None` unless the packet is Non-Real-Time (the Real-Time
+    /// `0x05` family is MTC Cueing) with one of the five sub-commands,
+    /// carrying all of the sub-command's declared bytes — truncated
+    /// packets yield `None` rather than partial fields. The base
+    /// `01` Dump Header / `03` Dump Request live on
+    /// [`sample_dump_header`](Self::sample_dump_header) /
+    /// [`sample_dump_request`](Self::sample_dump_request).
+    pub fn sample_dump_extension(&self) -> Option<SampleDumpExtension> {
+        if !matches!(self.classification.realm, UniversalRealm::NonRealTime) {
+            return None;
+        }
+        let sub2 = match self.classification.sub_id1 {
+            UniversalSubId1::SampleDumpExtensionsOrMtcCueing(s) => s,
+            _ => return None,
+        };
+        // <realm=7E> <device_id> <sub_id1=05> <sub_id2> <fields…> [F7]
+        let b = |i: usize| -> Option<u64> { self.data.get(i).map(|v| (*v & 0x7F) as u64) };
+        let pack = |start: usize, n: usize| -> Option<u64> {
+            let mut out = 0u64;
+            for k in 0..n {
+                out |= b(start + k)? << (7 * k);
+            }
+            Some(out)
+        };
+        match sub2 {
+            UniversalSubId2::SampleDumpExtendedDumpHeader => {
+                // ss ss ee ff×4 gg×4 hh×5 ii×5 jj×5 kk ll
+                Some(SampleDumpExtension::ExtendedDumpHeader(
+                    ExtendedDumpHeader {
+                        sample_number: pack(4, 2)? as u16,
+                        sample_format: b(6)? as u8,
+                        sample_rate_integer_hz: pack(7, 4)? as u32,
+                        sample_rate_fraction: pack(11, 4)? as u32,
+                        sample_length: pack(15, 5)?,
+                        loop_start: pack(20, 5)?,
+                        loop_end: pack(25, 5)?,
+                        loop_type: ExtendedLoopType::from_byte(b(30)? as u8),
+                        channels: b(31)? as u8,
+                    },
+                ))
+            }
+            UniversalSubId2::SampleDumpExtendedLoopPointsTransmission => {
+                // ss ss bb bb cc dd×5 ee×5
+                Some(SampleDumpExtension::ExtendedLoopPoints(
+                    ExtendedLoopPoints {
+                        sample_number: pack(4, 2)? as u16,
+                        loop_number: pack(6, 2)? as u16,
+                        loop_type: ExtendedLoopType::from_byte(b(8)? as u8),
+                        loop_start: pack(9, 5)?,
+                        loop_end: pack(14, 5)?,
+                    },
+                ))
+            }
+            UniversalSubId2::SampleDumpExtendedLoopPointsRequest => {
+                // ss ss bb bb
+                Some(SampleDumpExtension::ExtendedLoopPointsRequest {
+                    sample_number: pack(4, 2)? as u16,
+                    loop_number: pack(6, 2)? as u16,
+                })
+            }
+            UniversalSubId2::SampleDumpSampleNameTransmission => {
+                // ss ss tt <TAG×tt> nn <NAME×nn>
+                let sample_number = pack(4, 2)? as u16;
+                let tt = b(6)? as usize;
+                let language_tag = self.data.get(7..7 + tt)?.to_vec();
+                let nn = b(7 + tt)? as usize;
+                let name = self.data.get(8 + tt..8 + tt + nn)?.to_vec();
+                Some(SampleDumpExtension::SampleName(SampleName {
+                    sample_number,
+                    language_tag,
+                    name,
+                }))
+            }
+            UniversalSubId2::SampleDumpSampleNameRequest => {
+                // ss ss
+                Some(SampleDumpExtension::SampleNameRequest {
+                    sample_number: pack(4, 2)? as u16,
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// A decoded **MIDI Machine Control Command** — the leading opcode and
@@ -4677,6 +4788,165 @@ pub struct SampleDumpHeader {
     pub loop_end: u32,
     /// The loop type (`jj`).
     pub loop_type: LoopType,
+}
+
+/// The loop-type vocabulary of the CA-019 Sample Dump Extensions —
+/// richer than the base Sample Dump Header's [`LoopType`], adding
+/// release phases, backward playback, and one-shot modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtendedLoopType {
+    /// `0x00` — forward playback, unidirectional loop.
+    Forward,
+    /// `0x01` — forward playback, bi-directional loop.
+    ForwardBidirectional,
+    /// `0x02` — forward playback, unidirectional loop, with release
+    /// (on key-up, play through the loop then the tail after it).
+    ForwardWithRelease,
+    /// `0x03` — forward playback, bi-directional loop, with release.
+    ForwardBidirectionalWithRelease,
+    /// `0x40` — backward playback, unidirectional loop.
+    Backward,
+    /// `0x41` — backward playback, bi-directional loop.
+    BackwardBidirectional,
+    /// `0x42` — backward playback, unidirectional loop, with release.
+    BackwardWithRelease,
+    /// `0x43` — backward playback, bi-directional loop, with release.
+    BackwardBidirectionalWithRelease,
+    /// `0x7E` — backward one-shot (no looping).
+    BackwardOneShot,
+    /// `0x7F` — forward one-shot (no looping).
+    ForwardOneShot,
+    /// Any other byte (reserved), preserved raw.
+    Other(u8),
+}
+
+impl ExtendedLoopType {
+    /// Classify a CA-019 loop-type byte.
+    pub fn from_byte(byte: u8) -> Self {
+        match byte {
+            0x00 => ExtendedLoopType::Forward,
+            0x01 => ExtendedLoopType::ForwardBidirectional,
+            0x02 => ExtendedLoopType::ForwardWithRelease,
+            0x03 => ExtendedLoopType::ForwardBidirectionalWithRelease,
+            0x40 => ExtendedLoopType::Backward,
+            0x41 => ExtendedLoopType::BackwardBidirectional,
+            0x42 => ExtendedLoopType::BackwardWithRelease,
+            0x43 => ExtendedLoopType::BackwardBidirectionalWithRelease,
+            0x7E => ExtendedLoopType::BackwardOneShot,
+            0x7F => ExtendedLoopType::ForwardOneShot,
+            other => ExtendedLoopType::Other(other),
+        }
+    }
+}
+
+/// A decoded **Extended Dump Header** (CA-019, Sample Dump Extensions
+/// sub-command `05`): the large-object form of the Sample Dump Header,
+/// carrying a fixed-point sample *rate* (the base header carries a
+/// period), 35-bit sample/loop word counts (up to 32 G-words), and a
+/// channel count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtendedDumpHeader {
+    /// The sample number (`ss ss`, 14-bit LSB-first per the Sample Dump
+    /// Standard's multi-byte convention).
+    pub sample_number: u16,
+    /// The sample format — significant bits per word (`ee`, 8..=28).
+    pub sample_format: u8,
+    /// The integer part of the sample rate in Hz (`ff ff ff ff`, 28-bit
+    /// LSB-first).
+    pub sample_rate_integer_hz: u32,
+    /// The fractional part of the sample rate (`gg gg gg gg`, 28-bit
+    /// LSB-first, in units of 1/2²⁸ Hz).
+    pub sample_rate_fraction: u32,
+    /// The sample length in words (`hh ×5`, 35-bit LSB-first).
+    pub sample_length: u64,
+    /// The sustain-loop start word (`ii ×5`, 35-bit LSB-first).
+    pub loop_start: u64,
+    /// The sustain-loop end word — the last sample played (`jj ×5`,
+    /// 35-bit LSB-first).
+    pub loop_end: u64,
+    /// The loop type (`kk`, CA-019 vocabulary).
+    pub loop_type: ExtendedLoopType,
+    /// The number of interleaved audio channels (`ll`, 1..=127; CA-019
+    /// calls `0` an error condition, surfaced raw for the caller).
+    pub channels: u8,
+}
+
+impl ExtendedDumpHeader {
+    /// The sample rate in Hz as a float: integer part + fraction/2²⁸.
+    pub fn sample_rate_hz(&self) -> f64 {
+        self.sample_rate_integer_hz as f64 + self.sample_rate_fraction as f64 / (1u64 << 28) as f64
+    }
+}
+
+/// A decoded **Extended Loop Point Transmission** (CA-019, sub-command
+/// `06`): one loop's type + 35-bit start/end addresses for a sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtendedLoopPoints {
+    /// The sample number (`ss ss`, 14-bit LSB-first).
+    pub sample_number: u16,
+    /// The loop number (`bb bb`, LSB-first; `0x3FFF` = `7F 7F` means
+    /// "delete all loops").
+    pub loop_number: u16,
+    /// The loop type (CA-019 vocabulary).
+    pub loop_type: ExtendedLoopType,
+    /// The loop start address in words (35-bit LSB-first).
+    pub loop_start: u64,
+    /// The loop end address in words (35-bit LSB-first).
+    pub loop_end: u64,
+}
+
+/// A decoded **Sample Name Transmission** (CA-019, sub-command `03`):
+/// a sample's language tag + name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SampleName {
+    /// The sample number (`ss ss`, 14-bit LSB-first).
+    pub sample_number: u16,
+    /// The language-tag bytes (`tt`-counted; empty = the default,
+    /// which CA-019 defines as English with ASCII name bytes).
+    pub language_tag: Vec<u8>,
+    /// The name bytes (`nn`-counted, up to 127).
+    pub name: Vec<u8>,
+}
+
+impl SampleName {
+    /// The name as UTF-8 (lossy). With an empty language tag the bytes
+    /// are plain ASCII per CA-019, so this is exact in the default
+    /// case.
+    pub fn name_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.name)
+    }
+}
+
+/// One decoded **Sample Dump Extensions** message (CA-019) — the typed
+/// union over the five sub-commands riding Sub-ID #1 = `0x05`.
+///
+/// Byte-order note: the Sample Dump Standard transmits every multi-byte
+/// field LSB-first, and CA-019 annotates its loop-number and rate/length
+/// fields the same way; the sample-number fields carry no per-message
+/// annotation, so this decoder applies the Standard's LSB-first
+/// convention uniformly. Decoded via
+/// [`UniversalSysExEvent::sample_dump_extension`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SampleDumpExtension {
+    /// Sub-command `05` — Extended Dump Header.
+    ExtendedDumpHeader(ExtendedDumpHeader),
+    /// Sub-command `06` — Extended Loop Point Transmission.
+    ExtendedLoopPoints(ExtendedLoopPoints),
+    /// Sub-command `07` — Extended Loop Point Request: asks the device
+    /// to transmit the loop (`0x3FFF` = all loops) of a sample.
+    ExtendedLoopPointsRequest {
+        /// The sample number (14-bit LSB-first).
+        sample_number: u16,
+        /// The loop number (LSB-first; `0x3FFF` requests all loops).
+        loop_number: u16,
+    },
+    /// Sub-command `03` — Sample Name Transmission.
+    SampleName(SampleName),
+    /// Sub-command `04` — Sample Name Request.
+    SampleNameRequest {
+        /// The sample number (14-bit LSB-first).
+        sample_number: u16,
+    },
 }
 
 /// A **General MIDI System** message, per RP-003 (General MIDI System
@@ -7469,6 +7739,28 @@ impl SmfFile {
                     tick: ev.tick,
                     track: ev.track,
                     reference,
+                });
+            }
+        }
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **Sample Dump Extensions** message (CA-019,
+    /// `F0 7E <dev> 05 <sub> …`) from every track, pinned to the
+    /// absolute tick at which it fires, in time order. Each entry is
+    /// decoded via [`UniversalSysExEvent::sample_dump_extension`];
+    /// packets the decoder rejects (wrong realm — the Real-Time `0x05`
+    /// family is MTC Cueing — or truncated fields) are skipped. Returns
+    /// an empty `Vec` when no track carries one.
+    pub fn sample_dump_extensions(&self) -> Vec<SampleDumpExtensionEvent> {
+        let mut out: Vec<SampleDumpExtensionEvent> = Vec::new();
+        for ev in self.universal_sysex_events() {
+            if let Some(extension) = ev.sample_dump_extension() {
+                out.push(SampleDumpExtensionEvent {
+                    tick: ev.tick,
+                    track: ev.track,
+                    extension,
                 });
             }
         }
@@ -19108,6 +19400,153 @@ mod tests {
         assert_eq!(frs.len(), 1);
         assert_eq!(frs[0].tick, 30);
         assert_eq!(frs[0].reference.command, FileReferenceCommand::CloseFile);
+    }
+
+    // ----------------------------------------------------------------
+    // sample_dump_extension() — CA-019 Sample Dump Extensions.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn sample_dump_extension_extended_dump_header() {
+        // 44100.5 Hz, 2^33-word sample, loop 2..=10, forward+release,
+        // stereo. All multi-byte fields LSB-first 7-bit groups.
+        let mut payload: Vec<u8> = vec![0x7E, 0x7F, 0x05, 0x05];
+        payload.extend_from_slice(&[0x07, 0x00]); // sample number 7
+        payload.push(16); // sample format: 16 significant bits
+        payload.extend_from_slice(&[0x44, 0x58, 0x02, 0x00]); // 44100 Hz integer
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x40]); // fraction 2^27 = 0.5 Hz
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x20]); // length 2^33
+        payload.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00]); // loop start 2
+        payload.extend_from_slice(&[0x0A, 0x00, 0x00, 0x00, 0x00]); // loop end 10
+        payload.push(0x02); // forward, unidirectional, with release
+        payload.push(0x02); // 2 channels
+        payload.push(0xF7);
+        let smf = smf_with_sysex(&payload);
+        let evs = smf.universal_sysex_events();
+        let ext = evs[0].sample_dump_extension().expect("must decode");
+        let SampleDumpExtension::ExtendedDumpHeader(h) = ext else {
+            panic!("wrong variant: {ext:?}");
+        };
+        assert_eq!(h.sample_number, 7);
+        assert_eq!(h.sample_format, 16);
+        assert_eq!(h.sample_rate_integer_hz, 44100);
+        assert_eq!(h.sample_rate_fraction, 1 << 27);
+        assert!((h.sample_rate_hz() - 44100.5).abs() < 1e-9);
+        assert_eq!(h.sample_length, 1u64 << 33);
+        assert_eq!(h.loop_start, 2);
+        assert_eq!(h.loop_end, 10);
+        assert_eq!(h.loop_type, ExtendedLoopType::ForwardWithRelease);
+        assert_eq!(h.channels, 2);
+    }
+
+    #[test]
+    fn sample_dump_extension_extended_loop_points_and_request() {
+        // Transmission: sample 5, loop 7F 7F (delete all), backward
+        // bidirectional, 100..=200.
+        let mut payload: Vec<u8> = vec![0x7E, 0x7F, 0x05, 0x06];
+        payload.extend_from_slice(&[0x05, 0x00]); // sample 5
+        payload.extend_from_slice(&[0x7F, 0x7F]); // loop number = delete all
+        payload.push(0x41); // backward bi-directional
+        payload.extend_from_slice(&[100, 0x00, 0x00, 0x00, 0x00]);
+        payload.extend_from_slice(&[72, 0x01, 0x00, 0x00, 0x00]); // 200 = 72 + 128
+        payload.push(0xF7);
+        let smf = smf_with_sysex(&payload);
+        let evs = smf.universal_sysex_events();
+        let SampleDumpExtension::ExtendedLoopPoints(lp) =
+            evs[0].sample_dump_extension().expect("must decode")
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(lp.sample_number, 5);
+        assert_eq!(lp.loop_number, 0x3FFF);
+        assert_eq!(lp.loop_type, ExtendedLoopType::BackwardBidirectional);
+        assert_eq!(lp.loop_start, 100);
+        assert_eq!(lp.loop_end, 200);
+
+        // Request: sample 5, loop 1.
+        let smf = smf_with_sysex(&[0x7E, 0x7F, 0x05, 0x07, 0x05, 0x00, 0x01, 0x00, 0xF7]);
+        let evs = smf.universal_sysex_events();
+        assert_eq!(
+            evs[0].sample_dump_extension(),
+            Some(SampleDumpExtension::ExtendedLoopPointsRequest {
+                sample_number: 5,
+                loop_number: 1,
+            }),
+        );
+    }
+
+    #[test]
+    fn sample_dump_extension_name_transmission_worked_example() {
+        // CA-019's worked example: SAMPLE NAME Transmit "Test Sample"
+        // = F0 7E 01 05 03 00 01 00 0B 54 65 73 74 20 53 61 6D 70 6C 65 F7.
+        let smf = smf_with_sysex(&[
+            0x7E, 0x01, 0x05, 0x03, 0x00, 0x01, 0x00, 0x0B, 0x54, 0x65, 0x73, 0x74, 0x20, 0x53,
+            0x61, 0x6D, 0x70, 0x6C, 0x65, 0xF7,
+        ]);
+        let evs = smf.universal_sysex_events();
+        let SampleDumpExtension::SampleName(name) =
+            evs[0].sample_dump_extension().expect("must decode")
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(name.name_lossy(), "Test Sample");
+        assert!(name.language_tag.is_empty());
+        // The `ss ss` pair reads 128 under the Sample Dump Standard's
+        // LSB-first convention this decoder applies uniformly (the
+        // CA-019 example prose calls it "sample #1"; the byte order of
+        // the un-annotated ss ss field is resolved in the Standard's
+        // favour — see the SampleDumpExtension doc note).
+        assert_eq!(name.sample_number, 128);
+    }
+
+    #[test]
+    fn sample_dump_extension_name_request() {
+        let smf = smf_with_sysex(&[0x7E, 0x01, 0x05, 0x04, 0x02, 0x00, 0xF7]);
+        let evs = smf.universal_sysex_events();
+        assert_eq!(
+            evs[0].sample_dump_extension(),
+            Some(SampleDumpExtension::SampleNameRequest { sample_number: 2 }),
+        );
+    }
+
+    #[test]
+    fn sample_dump_extension_none_on_truncation_and_wrong_realm() {
+        // Extended header truncated before the channel-count byte.
+        let mut payload: Vec<u8> = vec![0x7E, 0x7F, 0x05, 0x05];
+        payload.extend_from_slice(&[0x07, 0x00, 16]);
+        payload.extend_from_slice(&[0x44, 0x58, 0x02, 0x00]);
+        payload.push(0xF7);
+        let smf = smf_with_sysex(&payload);
+        assert_eq!(
+            smf.universal_sysex_events()[0].sample_dump_extension(),
+            None,
+        );
+        // Real-Time 0x05 is MTC Cueing, not Sample Dump Extensions.
+        let smf = smf_with_sysex(&[0x7F, 0x7F, 0x05, 0x01, 0x00, 0x00, 0xF7]);
+        assert_eq!(
+            smf.universal_sysex_events()[0].sample_dump_extension(),
+            None,
+        );
+    }
+
+    #[test]
+    fn sample_dump_extensions_iterator_collects_in_time_order() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(12));
+        t0.extend_from_slice(&[0xF0, 0x07]);
+        t0.extend_from_slice(&[0x7E, 0x01, 0x05, 0x04, 0x02, 0x00, 0xF7]);
+        t0.extend_from_slice(&encode_vlq(0));
+        t0.extend_from_slice(&[0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&t0));
+        let smf = parse(&blob).unwrap();
+        let exts = smf.sample_dump_extensions();
+        assert_eq!(exts.len(), 1);
+        assert_eq!(exts[0].tick, 12);
+        assert_eq!(
+            exts[0].extension,
+            SampleDumpExtension::SampleNameRequest { sample_number: 2 },
+        );
     }
 
     #[test]
