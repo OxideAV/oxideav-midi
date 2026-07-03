@@ -256,6 +256,16 @@ pub struct ChannelState {
     /// send level into the system Chorus effect (CA-024, CC #93). Default
     /// 0 (fully dry).
     pub chorus_send: u8,
+    /// Pending CC 88 **High-Resolution Velocity Prefix** (CA-031): the
+    /// lower 7 bits affixed below the *next* Note On / Note Off velocity
+    /// on this channel, forming a 14-bit velocity
+    /// `(velocity << 7) | prefix`. Consumed (cleared) by the next note
+    /// message per CA-031 — a `9n key 0` Note-Off form consumes it with
+    /// no effect so the Running Status shortcut stays a valid Note Off.
+    /// `None` (the default) leaves note-on gain exactly as the 7-bit
+    /// path computes it, so scores that never send CC 88 render
+    /// bit-identically.
+    pub high_res_velocity_prefix: Option<u8>,
 }
 
 impl Default for ChannelState {
@@ -284,6 +294,7 @@ impl Default for ChannelState {
             mpe_role: MpeRole::None,
             reverb_send: 0,
             chorus_send: 0,
+            high_res_velocity_prefix: None,
         }
     }
 }
@@ -2035,6 +2046,19 @@ impl Mixer {
         self.channels[ch].portamento_ctrl_source = Some(source_key & 0x7F);
     }
 
+    /// Apply CC 88 (High-Resolution Velocity Prefix, CA-031). Arms the
+    /// channel's prefix register with the lower 7 velocity bits for the
+    /// **next** Note On / Note Off on this channel; that note message
+    /// consumes it (a velocity-0 Note-On form consumes it with no
+    /// effect, staying a valid Note Off per CA-031). At note-on the
+    /// 14-bit velocity `(velocity << 7) | value` refines the note's
+    /// static gain by the ratio it adds over the plain 7-bit velocity,
+    /// so a prefix of 0 renders bit-identically to no prefix.
+    pub fn set_high_res_velocity_prefix(&mut self, channel: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].high_res_velocity_prefix = Some(value & 0x7F);
+    }
+
     /// Compute the glide setup for a note-on at `target_key` on `ch`,
     /// returning `(offset_cents, total_samples)` when a glide should run
     /// or `None` for an immediate (non-gliding) attack. Consumes the
@@ -2256,6 +2280,20 @@ impl Mixer {
         if depth_cents != 0 {
             voice.set_mod_depth_cents(depth_cents);
         }
+        // CA-031 CC 88 High-Resolution Velocity Prefix: consume a pending
+        // prefix and refine the note's gain by the ratio of the 14-bit
+        // velocity to its 7-bit-only value (`(vel<<7)|lsb` over `vel<<7`).
+        // The voice itself was built from the 7-bit velocity, so this
+        // multiplicative correction is exactly the extra resolution the
+        // prefix adds; a prefix of 0 — or no prefix — is a ratio of 1.0,
+        // keeping the legacy path bit-identical.
+        let hr_gain = match self.channels[ch].high_res_velocity_prefix.take() {
+            Some(lsb) if velocity > 0 => {
+                let coarse = (velocity as u16) << 7;
+                (coarse | (lsb & 0x7F) as u16) as f32 / coarse as f32
+            }
+            _ => 1.0,
+        };
         let idx = self.pick_slot();
         let age = self.next_age;
         self.next_age = self.next_age.wrapping_add(1);
@@ -2272,8 +2310,10 @@ impl Mixer {
             age,
             velocity_norm: (velocity as f32 / 127.0).clamp(0.0, 1.0),
             // Soft Pedal (CC 67): a note struck while the pedal is down is
-            // attenuated; one struck with it up renders at unity.
-            note_gain: if st.soft_pedal { SOFT_PEDAL_GAIN } else { 1.0 },
+            // attenuated; one struck with it up renders at unity. The
+            // CA-031 high-resolution velocity refinement multiplies in —
+            // both are static per-note gains captured at strike time.
+            note_gain: hr_gain * if st.soft_pedal { SOFT_PEDAL_GAIN } else { 1.0 },
             glide_offset_cents,
             glide_step_cents_per_sample: glide_step,
             glide_remaining_samples: glide_remaining,
@@ -2289,6 +2329,11 @@ impl Mixer {
     /// independently — the pedal that releases last owns the actual
     /// `release()`.
     pub fn note_off(&mut self, channel: u8, key: u8) {
+        // CA-031: a Note Off is a note message too — it clears the
+        // channel's pending High-Resolution Velocity Prefix (the release
+        // velocity is not modelled as a gain, so the prefix simply
+        // expires here, matching the "no effect on 9n kk 00" rule).
+        self.channels[channel as usize % NUM_CHANNELS].high_res_velocity_prefix = None;
         let sustain = self.channels[channel as usize % NUM_CHANNELS].sustain;
         for slot in self.slots.iter_mut() {
             if slot.channel == channel && slot.key == key {
@@ -2908,6 +2953,85 @@ mod tests {
         m.mix_stereo(&mut l, &mut r);
         assert!(r[0] > 0.0);
         assert!(l[0].abs() < 1e-6, "left={} should be silent", l[0]);
+    }
+
+    #[test]
+    fn cc88_prefix_refines_next_note_gain_and_is_consumed() {
+        // CA-031: prefix 0x7F below velocity 100 gives a 14-bit velocity
+        // of (100<<7)|127 — the note's gain rises by exactly that ratio
+        // over the plain 7-bit note. The register clears with the note,
+        // so a second strike renders at the plain gain again.
+        let mut plain = Mixer::new();
+        plain.note_on(0, 60, 100, voice(0.5, 64));
+        let (mut lp, mut rp) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        plain.mix_stereo(&mut lp, &mut rp);
+
+        let mut hr = Mixer::new();
+        hr.set_high_res_velocity_prefix(0, 0x7F);
+        hr.note_on(0, 60, 100, voice(0.5, 64));
+        let (mut lh, mut rh) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        hr.mix_stereo(&mut lh, &mut rh);
+
+        let coarse = (100u16 << 7) as f32;
+        let expected = lp[0] * ((100u16 << 7) | 0x7F) as f32 / coarse;
+        assert!(
+            (lh[0] - expected).abs() < 1e-6,
+            "hi-res gain {} != expected {}",
+            lh[0],
+            expected,
+        );
+
+        // Second note on the same mixer: the prefix was consumed, so it
+        // renders identically to the plain mixer's note.
+        let mut hr2 = Mixer::new();
+        hr2.set_high_res_velocity_prefix(0, 0x7F);
+        hr2.note_on(0, 60, 100, voice(0.5, 64)); // consumes the prefix
+        hr2.all_sound_off(0); // silence it so only the next note sounds
+        hr2.note_on(0, 60, 100, voice(0.5, 64));
+        let (mut l2, mut r2) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        hr2.mix_stereo(&mut l2, &mut r2);
+        assert!(
+            (l2[0] - lp[0]).abs() < 1e-6,
+            "second note {} should render plain {}",
+            l2[0],
+            lp[0],
+        );
+    }
+
+    #[test]
+    fn cc88_prefix_zero_is_bit_identical_to_no_prefix() {
+        let mut plain = Mixer::new();
+        plain.note_on(0, 60, 100, voice(0.5, 64));
+        let (mut lp, mut rp) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        plain.mix_stereo(&mut lp, &mut rp);
+        let mut hr = Mixer::new();
+        hr.set_high_res_velocity_prefix(0, 0);
+        hr.note_on(0, 60, 100, voice(0.5, 64));
+        let (mut lh, mut rh) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        hr.mix_stereo(&mut lh, &mut rh);
+        assert_eq!(lp, lh);
+        assert_eq!(rp, rh);
+    }
+
+    #[test]
+    fn cc88_prefix_expires_on_note_off() {
+        // A Note Off is a note message: it consumes the pending prefix
+        // (with no effect), so a following note-on renders plain.
+        let mut m = Mixer::new();
+        m.note_on(0, 60, 100, voice(0.5, 64));
+        m.set_high_res_velocity_prefix(0, 0x7F);
+        m.note_off(0, 60); // clears the register per CA-031
+        m.note_on(0, 62, 100, voice(0.5, 64));
+        let (mut l, mut r) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        m.mix_stereo(&mut l, &mut r);
+
+        let mut plain = Mixer::new();
+        plain.note_on(0, 60, 100, voice(0.5, 64));
+        plain.note_off(0, 60);
+        plain.note_on(0, 62, 100, voice(0.5, 64));
+        let (mut lp, mut rp) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        plain.mix_stereo(&mut lp, &mut rp);
+        assert_eq!(l, lp, "expired prefix must not refine the next note");
     }
 
     #[test]

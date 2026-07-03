@@ -284,6 +284,9 @@ impl Scheduler {
                 84 => mixer.set_portamento_control(channel, value), // CC 84 — Portamento Control
 
                 74 => mixer.set_timbre(channel, value), // MPE "third dimension" (CC #74)
+                // CC 88 — High-Resolution Velocity Prefix (CA-031): lower
+                // 7 bits affixed to the next Note On / Note Off velocity.
+                88 => mixer.set_high_res_velocity_prefix(channel, value),
                 91 => mixer.channel_state_mut(channel).reverb_send = value, // CC 91 — Reverb Send (CA-024)
                 93 => mixer.channel_state_mut(channel).chorus_send = value, // CC 93 — Chorus Send (CA-024)
                 96 => mixer.data_inc_dec(channel, 1), // Data Increment (RP-018; value ignored)

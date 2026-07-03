@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 389 — synth CA-031 high-resolution velocity (CC 88) routing
+
+- The mixer now honours the CC 88 High-Resolution Velocity Prefix at
+  synthesis time. `Mixer::set_high_res_velocity_prefix` (routed from
+  the scheduler's CC dispatch) arms a per-channel register; the next
+  `note_on` consumes it and multiplies the note's static gain by the
+  ratio the 14-bit velocity adds over the plain 7-bit one
+  (`((vel<<7)|lsb) / (vel<<7)`) — the voice itself is still built from
+  the 7-bit velocity, so the correction is exactly the resolution the
+  prefix contributes. A prefix of 0 (or none) is a ratio of 1.0:
+  prefix-free scores render bit-identically. `note_off` consumes a
+  pending prefix with no effect, matching CA-031's rule that
+  `9n kk 00` stays a valid Note Off and the register clears after
+  every note message.
+- 3 new tests: exact gain ratio + consumption on the next strike,
+  prefix-0 bit-identity, and expiry via Note Off.
+- Provenance: `docs/audio/midi/recommended-practices/ca31.pdf`.
+
 ### Round 389 — smf CA-031 High-Resolution Velocity Prefix (CC 88)
 
 - `SmfFile::notes()` now folds the CC 88 **High-Resolution Velocity
