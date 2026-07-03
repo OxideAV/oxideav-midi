@@ -2081,6 +2081,34 @@ impl ControlChangeEvent {
     pub fn high_res_velocity_prefix(&self) -> Option<u8> {
         (self.controller == 88).then_some(self.value)
     }
+
+    /// Classify a "Sound Controller" (CC 70–79) into a typed
+    /// [`SoundController`] carrying the `0..=127` value, per RP-021
+    /// (*Sound Controller Defaults (Revised)*). Returns `None` for any
+    /// other controller number.
+    ///
+    /// The variant names are RP-021's *default* functions (Sound
+    /// Variation, Timbre, Release / Attack Time, Brightness, and the
+    /// RP-021-added Decay Time / Vibrato Rate / Depth / Delay); CC 79
+    /// is surfaced as [`SoundController::Undefined10`] since RP-021
+    /// leaves it unassigned. A stream may remap any of these via the
+    /// CA-022 Controller Destination Setting message — the classifier
+    /// reports the default, not the remap.
+    pub fn sound_controller(&self) -> Option<SoundController> {
+        Some(match self.controller {
+            70 => SoundController::SoundVariation(self.value),
+            71 => SoundController::Timbre(self.value),
+            72 => SoundController::ReleaseTime(self.value),
+            73 => SoundController::AttackTime(self.value),
+            74 => SoundController::Brightness(self.value),
+            75 => SoundController::DecayTime(self.value),
+            76 => SoundController::VibratoRate(self.value),
+            77 => SoundController::VibratoDepth(self.value),
+            78 => SoundController::VibratoDelay(self.value),
+            79 => SoundController::Undefined10(self.value),
+            _ => return None,
+        })
+    }
 }
 
 /// One Channel Mode Message (`Bn cc vv`, `cc` in `120..=127`) pinned to
@@ -2145,6 +2173,125 @@ impl EffectDepthEvent {
     /// Chorus Send / Celeste / Phaser) with its `0..=127` level.
     pub fn depth(&self) -> EffectDepth {
         self.depth
+    }
+}
+
+/// One of the ten "Sound Controller" continuous controllers (CC 70–79),
+/// classified per RP-021 (*Sound Controller Defaults (Revised)*). Each
+/// carries a `0..=127` value.
+///
+/// RP-021 assigns default names to Sound Controllers 1–9 (CC 70–78) —
+/// the first five carried over unchanged from the MIDI 1.0
+/// specification, Sound Controllers 6–9 newly named — and leaves Sound
+/// Controller 10 (CC 79) undefined. A device may remap any of them via
+/// the Universal Real-Time "Controller Destination Setting" message
+/// (CA-022); the classifier reports the RP-021 *default* function.
+/// Returned by [`ControlChangeEvent::sound_controller`] and collected by
+/// [`SmfFile::sound_controllers`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoundController {
+    /// CC 70 — Sound Controller 1, default **Sound Variation**.
+    SoundVariation(u8),
+    /// CC 71 — Sound Controller 2, default **Timbre / Harmonic
+    /// Intensity**.
+    Timbre(u8),
+    /// CC 72 — Sound Controller 3, default **Release Time**.
+    ReleaseTime(u8),
+    /// CC 73 — Sound Controller 4, default **Attack Time**.
+    AttackTime(u8),
+    /// CC 74 — Sound Controller 5, default **Brightness**. (On an MPE
+    /// Member Channel this same controller is the per-note "third
+    /// dimension" / timbre axis; the classifier stays zone-agnostic and
+    /// reports the RP-021 default name.)
+    Brightness(u8),
+    /// CC 75 — Sound Controller 6, default **Decay Time** (named by
+    /// RP-021).
+    DecayTime(u8),
+    /// CC 76 — Sound Controller 7, default **Vibrato Rate** (named by
+    /// RP-021).
+    VibratoRate(u8),
+    /// CC 77 — Sound Controller 8, default **Vibrato Depth** (named by
+    /// RP-021).
+    VibratoDepth(u8),
+    /// CC 78 — Sound Controller 9, default **Vibrato Delay** (named by
+    /// RP-021).
+    VibratoDelay(u8),
+    /// CC 79 — Sound Controller 10, **undefined** in RP-021 (no default
+    /// name assigned).
+    Undefined10(u8),
+}
+
+impl SoundController {
+    /// The raw `0..=127` controller value, regardless of which of the
+    /// ten sound-controller slots this is.
+    pub fn level(&self) -> u8 {
+        match self {
+            SoundController::SoundVariation(v)
+            | SoundController::Timbre(v)
+            | SoundController::ReleaseTime(v)
+            | SoundController::AttackTime(v)
+            | SoundController::Brightness(v)
+            | SoundController::DecayTime(v)
+            | SoundController::VibratoRate(v)
+            | SoundController::VibratoDepth(v)
+            | SoundController::VibratoDelay(v)
+            | SoundController::Undefined10(v) => *v,
+        }
+    }
+
+    /// The controller number (`70..=79`) this variant corresponds to.
+    pub fn controller(&self) -> u8 {
+        match self {
+            SoundController::SoundVariation(_) => 70,
+            SoundController::Timbre(_) => 71,
+            SoundController::ReleaseTime(_) => 72,
+            SoundController::AttackTime(_) => 73,
+            SoundController::Brightness(_) => 74,
+            SoundController::DecayTime(_) => 75,
+            SoundController::VibratoRate(_) => 76,
+            SoundController::VibratoDepth(_) => 77,
+            SoundController::VibratoDelay(_) => 78,
+            SoundController::Undefined10(_) => 79,
+        }
+    }
+
+    /// The 1-based Sound Controller ordinal (`1..=10`) RP-021 uses for
+    /// this slot (`controller() - 69`).
+    pub fn ordinal(&self) -> u8 {
+        self.controller() - 69
+    }
+}
+
+/// One **Sound Controller** (`Bn cc vv`, `cc` in `70..=79`) pinned to
+/// the absolute tick at which it fires, with the controller classified
+/// into a typed [`SoundController`] per RP-021.
+///
+/// Returned by [`SmfFile::sound_controllers`] — the typed counterpart of
+/// the sound-controller subset of [`SmfFile::control_changes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoundControllerEvent {
+    /// Cumulative delta-sum from the start of the track that carried the
+    /// controller, in division units. For format-1 SMFs this is also the
+    /// absolute tick on the shared timebase.
+    pub tick: u64,
+    /// Index of the [`Track`] the controller came from.
+    pub track: usize,
+    /// The MIDI channel index in the spec's `0..=15` range.
+    pub channel: u8,
+    /// The classified sound controller + its value.
+    pub controller: SoundController,
+}
+
+impl SoundControllerEvent {
+    /// The MIDI channel index in the spec's `0..=15` range.
+    pub fn channel(&self) -> u8 {
+        self.channel
+    }
+
+    /// The classified sound controller (RP-021 default function) with
+    /// its `0..=127` value.
+    pub fn controller(&self) -> SoundController {
+        self.controller
     }
 }
 
@@ -6436,6 +6583,56 @@ impl SmfFile {
                             track: track_idx,
                             channel: *channel,
                             depth,
+                        });
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **Sound Controller** (`Bn cc vv` with `cc` in
+    /// `70..=79`) from every track, pinned to the absolute tick at which
+    /// it fires, with each controller classified into a typed
+    /// [`SoundController`] per RP-021 (*Sound Controller Defaults
+    /// (Revised)*).
+    ///
+    /// The typed counterpart of the sound-controller subset of
+    /// [`SmfFile::control_changes`]: it keeps only CC 70–79 (Sound
+    /// Variation / Timbre / Release Time / Attack Time / Brightness /
+    /// Decay Time / Vibrato Rate / Vibrato Depth / Vibrato Delay / the
+    /// undefined tenth slot) and filters out every other controller.
+    ///
+    /// Stable-merged by absolute tick (track 0 before track 1 at the
+    /// same tick), matching the rest of the iterator family. Returns an
+    /// empty `Vec` when no track carries a sound controller. Cost is
+    /// linear in the total event count and bounded above by
+    /// [`MAX_EVENTS_PER_FILE`].
+    pub fn sound_controllers(&self) -> Vec<SoundControllerEvent> {
+        let mut out: Vec<SoundControllerEvent> = Vec::new();
+        for (track_idx, track) in self.tracks.iter().enumerate() {
+            let mut abs: u64 = 0;
+            for ev in &track.events {
+                abs = abs.saturating_add(ev.delta as u64);
+                if let Event::Channel(ChannelMessage {
+                    channel,
+                    body: ChannelBody::ControlChange { controller, value },
+                }) = &ev.kind
+                {
+                    let scratch = ControlChangeEvent {
+                        tick: abs,
+                        track: track_idx,
+                        channel: *channel,
+                        controller: *controller,
+                        value: *value,
+                    };
+                    if let Some(sc) = scratch.sound_controller() {
+                        out.push(SoundControllerEvent {
+                            tick: abs,
+                            track: track_idx,
+                            channel: *channel,
+                            controller: sc,
                         });
                     }
                 }
@@ -17758,5 +17955,96 @@ mod tests {
         blob.extend(track_chunk(&t0));
         let smf = parse(&blob).unwrap();
         assert!(smf.effect_depths().is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // sound_controller() / sound_controllers() — RP-021 CC 70-79.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn sound_controller_classifies_full_70_79_family() {
+        // RP-021 table: CC# → default name (CC 79 undefined).
+        let cases = [
+            (70u8, SoundController::SoundVariation(33)),
+            (71, SoundController::Timbre(33)),
+            (72, SoundController::ReleaseTime(33)),
+            (73, SoundController::AttackTime(33)),
+            (74, SoundController::Brightness(33)),
+            (75, SoundController::DecayTime(33)),
+            (76, SoundController::VibratoRate(33)),
+            (77, SoundController::VibratoDepth(33)),
+            (78, SoundController::VibratoDelay(33)),
+            (79, SoundController::Undefined10(33)),
+        ];
+        for (controller, expected) in cases {
+            let cc = ControlChangeEvent {
+                tick: 0,
+                track: 0,
+                channel: 0,
+                controller,
+                value: 33,
+            };
+            let sc = cc.sound_controller().expect("CC 70-79 must classify");
+            assert_eq!(sc, expected);
+            assert_eq!(sc.level(), 33);
+            assert_eq!(sc.controller(), controller);
+            assert_eq!(sc.ordinal(), controller - 69);
+        }
+    }
+
+    #[test]
+    fn sound_controller_returns_none_outside_70_79() {
+        for controller in [7u8, 10, 64, 69, 80, 91, 120] {
+            let cc = ControlChangeEvent {
+                tick: 0,
+                track: 0,
+                channel: 0,
+                controller,
+                value: 64,
+            };
+            assert_eq!(
+                cc.sound_controller(),
+                None,
+                "controller {controller} should not classify"
+            );
+        }
+    }
+
+    #[test]
+    fn sound_controllers_iterator_filters_and_merges() {
+        // Track 0: CC 7 (ignored) then CC 73 Attack Time @20.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xB0, 0x07, 0x64]); // filtered out
+        t0.extend_from_slice(&encode_vlq(20));
+        t0.extend_from_slice(&[0xB0, 73, 0x50]); // Attack Time = 80 @20
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        // Track 1: CC 76 Vibrato Rate @5.
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(5));
+        t1.extend_from_slice(&[0xB1, 76, 0x28]); // Vibrato Rate = 40 @5
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let scs = smf.sound_controllers();
+        assert_eq!(scs.len(), 2, "CC 7 must be filtered out");
+        assert_eq!(scs[0].tick, 5);
+        assert_eq!(scs[0].channel(), 1);
+        assert_eq!(scs[0].controller(), SoundController::VibratoRate(40));
+        assert_eq!(scs[1].tick, 20);
+        assert_eq!(scs[1].channel(), 0);
+        assert_eq!(scs[1].controller(), SoundController::AttackTime(80));
+    }
+
+    #[test]
+    fn sound_controllers_empty_when_none_present() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&[0x00, 0xB0, 91, 0x64]); // effects depth, not 70-79
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&t0));
+        let smf = parse(&blob).unwrap();
+        assert!(smf.sound_controllers().is_empty());
     }
 }

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 389 — smf RP-021 Sound Controller classifier (CC 70-79)
+
+- `ControlChangeEvent::sound_controller()` classifies the ten Sound
+  Controllers (CC 70–79) into a typed `SoundController` per RP-021
+  (*Sound Controller Defaults (Revised)*): Sound Variation / Timbre
+  (Harmonic Intensity) / Release Time / Attack Time / Brightness carry
+  over from the MIDI 1.0 spec; RP-021 newly names Decay Time / Vibrato
+  Rate / Vibrato Depth / Vibrato Delay (Sound Controllers 6–9); CC 79
+  (Sound Controller 10) stays undefined and surfaces as `Undefined10`.
+  Accessors: `.level()` (raw 0..=127 value), `.controller()` (70..=79),
+  `.ordinal()` (RP-021's 1-based slot). The doc notes CA-022's
+  Controller Destination Setting may remap any slot — the classifier
+  reports the RP-021 default.
+- `SmfFile::sound_controllers()` is the stably-merged absolute-tick
+  iterator over that subset, matching the `effect_depths()` /
+  `channel_mode_messages()` family conventions.
+- 4 new tests: full-family classification (name + level + controller +
+  ordinal), out-of-range rejection, cross-track merge + filter, empty
+  case.
+- Provenance: `docs/audio/midi/recommended-practices/rp21.pdf`.
+
 ### Round 389 — synth CA-031 high-resolution velocity (CC 88) routing
 
 - The mixer now honours the CC 88 High-Resolution Velocity Prefix at
