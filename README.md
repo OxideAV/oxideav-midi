@@ -1,5 +1,7 @@
 # oxideav-midi
 
+[![CI](https://github.com/OxideAV/oxideav-midi/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-midi/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-midi.svg)](https://crates.io/crates/oxideav-midi) [![docs.rs](https://docs.rs/oxideav-midi/badge.svg)](https://docs.rs/oxideav-midi) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **MIDI** — Standard MIDI File (`.mid` / SMF) parser + writer,
 transport metadata, and a soft-synth. Zero C dependencies, zero FFI,
 zero `*-sys`.
