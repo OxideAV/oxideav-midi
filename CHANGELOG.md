@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 389 — smf RP-050 MIDI Visual Control decoder
+
+- `UniversalSysExEvent::midi_visual_control()` decodes the RP-050
+  **MIDI Visual Control** Data Set (`F0 7E <dev> 0C 01 [addr×3]
+  [data…] <sum> F7`, Non-Real-Time Sub-ID #1 `0x0C` / Sub-ID #2 `0x01`
+  "Command Set Version 1.0") into a typed `MidiVisualControl`: the
+  3-byte Parameter Address Map starting address, one data byte per
+  consecutive parameter written, and the §2.3.2 checksum verdict
+  (7-bit sum of address + data + checksum must be zero — mismatches
+  are *reported* via `checksum_valid`, not rejected).
+  `MvcParameter::from_address()` names the full §2.3.2.1 address map
+  (MVC On/Off, Clip / Effect Control Rx channels, Note Message
+  Enabled, Playback-Speed / Dissolve-Time / Effect-Control-1..3 assign
+  nibbles, Playback Speed Ctrl Range, Keyboard Range Lower / Upper;
+  reserved areas surface raw). `is_mvc_on()` / `is_mvc_off()` classify
+  the two required messages. The classifier gains the
+  `UniversalSubId2::NonRtMvcVersion1` name for `0x0C 0x01` (the
+  Real-Time `0x0C` Mobile Phone Control family is untouched).
+- `SmfFile::midi_visual_controls()` is the time-ordered iterator
+  (checksum mismatches kept + flagged).
+- 6 new tests: the §2.3.4 MVC-On and §2.3.3 consecutive-parameter
+  worked examples, checksum-mismatch flagging, the address-map table,
+  truncation + wrong-family rejection, and the iterator.
+- Provenance: `docs/audio/midi/recommended-practices/
+  rp50-MIDI-Visual-Control.pdf` §2.3.
+
 ### Round 389 — smf CA-019 Sample Dump Extensions decoders
 
 - `UniversalSysExEvent::sample_dump_extension()` decodes the five

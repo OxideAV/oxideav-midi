@@ -3395,6 +3395,19 @@ pub struct SampleDumpExtensionEvent {
     pub extension: SampleDumpExtension,
 }
 
+/// A decoded **MIDI Visual Control** message (RP-050) pinned to the
+/// absolute tick (and the track) at which it fires — the element type
+/// of [`SmfFile::midi_visual_controls`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MidiVisualControlEvent {
+    /// Absolute tick (cumulative per-track delta sum).
+    pub tick: u64,
+    /// Source [`Track`] index within [`SmfFile::tracks`].
+    pub track: usize,
+    /// The decoded MIDI Visual Control Data Set.
+    pub control: MidiVisualControl,
+}
+
 impl UniversalSysExEvent {
     /// Decode this packet as a Notation **Bar Number** message when it
     /// is one, returning the signed 14-bit bar number and its semantic
@@ -4186,6 +4199,58 @@ impl UniversalSysExEvent {
             _ => None,
         }
     }
+
+    /// Decode this packet as a **MIDI Visual Control** Data Set message
+    /// (RP-050) when it is one, returning the 3-byte starting address,
+    /// the parameter data bytes, and the checksum verdict.
+    ///
+    /// Per RP-050 §2.3.1 MVC messages travel as Universal Non-Real-Time
+    /// SysEx with Sub-ID #1 = `0x0C` (MIDI Visual Control), Sub-ID #2 =
+    /// `0x01` (Command Set "Version 1.0"): `F0 7E <dev> 0C 01 [addr×3]
+    /// [data…] <sum> F7`. The Data Set (§2.3.2) is a 3-byte Parameter
+    /// Address Map address, one data byte per consecutive parameter
+    /// written, and a checksum chosen so the 7-bit sum of address +
+    /// data + checksum is zero. The decoder requires the address, at
+    /// least one data byte, and the checksum byte; it reports (rather
+    /// than rejects) a checksum mismatch via
+    /// [`MidiVisualControl::checksum_valid`] so a caller can apply its
+    /// own tolerance policy.
+    ///
+    /// Returns `None` unless the packet is Non-Real-Time `0x0C 0x01`
+    /// (the Real-Time `0x0C` family is the Mobile Phone Control
+    /// message) with the minimum field set present.
+    pub fn midi_visual_control(&self) -> Option<MidiVisualControl> {
+        if !matches!(
+            self.classification.sub_id1,
+            UniversalSubId1::MidiVisualControlOrMobilePhoneControl(
+                UniversalSubId2::NonRtMvcVersion1
+            )
+        ) {
+            return None;
+        }
+        // <realm=7E> <device_id> <0C> <01> a1 a2 a3 d… sum [F7]
+        let body = self.data.get(4..)?;
+        let body = if body.last() == Some(&0xF7) {
+            &body[..body.len() - 1]
+        } else {
+            body
+        };
+        // addr(3) + data(≥1) + sum(1).
+        if body.len() < 5 {
+            return None;
+        }
+        let address = [body[0] & 0x7F, body[1] & 0x7F, body[2] & 0x7F];
+        let data: Vec<u8> = body[3..body.len() - 1].iter().map(|b| *b & 0x7F).collect();
+        let sum = *body.last()? & 0x7F;
+        let total: u32 = address.iter().map(|b| *b as u32).sum::<u32>()
+            + data.iter().map(|b| *b as u32).sum::<u32>()
+            + sum as u32;
+        Some(MidiVisualControl {
+            address,
+            data,
+            checksum_valid: total % 128 == 0,
+        })
+    }
 }
 
 /// A decoded **MIDI Machine Control Command** — the leading opcode and
@@ -4949,6 +5014,122 @@ pub enum SampleDumpExtension {
     },
 }
 
+/// The named parameter a MIDI Visual Control address points at, per
+/// the RP-050 §2.3.2.1 Parameter Address Map. Every address is
+/// `10H xx yy`; unassigned / reserved slots surface as [`Reserved`]
+/// with the raw address.
+///
+/// [`Reserved`]: MvcParameter::Reserved
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MvcParameter {
+    /// `10 00 00` — MIDI Visual Control ON/OFF (`0` = Off, `1` = On).
+    MvcOnOff,
+    /// `10 00 01` — Clip Control Rx MIDI Channel (`0` = Ch. 1, `0x0F` =
+    /// Ch. 16, `0x10` = Off).
+    ClipControlRxChannel,
+    /// `10 00 02` — Effect Control Rx MIDI Channel (same encoding).
+    EffectControlRxChannel,
+    /// `10 00 03` — Note Message Enabled (`0` = Off, `1` = Assignable
+    /// within the keyboard range).
+    NoteMessageEnabled,
+    /// `10 10 00` / `10 10 01` — Playback Speed Ctrl Assign MSN / LSN
+    /// (4-bit nibbles combining into the 8-bit assignment: `0xD0`
+    /// Aftertouch, `0xE0` Pitch Bend, `0xFF` none, `01-1F`/`40-5F` a
+    /// CC number). `msn == true` for the MSN half.
+    PlaybackSpeedCtrlAssign {
+        /// `true` for the most-significant-nibble address (`…00`),
+        /// `false` for the LSN (`…01`).
+        msn: bool,
+    },
+    /// `10 10 02` / `10 10 03` — Dissolve Time Ctrl Assign MSN / LSN.
+    DissolveTimeCtrlAssign {
+        /// `true` for the MSN half.
+        msn: bool,
+    },
+    /// `10 20 00..=05` — Effect Control 1..=3 Assign MSN / LSN.
+    EffectControlAssign {
+        /// Which effect control (1..=3).
+        control: u8,
+        /// `true` for the MSN half.
+        msn: bool,
+    },
+    /// `10 30 01` — Playback Speed Ctrl Range (the RP-050 §2.3.9
+    /// min/center/max speed-multiple table selector).
+    PlaybackSpeedCtrlRange,
+    /// `10 30 02` — Keyboard Range Lower (MIDI note, default `0x24`).
+    KeyboardRangeLower,
+    /// `10 30 03` — Keyboard Range Upper (MIDI note, default `0x54`).
+    KeyboardRangeUpper,
+    /// Any other address (reserved areas), surfaced raw.
+    Reserved([u8; 3]),
+}
+
+impl MvcParameter {
+    /// Map a 3-byte MVC address to its Parameter Address Map entry.
+    pub fn from_address(address: [u8; 3]) -> Self {
+        match address {
+            [0x10, 0x00, 0x00] => MvcParameter::MvcOnOff,
+            [0x10, 0x00, 0x01] => MvcParameter::ClipControlRxChannel,
+            [0x10, 0x00, 0x02] => MvcParameter::EffectControlRxChannel,
+            [0x10, 0x00, 0x03] => MvcParameter::NoteMessageEnabled,
+            [0x10, 0x10, 0x00] => MvcParameter::PlaybackSpeedCtrlAssign { msn: true },
+            [0x10, 0x10, 0x01] => MvcParameter::PlaybackSpeedCtrlAssign { msn: false },
+            [0x10, 0x10, 0x02] => MvcParameter::DissolveTimeCtrlAssign { msn: true },
+            [0x10, 0x10, 0x03] => MvcParameter::DissolveTimeCtrlAssign { msn: false },
+            [0x10, 0x20, lsn @ 0x00..=0x05] => MvcParameter::EffectControlAssign {
+                control: lsn / 2 + 1,
+                msn: lsn % 2 == 0,
+            },
+            [0x10, 0x30, 0x01] => MvcParameter::PlaybackSpeedCtrlRange,
+            [0x10, 0x30, 0x02] => MvcParameter::KeyboardRangeLower,
+            [0x10, 0x30, 0x03] => MvcParameter::KeyboardRangeUpper,
+            other => MvcParameter::Reserved(other),
+        }
+    }
+}
+
+/// A decoded **MIDI Visual Control** Data Set message (RP-050) — a
+/// Universal Non-Real-Time SysEx `F0 7E <dev> 0C 01 [addr×3] [data…]
+/// <sum> F7` writing one or more consecutive parameters of a visual
+/// presentation device (video clip switcher, effect unit) starting at
+/// a Parameter Address Map address.
+///
+/// Decoded via [`UniversalSysExEvent::midi_visual_control`]. When
+/// `data` spans several bytes, RP-050 §2.3.2 defines them as writes to
+/// consecutive addresses (no reserved gaps allowed);
+/// [`parameter`](Self::parameter) names the *starting* address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MidiVisualControl {
+    /// The 3-byte starting address (`10H xx yy`).
+    pub address: [u8; 3],
+    /// The parameter data byte(s), one per consecutive address.
+    pub data: Vec<u8>,
+    /// `true` when the trailing checksum satisfies RP-050 §2.3.2: the
+    /// 7-bit sum of `[ADDR]`, `[DATA]`, and the checksum byte is zero.
+    pub checksum_valid: bool,
+}
+
+impl MidiVisualControl {
+    /// The Parameter Address Map entry at the starting address.
+    pub fn parameter(&self) -> MvcParameter {
+        MvcParameter::from_address(self.address)
+    }
+
+    /// `true` for the required **MIDI Visual Control ON** message
+    /// (address `10 00 00`, first data byte `1`) — the message a
+    /// Master must send before any other MVC traffic, and which resets
+    /// the Slave's MVC parameters to their defaults.
+    pub fn is_mvc_on(&self) -> bool {
+        self.address == [0x10, 0x00, 0x00] && self.data.first() == Some(&0x01)
+    }
+
+    /// `true` for the required **MIDI Visual Control OFF** message
+    /// (address `10 00 00`, first data byte `0`).
+    pub fn is_mvc_off(&self) -> bool {
+        self.address == [0x10, 0x00, 0x00] && self.data.first() == Some(&0x00)
+    }
+}
+
 /// A **General MIDI System** message, per RP-003 (General MIDI System
 /// Level 1) and the General MIDI 2 specification.
 ///
@@ -5690,6 +5871,11 @@ pub enum UniversalSubId2 {
     /// `0x0C 0x00` Real-Time — Mobile Phone Control Message.
     RtMobilePhoneControlMessage,
 
+    // ---- Non-Real-Time, Sub-ID #1 = 0x0C (MIDI Visual Control) ----
+    /// `0x0C 0x01` Non-Real-Time — MIDI Visual Control, Command Set ID
+    /// "Version 1.0" (RP-050 §2.3.1).
+    NonRtMvcVersion1,
+
     /// A Sub-ID #2 byte outside the Table 4 vocabulary the classifier
     /// knows about, surfaced for caller inspection.
     Other(u8),
@@ -6088,6 +6274,7 @@ fn classify_realm_sub2_for_0x0b(realm: UniversalRealm, sub2: Option<u8>) -> Univ
 fn classify_realm_sub2_for_0x0c(realm: UniversalRealm, sub2: Option<u8>) -> UniversalSubId2 {
     match (realm, sub2) {
         (UniversalRealm::RealTime, Some(0x00)) => UniversalSubId2::RtMobilePhoneControlMessage,
+        (UniversalRealm::NonRealTime, Some(0x01)) => UniversalSubId2::NonRtMvcVersion1,
         (_, other) => UniversalSubId2::Other(other.unwrap_or(0)),
     }
 }
@@ -7761,6 +7948,31 @@ impl SmfFile {
                     tick: ev.tick,
                     track: ev.track,
                     extension,
+                });
+            }
+        }
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **MIDI Visual Control** Data Set (RP-050, `F0 7E
+    /// <dev> 0C 01 [addr×3] [data…] <sum> F7`) from every track, pinned
+    /// to the absolute tick at which it fires, in time order. Each
+    /// entry is decoded via
+    /// [`UniversalSysExEvent::midi_visual_control`]; packets the
+    /// decoder rejects (wrong realm / Sub-ID #2, or fewer than the
+    /// address + one data byte + checksum) are skipped, while checksum
+    /// mismatches are *kept* and flagged on
+    /// [`MidiVisualControl::checksum_valid`]. Returns an empty `Vec`
+    /// when no track carries an MVC message.
+    pub fn midi_visual_controls(&self) -> Vec<MidiVisualControlEvent> {
+        let mut out: Vec<MidiVisualControlEvent> = Vec::new();
+        for ev in self.universal_sysex_events() {
+            if let Some(control) = ev.midi_visual_control() {
+                out.push(MidiVisualControlEvent {
+                    tick: ev.tick,
+                    track: ev.track,
+                    control,
                 });
             }
         }
@@ -19547,6 +19759,116 @@ mod tests {
             exts[0].extension,
             SampleDumpExtension::SampleNameRequest { sample_number: 2 },
         );
+    }
+
+    // ----------------------------------------------------------------
+    // midi_visual_control() — RP-050.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn midi_visual_control_decodes_mvc_on_example() {
+        // RP-050 §2.3.4: F0 7E DEV 0C 01 [10 00 00] 01 SUM F7 — the
+        // required MVC On. SUM makes the 7-bit total zero: 0x6F.
+        let smf = smf_with_sysex(&[0x7E, 0x00, 0x0C, 0x01, 0x10, 0x00, 0x00, 0x01, 0x6F, 0xF7]);
+        let evs = smf.universal_sysex_events();
+        let mvc = evs[0].midi_visual_control().expect("must decode");
+        assert_eq!(mvc.address, [0x10, 0x00, 0x00]);
+        assert_eq!(mvc.data, vec![0x01]);
+        assert!(mvc.checksum_valid);
+        assert_eq!(mvc.parameter(), MvcParameter::MvcOnOff);
+        assert!(mvc.is_mvc_on());
+        assert!(!mvc.is_mvc_off());
+    }
+
+    #[test]
+    fn midi_visual_control_decodes_consecutive_parameters_example() {
+        // RP-050 §2.3.3 consecutive example: [10 00 01] 0E 0E SUM —
+        // Clip + Effect Control Rx Channel both to channel 15.
+        // SUM = 128 - (0x10 + 0x01 + 0x0E + 0x0E) = 0x53.
+        let smf = smf_with_sysex(&[
+            0x7E, 0x00, 0x0C, 0x01, 0x10, 0x00, 0x01, 0x0E, 0x0E, 0x53, 0xF7,
+        ]);
+        let evs = smf.universal_sysex_events();
+        let mvc = evs[0].midi_visual_control().expect("must decode");
+        assert_eq!(mvc.parameter(), MvcParameter::ClipControlRxChannel);
+        assert_eq!(mvc.data, vec![0x0E, 0x0E]);
+        assert!(mvc.checksum_valid);
+    }
+
+    #[test]
+    fn midi_visual_control_flags_checksum_mismatch() {
+        // Same MVC On with a corrupted checksum byte: decoded but
+        // flagged.
+        let smf = smf_with_sysex(&[0x7E, 0x00, 0x0C, 0x01, 0x10, 0x00, 0x00, 0x00, 0x11, 0xF7]);
+        let evs = smf.universal_sysex_events();
+        let mvc = evs[0].midi_visual_control().expect("must decode");
+        assert!(!mvc.checksum_valid);
+        assert!(mvc.is_mvc_off());
+    }
+
+    #[test]
+    fn midi_visual_control_parameter_address_map() {
+        let cases: [([u8; 3], MvcParameter); 8] = [
+            ([0x10, 0x00, 0x03], MvcParameter::NoteMessageEnabled),
+            (
+                [0x10, 0x10, 0x00],
+                MvcParameter::PlaybackSpeedCtrlAssign { msn: true },
+            ),
+            (
+                [0x10, 0x10, 0x03],
+                MvcParameter::DissolveTimeCtrlAssign { msn: false },
+            ),
+            (
+                [0x10, 0x20, 0x03],
+                MvcParameter::EffectControlAssign {
+                    control: 2,
+                    msn: false,
+                },
+            ),
+            (
+                [0x10, 0x20, 0x04],
+                MvcParameter::EffectControlAssign {
+                    control: 3,
+                    msn: true,
+                },
+            ),
+            ([0x10, 0x30, 0x01], MvcParameter::PlaybackSpeedCtrlRange),
+            ([0x10, 0x30, 0x03], MvcParameter::KeyboardRangeUpper),
+            (
+                [0x10, 0x40, 0x00],
+                MvcParameter::Reserved([0x10, 0x40, 0x00]),
+            ),
+        ];
+        for (addr, expected) in cases {
+            assert_eq!(MvcParameter::from_address(addr), expected, "{addr:02X?}");
+        }
+    }
+
+    #[test]
+    fn midi_visual_control_none_on_truncation_and_wrong_family() {
+        // Address only, no data / checksum.
+        let smf = smf_with_sysex(&[0x7E, 0x00, 0x0C, 0x01, 0x10, 0x00, 0x00, 0xF7]);
+        assert_eq!(smf.universal_sysex_events()[0].midi_visual_control(), None,);
+        // Real-Time 0x0C is the Mobile Phone Control family.
+        let smf = smf_with_sysex(&[0x7F, 0x00, 0x0C, 0x00, 0x10, 0x00, 0x00, 0x01, 0x6F, 0xF7]);
+        assert_eq!(smf.universal_sysex_events()[0].midi_visual_control(), None,);
+    }
+
+    #[test]
+    fn midi_visual_controls_iterator_collects_in_time_order() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(7));
+        t0.extend_from_slice(&[0xF0, 0x0A]);
+        t0.extend_from_slice(&[0x7E, 0x00, 0x0C, 0x01, 0x10, 0x00, 0x00, 0x01, 0x6F, 0xF7]);
+        t0.extend_from_slice(&encode_vlq(0));
+        t0.extend_from_slice(&[0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&t0));
+        let smf = parse(&blob).unwrap();
+        let mvcs = smf.midi_visual_controls();
+        assert_eq!(mvcs.len(), 1);
+        assert_eq!(mvcs[0].tick, 7);
+        assert!(mvcs[0].control.is_mvc_on());
     }
 
     #[test]
