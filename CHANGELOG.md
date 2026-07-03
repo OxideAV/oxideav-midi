@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 389 — smf CA-018 / CA-028 File Reference decoder
+
+- `UniversalSysExEvent::file_reference()` decodes the Universal
+  Non-Real-Time **File Reference** message (CA-018, `F0 7E <dev> 0B
+  <cmd> <ctx×2> <len×2> <data> F7`) into a typed `FileReference`: the
+  command (`FileReferenceCommand`: Open File / Select-or-Reselect
+  Contents / Open-and-Select / Close File), the raw two-byte command
+  context, and exactly the `len`-declared data (14-bit LSB-first
+  count; a packet truncated short of its declared length yields
+  `None`). The Real-Time `0x0B` family (Scalable Polyphony MIP) stays
+  on its own surface.
+- Because CA-018 makes Select-Contents data file-type-dependent (the
+  type lives in the Open command sharing the context), the typed views
+  are opt-in: `open_payload()` (four-ASCII-byte type + NUL-terminated
+  URL + trailing select data for the combined command),
+  `select_instrument_maps()` (DLS/SF2 layout: count + 8-byte
+  `FileReferenceInstrumentMap`s — 14-bit MSB-first banks, source /
+  destination drum flags, initial volume — plus trailing ext-data), and
+  `select_wav()` (bank / program / base / key range / 14-bit LSB-first
+  fine tuning with a `fine_tuning_cents()` map through CA-018's anchor
+  rows / volume). `FileReferenceSelect::bank_offset()` walks the
+  ext-data chain for CA-028's "Map Entire File with Bank Offset"
+  extension (`ext-ID 00 01`: 14-bit destination bank + drum-bank
+  flag).
+- `SmfFile::file_references()` is the time-ordered iterator.
+- 8 new tests: Open type+URL, instrument-map select, the CA-028
+  bank-offset extension, WAV select + both fine-tuning anchors, Close
+  with empty data, declared-length truncation, realm separation, and
+  the iterator.
+- Provenance: `docs/audio/midi/recommended-practices/ca18.pdf` +
+  `ca28.pdf`.
+
 ### Round 389 — smf CA-023 Key-Based Instrument Control decoder
 
 - `UniversalSysExEvent::key_based_instrument_control()` decodes the

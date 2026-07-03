@@ -3369,6 +3369,19 @@ pub struct KeyBasedInstrumentControlEvent {
     pub control: KeyBasedInstrumentControl,
 }
 
+/// A decoded **File Reference** message (CA-018) pinned to the absolute
+/// tick (and the track) at which it fires — the element type of
+/// [`SmfFile::file_references`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileReferenceEvent {
+    /// Absolute tick (cumulative per-track delta sum).
+    pub tick: u64,
+    /// Source [`Track`] index within [`SmfFile::tracks`].
+    pub track: usize,
+    /// The decoded File Reference message.
+    pub reference: FileReference,
+}
+
 impl UniversalSysExEvent {
     /// Decode this packet as a Notation **Bar Number** message when it
     /// is one, returning the signed 14-bit bar number and its semantic
@@ -4007,6 +4020,59 @@ impl UniversalSysExEvent {
             channel,
             key,
             controls,
+        })
+    }
+
+    /// Decode this packet as a **File Reference** message (CA-018) when
+    /// it is one, returning the typed command (Open / Select / Open-and-
+    /// Select / Close), the two-byte command context, and exactly the
+    /// `len`-declared command data.
+    ///
+    /// Per CA-018 the message travels as a Universal Non-Real-Time
+    /// SysEx with Sub-ID #1 = `0x0B`: `F0 7E <dev> 0B <cmd> <ctx×2>
+    /// <len×2> <data> F7`, where `<len>` is a 14-bit LSB-first count of
+    /// the bytes remaining before the end-of-exclusive byte (so command
+    /// data caps at 16383 bytes). The decoder validates that the packet
+    /// actually carries `len` data bytes — a packet truncated short of
+    /// its declared length yields `None` rather than partial data.
+    /// Bytes beyond `len` (other than the EOX marker) are ignored.
+    ///
+    /// Returns `None` unless the packet is Non-Real-Time with a defined
+    /// File Reference command Sub-ID #2 (`0x01..=0x04`; `0x00` and
+    /// `0x05..=0x7F` are reserved) — the Real-Time `0x0B` family is the
+    /// Scalable Polyphony MIP message. Interpretation of `data` is per
+    /// command: see [`FileReference::open_payload`] /
+    /// [`FileReference::select_instrument_maps`] /
+    /// [`FileReference::select_wav`].
+    pub fn file_reference(&self) -> Option<FileReference> {
+        if !matches!(self.classification.realm, UniversalRealm::NonRealTime) {
+            return None;
+        }
+        let sub2 = match self.classification.sub_id1 {
+            UniversalSubId1::FileReferenceOrScalablePolyphonyMip(s) => s,
+            _ => return None,
+        };
+        let command = match sub2 {
+            UniversalSubId2::FileReferenceOpenFile => FileReferenceCommand::OpenFile,
+            UniversalSubId2::FileReferenceSelectOrReselectContents => {
+                FileReferenceCommand::SelectContents
+            }
+            UniversalSubId2::FileReferenceOpenFileAndSelectContents => {
+                FileReferenceCommand::OpenFileAndSelectContents
+            }
+            UniversalSubId2::FileReferenceCloseFile => FileReferenceCommand::CloseFile,
+            _ => return None,
+        };
+        // <realm=7E> <device_id> <sub_id1=0B> <sub_id2> ctx1 ctx2
+        // len_lsb len_msb <data×len> [F7]
+        let context = [*self.data.get(4)? & 0x7F, *self.data.get(5)? & 0x7F];
+        let len =
+            (*self.data.get(6)? & 0x7F) as usize | (((*self.data.get(7)? & 0x7F) as usize) << 7);
+        let data = self.data.get(8..8 + len)?.to_vec();
+        Some(FileReference {
+            command,
+            context,
+            data,
         })
     }
 }
@@ -4766,6 +4832,280 @@ impl KeyBasedInstrumentControl {
     /// which CA-023 redefines as Fine / Coarse Tuning.
     pub fn is_disallowed_controller(nn: u8) -> bool {
         matches!(nn, 0x00 | 0x20 | 0x06 | 0x26 | 0x60..=0x65 | 0x7A..=0x7F)
+    }
+}
+
+/// The command code (Sub-ID #2) of a **File Reference** message
+/// (CA-018).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileReferenceCommand {
+    /// `0x01` — Open File: declares a sound file's type + URL so it can
+    /// be loaded. Does not by itself make anything play.
+    OpenFile,
+    /// `0x02` — Select or Reselect Contents: maps sounds from an
+    /// already-opened file into MIDI bank/program space.
+    SelectContents,
+    /// `0x03` — Open File and Select Contents: the two combined for
+    /// convenience.
+    OpenFileAndSelectContents,
+    /// `0x04` — Close File: unloads the file; sounds it provided stop
+    /// resolving and previously-shadowed sounds re-enable.
+    CloseFile,
+}
+
+/// A decoded **File Reference** message (CA-018) — a Universal
+/// Non-Real-Time SysEx `F0 7E <dev> 0B <cmd> <ctx> <len> <data> F7`
+/// that lets a receiver load sound files (DLS / SoundFont / WAV) from a
+/// URL and play them through ordinary channel messages.
+///
+/// The command context (`ctx`, two 7-bit bytes) distinguishes multiple
+/// concurrent file operations; CA-018 assigns it no numeric semantics
+/// beyond equality, so it is surfaced as the raw byte pair. `data`
+/// carries exactly the `len`-declared bytes (`len` is a 14-bit
+/// LSB-first count of the bytes remaining before EOX, capping command
+/// data at 16383 bytes). The *interpretation* of Select-Contents data
+/// depends on the file type declared by the Open command that shares
+/// its context — a per-packet decoder cannot resolve that on its own —
+/// so the typed views are opt-in:
+/// [`open_payload`](Self::open_payload) for the Open forms and
+/// [`select_instrument_maps`](Self::select_instrument_maps) /
+/// [`select_wav`](Self::select_wav) for the two Select layouts.
+/// Decoded via [`UniversalSysExEvent::file_reference`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileReference {
+    /// The file operation this packet performs.
+    pub command: FileReferenceCommand,
+    /// The two raw context bytes distinguishing concurrent operations
+    /// (equality is their only defined semantics).
+    pub context: [u8; 2],
+    /// The command-specific data, exactly as declared by `len`.
+    pub data: Vec<u8>,
+}
+
+/// The payload of a File Reference **Open File** (or the leading
+/// portion of **Open File and Select Contents**): the four-byte ASCII
+/// file type, the URL, and — for the combined command — the trailing
+/// select data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileReferenceOpen {
+    /// The case-insensitive four-ASCII-byte file type. CA-018 defines
+    /// `"DLS "`, `"SF2 "`, and `"WAV "` (upper- or lower-case).
+    pub file_type: [u8; 4],
+    /// The URL bytes (7-bit ASCII, terminating NUL excluded). CA-018
+    /// caps the URL at 261 bytes including the terminator and
+    /// recommends `http://` / `file://` prefixes.
+    pub url: Vec<u8>,
+    /// For [`FileReferenceCommand::OpenFileAndSelectContents`], the
+    /// select data following the URL's NUL terminator (interpret via
+    /// the same layouts as Select Contents). Empty for a plain Open.
+    pub select_data: Vec<u8>,
+}
+
+/// One instrument-select map of a File Reference **Select Contents**
+/// for a DLS / SoundFont file (CA-018): where a source instrument in
+/// the file lands in MIDI bank/program space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileReferenceInstrumentMap {
+    /// The 14-bit MIDI bank (CC 0 MSB first, then CC 32 LSB) that
+    /// selects the sound for playing (`0` = default).
+    pub dst_bank: u16,
+    /// The MIDI program number that selects the sound for playing.
+    pub dst_program: u8,
+    /// The 14-bit bank stored in the file's instrument header.
+    pub src_bank: u16,
+    /// The program number stored in the file's instrument header.
+    pub src_program: u8,
+    /// Bit 0: Source Drum flag (the selected instrument is a drum
+    /// instrument — DLS `ulBank` bit 31). Bit 1: Destination Drum flag
+    /// (load it *as* a drum instrument). Bits 2..=6 reserved.
+    pub flags: u8,
+    /// Initial volume (`0x7F` = default).
+    pub volume: u8,
+}
+
+impl FileReferenceInstrumentMap {
+    /// Bit 0 — the source instrument is a drum instrument.
+    pub fn source_drum(&self) -> bool {
+        self.flags & 0x01 != 0
+    }
+
+    /// Bit 1 — load the instrument as a drum instrument.
+    pub fn destination_drum(&self) -> bool {
+        self.flags & 0x02 != 0
+    }
+}
+
+/// The decoded Select-Contents data of a File Reference for a DLS /
+/// SoundFont file: the instrument map list plus any trailing extension
+/// data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileReferenceSelect {
+    /// The instrument-select maps. Empty when `count == 0` — "use the
+    /// mapping information provided in the DLS file", optionally
+    /// modified by a CA-028 bank-offset extension
+    /// ([`bank_offset`](Self::bank_offset)).
+    pub maps: Vec<FileReferenceInstrumentMap>,
+    /// Extension data following the map list (`<ext-ID#1> <ext-ID#2>
+    /// <len×2 LSB-first> <data>` blocks, per CA-028's formalisation).
+    /// Devices that recognise no extension must ignore it.
+    pub ext_data: Vec<u8>,
+}
+
+impl FileReferenceSelect {
+    /// Extract the CA-028 **Map Entire File with Bank Offset**
+    /// extension (`ext-ID 00 01`) when present: the 14-bit destination
+    /// bank offset (MSB first on the wire) and its Source Drum flag
+    /// (bit 0 — the target bank is a drum bank).
+    ///
+    /// Per CA-028 the extension is only meaningful on a Select with
+    /// `count == 0`; this accessor just reports what the extension
+    /// block carries, walking the `<id1> <id2> <len> <data>` chain and
+    /// skipping unrecognised blocks. Returns `None` when no `00 01`
+    /// block with the required 3 data bytes exists.
+    pub fn bank_offset(&self) -> Option<(u16, bool)> {
+        let mut idx = 0usize;
+        while idx + 4 <= self.ext_data.len() {
+            let id1 = self.ext_data[idx];
+            let id2 = self.ext_data[idx + 1];
+            let len = (self.ext_data[idx + 2] & 0x7F) as usize
+                | (((self.ext_data[idx + 3] & 0x7F) as usize) << 7);
+            let body = self.ext_data.get(idx + 4..idx + 4 + len)?;
+            if id1 == 0x00 && id2 == 0x01 && body.len() >= 3 {
+                let bank = (((body[0] & 0x7F) as u16) << 7) | (body[1] & 0x7F) as u16;
+                return Some((bank, body[2] & 0x01 != 0));
+            }
+            idx += 4 + len;
+        }
+        None
+    }
+}
+
+/// The decoded Select-Contents data of a File Reference for a WAV file
+/// (CA-018): the single sound's placement and tuning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileReferenceWavSelect {
+    /// The 14-bit destination MIDI bank (MSB first on the wire).
+    pub dst_bank: u16,
+    /// The destination MIDI program number.
+    pub dst_program: u8,
+    /// The MIDI note at which the sample plays at original pitch.
+    pub base_key: u8,
+    /// The lowest MIDI note that plays the sound (`0` = default).
+    pub low_key: u8,
+    /// The highest MIDI note that plays the sound (`0x7F` = default).
+    pub high_key: u8,
+    /// The raw 14-bit fine-tuning field (LSB first on the wire).
+    /// `0x2000` = 0 cents; the span maps linearly over ±100 cents like
+    /// RPN 1 (`00 00` = −100.0¢, `00 40` = 0.0¢, `7F 7F` = +100.0¢ in
+    /// the CA-018 LSB/MSB table).
+    pub fine_tuning14: u16,
+    /// Initial volume (`0x7F` = default). Overrides the WAV's `smpl` /
+    /// `inst` chunks.
+    pub volume: u8,
+    /// Extension data following the fixed fields (ignore-if-unknown).
+    pub ext_data: Vec<u8>,
+}
+
+impl FileReferenceWavSelect {
+    /// The fine-tuning offset in cents: `(fine_tuning14 − 0x2000) ×
+    /// 100 / 0x2000`, the linear map through the CA-018 anchor rows
+    /// (`00 00` → −100.0¢, `00 40` → 0.0¢).
+    pub fn fine_tuning_cents(&self) -> f64 {
+        (self.fine_tuning14 as f64 - 0x2000 as f64) * 100.0 / 0x2000 as f64
+    }
+}
+
+impl FileReference {
+    /// Interpret this packet's data as an **Open File** payload (valid
+    /// for the Open and Open-and-Select commands): the four-ASCII-byte
+    /// file type, the NUL-terminated URL, and — for the combined
+    /// command — the select data after the terminator. Returns `None`
+    /// for the Select / Close commands, when the data is shorter than
+    /// the type field, or when no NUL terminator bounds the URL.
+    pub fn open_payload(&self) -> Option<FileReferenceOpen> {
+        if !matches!(
+            self.command,
+            FileReferenceCommand::OpenFile | FileReferenceCommand::OpenFileAndSelectContents
+        ) {
+            return None;
+        }
+        let file_type: [u8; 4] = self.data.get(0..4)?.try_into().ok()?;
+        let rest = self.data.get(4..)?;
+        let nul = rest.iter().position(|b| *b == 0x00)?;
+        Some(FileReferenceOpen {
+            file_type,
+            url: rest[..nul].to_vec(),
+            select_data: rest[nul + 1..].to_vec(),
+        })
+    }
+
+    /// Interpret this packet's data as the DLS / SoundFont
+    /// **Select Contents** layout (`<count>` + `count × 8`-byte
+    /// instrument maps + optional extension data). Valid for the Select
+    /// command only — for the combined Open-and-Select command,
+    /// interpret [`open_payload`](Self::open_payload)`.select_data`
+    /// with [`Self::interpret_select_data`]. Returns `None` when the
+    /// data is shorter than the declared map list.
+    pub fn select_instrument_maps(&self) -> Option<FileReferenceSelect> {
+        if !matches!(self.command, FileReferenceCommand::SelectContents) {
+            return None;
+        }
+        Self::interpret_select_data(&self.data)
+    }
+
+    /// Interpret this packet's data as the WAV **Select Contents**
+    /// layout (`<dst-bank×2> <dst-prog> <base> <lokey> <hikey>
+    /// <fine×2> <vol>`, minimum 9 bytes). Valid for the Select command
+    /// only. Returns `None` when the fixed fields don't fit.
+    pub fn select_wav(&self) -> Option<FileReferenceWavSelect> {
+        if !matches!(self.command, FileReferenceCommand::SelectContents) {
+            return None;
+        }
+        Self::interpret_wav_select_data(&self.data)
+    }
+
+    /// Decode a DLS / SoundFont Select-Contents byte layout (the
+    /// free-standing form of
+    /// [`select_instrument_maps`](Self::select_instrument_maps), usable
+    /// on [`FileReferenceOpen::select_data`]).
+    pub fn interpret_select_data(data: &[u8]) -> Option<FileReferenceSelect> {
+        let count = (*data.first()? & 0x7F) as usize;
+        let mut maps = Vec::with_capacity(count.min(128));
+        let mut idx = 1usize;
+        for _ in 0..count {
+            let m = data.get(idx..idx + 8)?;
+            maps.push(FileReferenceInstrumentMap {
+                dst_bank: (((m[0] & 0x7F) as u16) << 7) | (m[1] & 0x7F) as u16,
+                dst_program: m[2] & 0x7F,
+                src_bank: (((m[3] & 0x7F) as u16) << 7) | (m[4] & 0x7F) as u16,
+                src_program: m[5] & 0x7F,
+                flags: m[6] & 0x7F,
+                volume: m[7] & 0x7F,
+            });
+            idx += 8;
+        }
+        Some(FileReferenceSelect {
+            maps,
+            ext_data: data.get(idx..).unwrap_or(&[]).to_vec(),
+        })
+    }
+
+    /// Decode a WAV Select-Contents byte layout (the free-standing form
+    /// of [`select_wav`](Self::select_wav), usable on
+    /// [`FileReferenceOpen::select_data`]).
+    pub fn interpret_wav_select_data(data: &[u8]) -> Option<FileReferenceWavSelect> {
+        let f = data.get(0..9)?;
+        Some(FileReferenceWavSelect {
+            dst_bank: (((f[0] & 0x7F) as u16) << 7) | (f[1] & 0x7F) as u16,
+            dst_program: f[2] & 0x7F,
+            base_key: f[3] & 0x7F,
+            low_key: f[4] & 0x7F,
+            high_key: f[5] & 0x7F,
+            // <fine> is LSB first on the wire.
+            fine_tuning14: (f[6] & 0x7F) as u16 | (((f[7] & 0x7F) as u16) << 7),
+            volume: f[8] & 0x7F,
+            ext_data: data.get(9..).unwrap_or(&[]).to_vec(),
+        })
     }
 }
 
@@ -7106,6 +7446,29 @@ impl SmfFile {
                     tick: ev.tick,
                     track: ev.track,
                     control,
+                });
+            }
+        }
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **File Reference** message (CA-018, `F0 7E <dev>
+    /// 0B <cmd> <ctx> <len> <data> F7`) from every track, pinned to the
+    /// absolute tick at which it fires, in time order. Each entry is
+    /// decoded via [`UniversalSysExEvent::file_reference`]; packets the
+    /// decoder rejects (wrong realm — the Real-Time `0x0B` family is
+    /// Scalable Polyphony MIP — a reserved command code, or data
+    /// truncated short of the declared length) are skipped. Returns an
+    /// empty `Vec` when no track carries a File Reference message.
+    pub fn file_references(&self) -> Vec<FileReferenceEvent> {
+        let mut out: Vec<FileReferenceEvent> = Vec::new();
+        for ev in self.universal_sysex_events() {
+            if let Some(reference) = ev.file_reference() {
+                out.push(FileReferenceEvent {
+                    tick: ev.tick,
+                    track: ev.track,
+                    reference,
                 });
             }
         }
@@ -18588,6 +18951,163 @@ mod tests {
         assert_eq!(kbics[0].control.key, 0x26);
         assert_eq!(kbics[1].tick, 10);
         assert_eq!(kbics[1].control.key, 0x24);
+    }
+
+    // ----------------------------------------------------------------
+    // file_reference() — CA-018 + CA-028.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn file_reference_open_decodes_type_and_url() {
+        // F0 7E 7F 0B 01 <ctx> <len> "DLS " url NUL F7.
+        let url = b"file://kit.dls";
+        let mut payload: Vec<u8> = vec![0x7E, 0x7F, 0x0B, 0x01, 0x05, 0x21];
+        let len = 4 + url.len() + 1;
+        payload.push((len & 0x7F) as u8);
+        payload.push(((len >> 7) & 0x7F) as u8);
+        payload.extend_from_slice(b"DLS ");
+        payload.extend_from_slice(url);
+        payload.push(0x00);
+        payload.push(0xF7);
+        let smf = smf_with_sysex(&payload);
+        let evs = smf.universal_sysex_events();
+        let fr = evs[0].file_reference().expect("must decode");
+        assert_eq!(fr.command, FileReferenceCommand::OpenFile);
+        assert_eq!(fr.context, [0x05, 0x21]);
+        let open = fr.open_payload().expect("open payload");
+        assert_eq!(&open.file_type, b"DLS ");
+        assert_eq!(open.url, url.to_vec());
+        assert!(open.select_data.is_empty());
+        // The Open command has no instrument-map view.
+        assert_eq!(fr.select_instrument_maps(), None);
+    }
+
+    #[test]
+    fn file_reference_select_decodes_instrument_maps() {
+        // One map: dst bank 0x0102 prog 5 ← src bank 0 prog 9,
+        // flags = both drum bits, vol 0x7F.
+        let data = [
+            0x01, // count
+            0x02, 0x02, 0x05, // dst-bank MSB/LSB (0x102), dst-prog
+            0x00, 0x00, 0x09, // src-bank, src-prog
+            0x03, 0x7F, // flags, vol
+        ];
+        let mut payload: Vec<u8> = vec![0x7E, 0x7F, 0x0B, 0x02, 0x00, 0x00];
+        payload.push(data.len() as u8);
+        payload.push(0x00);
+        payload.extend_from_slice(&data);
+        payload.push(0xF7);
+        let smf = smf_with_sysex(&payload);
+        let evs = smf.universal_sysex_events();
+        let fr = evs[0].file_reference().expect("must decode");
+        assert_eq!(fr.command, FileReferenceCommand::SelectContents);
+        let sel = fr.select_instrument_maps().expect("select data");
+        assert_eq!(sel.maps.len(), 1);
+        let m = sel.maps[0];
+        assert_eq!(m.dst_bank, (0x02 << 7) | 0x02);
+        assert_eq!(m.dst_program, 5);
+        assert_eq!(m.src_bank, 0);
+        assert_eq!(m.src_program, 9);
+        assert!(m.source_drum());
+        assert!(m.destination_drum());
+        assert_eq!(m.volume, 0x7F);
+        assert!(sel.ext_data.is_empty());
+        assert_eq!(sel.bank_offset(), None);
+    }
+
+    #[test]
+    fn file_reference_ca028_bank_offset_extension() {
+        // count = 0 ("use the file's mapping") + ext block 00 01 len 3:
+        // dst-bank MSB/LSB (bank 2), flags bit 0 set (drum bank).
+        let data = [0x00, 0x00, 0x01, 0x03, 0x00, 0x00, 0x02, 0x01];
+        let mut payload: Vec<u8> = vec![0x7E, 0x7F, 0x0B, 0x02, 0x01, 0x00];
+        payload.push(data.len() as u8);
+        payload.push(0x00);
+        payload.extend_from_slice(&data);
+        payload.push(0xF7);
+        let smf = smf_with_sysex(&payload);
+        let evs = smf.universal_sysex_events();
+        let sel = evs[0]
+            .file_reference()
+            .and_then(|fr| fr.select_instrument_maps())
+            .expect("select data");
+        assert!(sel.maps.is_empty());
+        assert_eq!(sel.bank_offset(), Some((2, true)));
+    }
+
+    #[test]
+    fn file_reference_wav_select_and_fine_tuning() {
+        // WAV select: bank 0, prog 3, base 60, range 0..127,
+        // fine 00 40 (= 0 cents), vol 0x7F.
+        let data = [0x00, 0x00, 0x03, 60, 0x00, 0x7F, 0x00, 0x40, 0x7F];
+        let mut payload: Vec<u8> = vec![0x7E, 0x7F, 0x0B, 0x02, 0x00, 0x01];
+        payload.push(data.len() as u8);
+        payload.push(0x00);
+        payload.extend_from_slice(&data);
+        payload.push(0xF7);
+        let smf = smf_with_sysex(&payload);
+        let evs = smf.universal_sysex_events();
+        let wav = evs[0]
+            .file_reference()
+            .and_then(|fr| fr.select_wav())
+            .expect("wav select");
+        assert_eq!(wav.dst_program, 3);
+        assert_eq!(wav.base_key, 60);
+        assert_eq!(wav.high_key, 0x7F);
+        assert_eq!(wav.fine_tuning14, 0x2000);
+        assert!(wav.fine_tuning_cents().abs() < 1e-9);
+        // The CA-018 table's -100.0 cents row: LSB 00 MSB 00.
+        let low = FileReference::interpret_wav_select_data(&[
+            0x00, 0x00, 0x00, 60, 0x00, 0x7F, 0x00, 0x00, 0x7F,
+        ])
+        .unwrap();
+        assert!((low.fine_tuning_cents() + 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn file_reference_close_carries_empty_data() {
+        // F0 7E 7F 0B 04 <ctx> 00 00 F7.
+        let smf = smf_with_sysex(&[0x7E, 0x7F, 0x0B, 0x04, 0x02, 0x00, 0x00, 0x00, 0xF7]);
+        let evs = smf.universal_sysex_events();
+        let fr = evs[0].file_reference().expect("must decode");
+        assert_eq!(fr.command, FileReferenceCommand::CloseFile);
+        assert_eq!(fr.context, [0x02, 0x00]);
+        assert!(fr.data.is_empty());
+    }
+
+    #[test]
+    fn file_reference_none_when_data_shorter_than_declared_length() {
+        // Declares 5 data bytes but carries only 2 before EOX.
+        let smf = smf_with_sysex(&[
+            0x7E, 0x7F, 0x0B, 0x01, 0x00, 0x00, 0x05, 0x00, 0x44, 0x4C, 0xF7,
+        ]);
+        let evs = smf.universal_sysex_events();
+        assert_eq!(evs[0].file_reference(), None);
+    }
+
+    #[test]
+    fn file_reference_none_on_realtime_scalable_polyphony_family() {
+        // RT 0x0B 0x01 is the Scalable Polyphony MIP message.
+        let smf = smf_with_sysex(&[0x7F, 0x7F, 0x0B, 0x01, 0x00, 0x00, 0x00, 0x00, 0xF7]);
+        let evs = smf.universal_sysex_events();
+        assert_eq!(evs[0].file_reference(), None);
+    }
+
+    #[test]
+    fn file_references_iterator_collects_in_time_order() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(30));
+        t0.extend_from_slice(&[0xF0, 0x09]);
+        t0.extend_from_slice(&[0x7E, 0x7F, 0x0B, 0x04, 0x00, 0x00, 0x00, 0x00, 0xF7]);
+        t0.extend_from_slice(&encode_vlq(0));
+        t0.extend_from_slice(&[0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&t0));
+        let smf = parse(&blob).unwrap();
+        let frs = smf.file_references();
+        assert_eq!(frs.len(), 1);
+        assert_eq!(frs[0].tick, 30);
+        assert_eq!(frs[0].reference.command, FileReferenceCommand::CloseFile);
     }
 
     #[test]
