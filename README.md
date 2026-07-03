@@ -57,7 +57,19 @@ total events capped at 1 M to keep malformed input bounded.
   (with `is_channel_mode()`), `pitch_bends` (`signed_value()` /
   `is_centre()`), `channel_pressures`, `poly_aftertouches`, and the
   piano-roll `notes()` (Note-On/Off pairing with velocity-0 = Off
-  convention, FIFO re-strike) plus `active_notes_at(tick)`.
+  convention, FIFO re-strike) plus `active_notes_at(tick)`. `notes()`
+  also folds the CC 88 **High-Resolution Velocity Prefix** (CA-031)
+  into the pairing: a pending `Bn 58 vv` affixes its 7 bits below the
+  next Note On / Off velocity on the channel
+  (`Note::on_velocity14` / `off_velocity14` / `velocity14()`), with the
+  register cleared per note message and the `9n key 0` form staying a
+  plain Note Off.
+- **Sound-controller classifier** — `ControlChangeEvent::
+  sound_controller()` types CC 70–79 per RP-021 (*Sound Controller
+  Defaults (Revised)*): Sound Variation / Timbre / Release / Attack /
+  Brightness plus the RP-021-named Decay Time / Vibrato Rate / Depth /
+  Delay, with `level()` / `controller()` / `ordinal()`;
+  `sound_controllers()` is the merged iterator.
 - **Channel-mode classifier** — `ControlChangeEvent::channel_mode()`
   decodes a `120..=127` controller into a typed `ChannelModeMessage`
   (All Sound Off, Reset All Controllers, Local Control on/off, All Notes
@@ -145,10 +157,28 @@ total events capped at 1 M to keep malformed input bounded.
   `general_midi_system()` maps GM System On/Off (`F0 7E <dev> 09 0n F7`,
   RP-003 / GM2) to `GeneralMidiSystem`. `sample_dump_header()` /
   `sample_dump_request()` decode the Sample Dump Standard header (21-bit
-  LSB-first fields + `LoopType`) and request. Each has a stably-merged
-  absolute-tick iterator (`mmc_commands()`, `mmc_responses()`,
-  `show_control_messages()`, `identity_replies()`,
-  `general_midi_system_messages()`).
+  LSB-first fields + `LoopType`) and request; `sample_dump_extension()`
+  adds the five CA-019 Sample Dump Extensions (Extended Dump Header with
+  28-bit fixed-point Hz rate + 35-bit word counts + the ten-value
+  `ExtendedLoopType`, Extended Loop Point transmission / request, Sample
+  Name transmission / request). `controller_destination()` decodes the
+  CA-022 Controller Destination Setting (Channel / Poly Pressure or an
+  allowed CC routed to the Pitch / Filter / Amplitude / LFO-depth
+  parameter table); `key_based_instrument_control()` the CA-023
+  per-key drum controller message (`0x78`/`0x79` redefined as Fine /
+  Coarse Tuning, disallowed numbers reported);
+  `file_reference()` the CA-018 URL-based sound-file message (Open /
+  Select / Open-and-Select / Close with length validation, typed
+  DLS/SF2 instrument-map + WAV select views, and the CA-028
+  map-entire-file `bank_offset()` extension); and
+  `midi_visual_control()` the RP-050 MIDI Visual Control Data Set
+  (Parameter Address Map naming via `MvcParameter`, `is_mvc_on()` /
+  `is_mvc_off()`, checksum verdict reported not rejected). Each has a
+  stably-merged absolute-tick iterator (`mmc_commands()`,
+  `mmc_responses()`, `show_control_messages()`, `identity_replies()`,
+  `general_midi_system_messages()`, `sample_dump_extensions()`,
+  `controller_destinations()`, `key_based_instrument_controls()`,
+  `file_references()`, `midi_visual_controls()`).
 - **Tick → wall-clock time** — `tempo_timeline()` folds the tempo map
   against the header `Division` into a `TempoTimeline`; its
   `tick_to_seconds(tick)` resolves any absolute tick to elapsed seconds
@@ -239,7 +269,12 @@ the MIDI Association *UMP Format and MIDI 2.0 Protocol* spec
   fine/coarse tune, mod-depth range, MPE config), Data Inc/Dec
   (CC 96/97), mod-wheel + MPE timbre routing, Master Volume / Balance
   / Fine / Coarse Tuning (Universal Real-Time SysEx), and GM2 Global
-  Parameter Control.
+  Parameter Control. CC 10 panning follows the **RP-036 Default Pan
+  Formula** exactly (`cos`/`sin` of `π/2 · max(0, pan − 1)/126`): 64 is
+  a true equal-power centre and 0/1 both pan hard left. The **CC 88
+  High-Resolution Velocity Prefix** (CA-031) refines the next note-on's
+  gain by its 14-bit velocity ratio (prefix-free scores render
+  bit-identically; a Note Off expires a pending prefix).
 - `mixer` **continuous controllers + pedals** — **CC 11 Expression**
   multiplies Channel Volume at mix time (Expression is a percentage of
   Volume per the MIDI 1.0 Control Change table; default 127 = transparent).
