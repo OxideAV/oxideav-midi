@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 389 — smf CA-023 Key-Based Instrument Control decoder
+
+- `UniversalSysExEvent::key_based_instrument_control()` decodes the
+  Universal Real-Time **Key-Based Instrument Control** message (CA-023,
+  `F0 7F <dev> 0A 01 0n kk [nn vv]… F7`) into a typed
+  `KeyBasedInstrumentControl`: the channel, the key whose instrument
+  (drum-set slot) is addressed, and the controller/value pairs in wire
+  order. Values are generally relative to the key's preset (`0x40` =
+  factory default) with Pan / Reverb Send / Chorus Send called out
+  absolute per CA-023's table; `nn = 0x78` / `0x79` decode as ordinary
+  pairs under their CA-023-redefined Fine / Coarse Tuning meaning.
+  `KeyBasedInstrumentControl::is_disallowed_controller()` reports the
+  numbers CA-023 excludes (Bank Select `00`/`20`, Data Entry `06`/`26`,
+  RPN/NRPN `60..=65`, Mode Change `7A..=7F` — with `78`/`79` allowed
+  via the redefinition). The decoder keeps the Non-Real-Time `0x0A`
+  realm (Downloadable Sounds) on its own surface and returns `None` on
+  a dangling controller byte.
+- `SmfFile::key_based_instrument_controls()` is the stably-merged
+  absolute-tick iterator.
+- 5 new tests: pair decode on the GM drum channel, the `78`/`79`
+  tuning redefinition + full disallowed-set check, realm separation
+  from DLS-On, dangling-byte rejection, cross-track merge.
+- Provenance: `docs/audio/midi/recommended-practices/
+  ca23-Key-based-Instrument-Controller-SysEx-Message.pdf`.
+
 ### Round 389 — smf CA-022 Controller Destination Setting decoder
 
 - `UniversalSysExEvent::controller_destination()` decodes the Universal

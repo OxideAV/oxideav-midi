@@ -3356,6 +3356,19 @@ pub struct ControllerDestinationEvent {
     pub destination: ControllerDestination,
 }
 
+/// A decoded **Key-Based Instrument Control** (CA-023) pinned to the
+/// absolute tick (and the track) at which it fires — the element type of
+/// [`SmfFile::key_based_instrument_controls`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyBasedInstrumentControlEvent {
+    /// Absolute tick (cumulative per-track delta sum).
+    pub tick: u64,
+    /// Source [`Track`] index within [`SmfFile::tracks`].
+    pub track: usize,
+    /// The decoded Key-Based Instrument Control message.
+    pub control: KeyBasedInstrumentControl,
+}
+
 impl UniversalSysExEvent {
     /// Decode this packet as a Notation **Bar Number** message when it
     /// is one, returning the signed 14-bit bar number and its semantic
@@ -3939,6 +3952,61 @@ impl UniversalSysExEvent {
             source,
             channel,
             routings,
+        })
+    }
+
+    /// Decode this packet as a **Key-Based Instrument Control** message
+    /// (CA-023) when it is one, returning the channel, the key whose
+    /// instrument is addressed, and the `[nn vv]` controller/value
+    /// pairs.
+    ///
+    /// Per CA-023 the message travels as a Universal Real-Time SysEx
+    /// with Sub-ID #1 = `0x0A`, Sub-ID #2 = `0x01` (Basic Message):
+    /// `F0 7F <dev> 0A 01 0n kk [nn vv]… F7`. Multiple controller/value
+    /// pairs may ride in one message; the values are generally relative
+    /// to the key's preset (`0x40` = factory default) with the
+    /// exceptions CA-023 marks absolute (Pan, Reverb / Chorus Send).
+    ///
+    /// Returns `None` unless the packet is Real-Time with Sub-ID #1 =
+    /// `0x0A` / Sub-ID #2 = `0x01` — the Non-Real-Time `0x0A` family is
+    /// Downloadable Sounds — or when the packet truncates before the
+    /// key byte or ends on a dangling `nn` with no value byte. The
+    /// pairs are surfaced verbatim, including any controller numbers
+    /// CA-023 disallows (see
+    /// [`KeyBasedInstrumentControl::is_disallowed_controller`]); a
+    /// receiver applies its own policy to those.
+    pub fn key_based_instrument_control(&self) -> Option<KeyBasedInstrumentControl> {
+        if !matches!(self.classification.realm, UniversalRealm::RealTime) {
+            return None;
+        }
+        if !matches!(
+            self.classification.sub_id1,
+            UniversalSubId1::DownloadableSoundsOrKeyBasedInstrumentControl(
+                UniversalSubId2::RtKeyBasedInstrumentControl
+            )
+        ) {
+            return None;
+        }
+        // <realm=7F> <device_id> <sub_id1=0A> <sub_id2=01> 0n kk [nn vv]… [F7]
+        let channel = *self.data.get(4)? & 0x0F;
+        let key = *self.data.get(5)? & 0x7F;
+        let mut controls: Vec<(u8, u8)> = Vec::new();
+        let mut idx = 6;
+        while let Some(&nn) = self.data.get(idx) {
+            if nn == 0xF7 {
+                break; // end-of-exclusive terminates the pair list
+            }
+            let vv = *self.data.get(idx + 1)?; // dangling nn → None
+            if vv == 0xF7 {
+                return None; // pair truncated by EOX
+            }
+            controls.push((nn & 0x7F, vv & 0x7F));
+            idx += 2;
+        }
+        Some(KeyBasedInstrumentControl {
+            channel,
+            key,
+            controls,
         })
     }
 }
@@ -4659,6 +4727,46 @@ pub struct ControllerDestination {
     /// byte's scale is defined by the governing recommended practice
     /// (see [`ControlledParameter`]).
     pub routings: Vec<(ControlledParameter, u8)>,
+}
+
+/// A decoded **Key-Based Instrument Control** message (CA-023) — a
+/// Universal Real-Time SysEx `F0 7F <dev> 0A 01 0n kk [nn vv]… F7`
+/// applying controller values to the sound assigned to one *key* of a
+/// channel (a drum-set instrument, typically) rather than the whole
+/// channel.
+///
+/// Per CA-023 the values are generally *relative* adjustments to the
+/// key's preset (`0x40` selects the factory default; below decreases,
+/// above increases), with Pan (CC 10), Reverb Send (CC 91), and Chorus
+/// Send (CC 93) called out as usually absolute. `nn = 0x78` / `0x79`
+/// are **redefined** as Fine / Coarse Tuning (their channel-message
+/// meanings — the Mode Change family — do not apply per key). Decoded
+/// via [`UniversalSysExEvent::key_based_instrument_control`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyBasedInstrumentControl {
+    /// The MIDI channel (`0n`, `0..=15`) whose key-based instrument is
+    /// addressed.
+    pub channel: u8,
+    /// The key number (`kk`, `0..=127`) — the drum-set slot / key-based
+    /// instrument the controller values apply to.
+    pub key: u8,
+    /// The `[nn vv]` controller/value pairs, in wire order. `nn`
+    /// follows the Control Change numbering except where CA-023
+    /// disallows or redefines it — see
+    /// [`is_disallowed_controller`](Self::is_disallowed_controller) and
+    /// the Fine / Coarse Tuning redefinition of `0x78` / `0x79`.
+    pub controls: Vec<(u8, u8)>,
+}
+
+impl KeyBasedInstrumentControl {
+    /// `true` for the controller numbers CA-023 excludes from key-based
+    /// use: Bank Select MSB/LSB (`0x00` / `0x20`), Data Entry MSB/LSB
+    /// (`0x06` / `0x26`), the RPN/NRPN family (`0x60..=0x65`), and the
+    /// Mode Change messages (`0x78..=0x7F`) **except** `0x78` / `0x79`,
+    /// which CA-023 redefines as Fine / Coarse Tuning.
+    pub fn is_disallowed_controller(nn: u8) -> bool {
+        matches!(nn, 0x00 | 0x20 | 0x06 | 0x26 | 0x60..=0x65 | 0x7A..=0x7F)
+    }
 }
 
 /// Sub-ID #1 category of a Universal System Exclusive packet — the
@@ -6975,6 +7083,29 @@ impl SmfFile {
                     tick: ev.tick,
                     track: ev.track,
                     destination,
+                });
+            }
+        }
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **Key-Based Instrument Control** message (CA-023,
+    /// `F0 7F <dev> 0A 01 0n kk [nn vv]… F7`) from every track, pinned
+    /// to the absolute tick at which it fires, in time order. Each entry
+    /// is decoded via
+    /// [`UniversalSysExEvent::key_based_instrument_control`]; packets
+    /// the decoder rejects (wrong realm — the Non-Real-Time `0x0A`
+    /// family is Downloadable Sounds — or a dangling controller byte)
+    /// are skipped. Returns an empty `Vec` when no track carries one.
+    pub fn key_based_instrument_controls(&self) -> Vec<KeyBasedInstrumentControlEvent> {
+        let mut out: Vec<KeyBasedInstrumentControlEvent> = Vec::new();
+        for ev in self.universal_sysex_events() {
+            if let Some(control) = ev.key_based_instrument_control() {
+                out.push(KeyBasedInstrumentControlEvent {
+                    tick: ev.tick,
+                    track: ev.track,
+                    control,
                 });
             }
         }
@@ -18372,6 +18503,91 @@ mod tests {
             vec![(ControlledParameter::Reserved(0x06), 0x10)],
         );
         assert_eq!(dest.routings[0].0.byte(), 0x06);
+    }
+
+    // ----------------------------------------------------------------
+    // key_based_instrument_control() — CA-023.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn key_based_instrument_control_decodes_pairs() {
+        // Channel 9 (GM drums), key 38 (snare): Note Volume 0x50
+        // (relative), Pan 0x20 (absolute), Reverb Send 0x66.
+        let smf = smf_with_sysex(&[
+            0x7F, 0x7F, 0x0A, 0x01, 0x09, 0x26, 0x07, 0x50, 0x0A, 0x20, 0x5B, 0x66, 0xF7,
+        ]);
+        let evs = smf.universal_sysex_events();
+        assert_eq!(evs.len(), 1);
+        let kbic = evs[0].key_based_instrument_control().expect("must decode");
+        assert_eq!(kbic.channel, 9);
+        assert_eq!(kbic.key, 0x26);
+        assert_eq!(
+            kbic.controls,
+            vec![(0x07, 0x50), (0x0A, 0x20), (0x5B, 0x66)],
+        );
+    }
+
+    #[test]
+    fn key_based_instrument_control_redefined_tuning_controllers() {
+        // CA-023 redefines nn = 0x78 / 0x79 as Fine / Coarse Tuning —
+        // they decode as ordinary pairs and are NOT disallowed, while
+        // their Mode Change neighbours 0x7A..=0x7F are.
+        let smf = smf_with_sysex(&[
+            0x7F, 0x7F, 0x0A, 0x01, 0x00, 0x24, 0x78, 0x42, 0x79, 0x3E, 0xF7,
+        ]);
+        let evs = smf.universal_sysex_events();
+        let kbic = evs[0].key_based_instrument_control().expect("must decode");
+        assert_eq!(kbic.controls, vec![(0x78, 0x42), (0x79, 0x3E)]);
+        assert!(!KeyBasedInstrumentControl::is_disallowed_controller(0x78));
+        assert!(!KeyBasedInstrumentControl::is_disallowed_controller(0x79));
+        for nn in [0x00u8, 0x20, 0x06, 0x26, 0x60, 0x65, 0x7A, 0x7F] {
+            assert!(
+                KeyBasedInstrumentControl::is_disallowed_controller(nn),
+                "nn {nn:#04x} is excluded by CA-023",
+            );
+        }
+        assert!(!KeyBasedInstrumentControl::is_disallowed_controller(0x07));
+        assert!(!KeyBasedInstrumentControl::is_disallowed_controller(0x5B));
+    }
+
+    #[test]
+    fn key_based_instrument_control_none_on_non_realtime_dls_family() {
+        // Non-RT 0x0A is Downloadable Sounds (Turn DLS On = 0x01) —
+        // same Sub-ID pair, different realm.
+        let smf = smf_with_sysex(&[0x7E, 0x7F, 0x0A, 0x01, 0xF7]);
+        let evs = smf.universal_sysex_events();
+        assert_eq!(evs[0].key_based_instrument_control(), None);
+    }
+
+    #[test]
+    fn key_based_instrument_control_none_on_dangling_controller_byte() {
+        let smf = smf_with_sysex(&[0x7F, 0x7F, 0x0A, 0x01, 0x09, 0x26, 0x07, 0xF7]);
+        let evs = smf.universal_sysex_events();
+        assert_eq!(evs[0].key_based_instrument_control(), None);
+    }
+
+    #[test]
+    fn key_based_instrument_controls_iterator_merges_across_tracks() {
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(10));
+        t0.extend_from_slice(&[0xF0, 0x09]);
+        t0.extend_from_slice(&[0x7F, 0x7F, 0x0A, 0x01, 0x09, 0x24, 0x07, 0x30, 0xF7]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(5));
+        t1.extend_from_slice(&[0xF0, 0x09]);
+        t1.extend_from_slice(&[0x7F, 0x7F, 0x0A, 0x01, 0x09, 0x26, 0x0A, 0x7F, 0xF7]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let kbics = smf.key_based_instrument_controls();
+        assert_eq!(kbics.len(), 2);
+        assert_eq!(kbics[0].tick, 5);
+        assert_eq!(kbics[0].control.key, 0x26);
+        assert_eq!(kbics[1].tick, 10);
+        assert_eq!(kbics[1].control.key, 0x24);
     }
 
     #[test]
