@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 389 — smf CA-022 Controller Destination Setting decoder
+
+- `UniversalSysExEvent::controller_destination()` decodes the Universal
+  Real-Time **Controller Destination Setting** message (CA-022,
+  `F0 7F <dev> 09 <src> 0n [cc] [pp rr]… F7`) into a typed
+  `ControllerDestination`: the control source
+  (`ControllerDestinationSource` — Channel Pressure `01` / Polyphonic
+  Key Pressure `02` / Control Change `03` with its controller number),
+  the target channel, and the parameter/range routing pairs. Each `pp`
+  classifies against the CA-022 controlled-parameter table
+  (`ControlledParameter`: Pitch / Filter Cutoff / Amplitude / LFO
+  Pitch- / Filter- / Amplitude-Depth, `Reserved` for `06..=7F`); `rr`
+  is surfaced raw since its scale is defined by the governing
+  recommended practice. The decoder enforces CA-022's allowed CC ranges
+  (`01..=1F`, `40..=5F` — anything else "must be ignored by the
+  receiver"), returns `None` on a dangling `pp` with no range byte, and
+  keeps the Non-Real-Time `0x09` realm (General MIDI System On/Off)
+  on its own decoder. An empty pair list decodes as the explicit
+  routing clear CA-022 defines.
+- `SmfFile::controller_destinations()` is the stably-merged
+  absolute-tick iterator (rejected packets skipped).
+- 8 new tests, including CA-022's worked example (`F0 7F 7F 09 01 06 00
+  42 01 60 05 20 F7` → Pitch +2 semitones / Filter Cutoff / LFO
+  Amplitude Depth on channel 6), the CC form, disallowed-CC rejection,
+  realm separation from GM System On, dangling-byte rejection, the
+  empty-list clear, reserved parameters, and the iterator merge/skip.
+- Provenance: `docs/audio/midi/recommended-practices/
+  ca22-Controller-Destination-SysEx-Message.pdf`.
+
 ### Round 389 — smf RP-021 Sound Controller classifier (CC 70-79)
 
 - `ControlChangeEvent::sound_controller()` classifies the ten Sound

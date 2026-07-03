@@ -3343,6 +3343,19 @@ pub struct GeneralMidiSystemEvent {
     pub system: GeneralMidiSystem,
 }
 
+/// A decoded **Controller Destination Setting** (CA-022) pinned to the
+/// absolute tick (and the track) at which it fires — the element type of
+/// [`SmfFile::controller_destinations`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControllerDestinationEvent {
+    /// Absolute tick (cumulative per-track delta sum).
+    pub tick: u64,
+    /// Source [`Track`] index within [`SmfFile::tracks`].
+    pub track: usize,
+    /// The decoded Controller Destination Setting.
+    pub destination: ControllerDestination,
+}
+
 impl UniversalSysExEvent {
     /// Decode this packet as a Notation **Bar Number** message when it
     /// is one, returning the signed 14-bit bar number and its semantic
@@ -3859,6 +3872,74 @@ impl UniversalSysExEvent {
             UniversalSubId2::GeneralMidi2SystemOn => Some(GeneralMidiSystem::Level2On),
             _ => None,
         }
+    }
+
+    /// Decode this packet as a **Controller Destination Setting** message
+    /// (CA-022) when it is one, returning the control source, target
+    /// channel, and the `[pp rr]` parameter/range routing pairs.
+    ///
+    /// Per CA-022, the message travels as a Universal Real-Time SysEx
+    /// with Sub-ID #1 = `0x09`: `F0 7F <dev> 09 <src> 0n [pp rr]… F7`
+    /// for the Channel Pressure (`src = 01`) / Polyphonic Key Pressure
+    /// (`02`) sources, with a controller-number byte inserted before the
+    /// pairs for the Control Change source (`03`): `F0 7F <dev> 09 03 0n
+    /// cc [pp rr]… F7`. The pair list may be empty (clearing the
+    /// source's routings on the channel) or carry several routings; each
+    /// `pp` is classified against the CA-022 controlled-parameter table
+    /// and each `rr` is surfaced raw (its scale is defined by the
+    /// governing recommended practice).
+    ///
+    /// Returns `None` unless the packet is Real-Time with Sub-ID #1 =
+    /// `0x09` and a valid source Sub-ID #2 — the Non-Real-Time `0x09`
+    /// family is General MIDI System On/Off
+    /// ([`general_midi_system`](Self::general_midi_system)) — or when
+    /// the Control Change form carries a controller number outside
+    /// CA-022's allowed `0x01..=0x1F` / `0x40..=0x5F` ranges ("Any
+    /// other controller number must be ignored by the receiver"), or
+    /// when the pair list ends on a dangling `pp` with no range byte.
+    pub fn controller_destination(&self) -> Option<ControllerDestination> {
+        if !matches!(self.classification.realm, UniversalRealm::RealTime) {
+            return None;
+        }
+        let sub2 = match self.classification.sub_id1 {
+            UniversalSubId1::GeneralMidiOrControllerDestination(s) => s,
+            _ => return None,
+        };
+        // <realm=7F> <device_id> <sub_id1=09> <sub_id2> 0n [cc] [pp rr]… [F7]
+        let channel = *self.data.get(4)? & 0x0F;
+        let (source, mut idx) = match sub2 {
+            UniversalSubId2::ControllerDestinationChannelPressure => {
+                (ControllerDestinationSource::ChannelPressure, 5)
+            }
+            UniversalSubId2::ControllerDestinationPolyphonicKeyPressure => {
+                (ControllerDestinationSource::PolyphonicKeyPressure, 5)
+            }
+            UniversalSubId2::ControllerDestinationControlChange => {
+                let cc = *self.data.get(5)? & 0x7F;
+                if !matches!(cc, 0x01..=0x1F | 0x40..=0x5F) {
+                    return None;
+                }
+                (ControllerDestinationSource::ControlChange(cc), 6)
+            }
+            _ => return None,
+        };
+        let mut routings: Vec<(ControlledParameter, u8)> = Vec::new();
+        while let Some(&pp) = self.data.get(idx) {
+            if pp == 0xF7 {
+                break; // end-of-exclusive terminates the pair list
+            }
+            let rr = *self.data.get(idx + 1)?; // dangling pp → None
+            if rr == 0xF7 {
+                return None; // pair truncated by EOX
+            }
+            routings.push((ControlledParameter::from_byte(pp & 0x7F), rr & 0x7F));
+            idx += 2;
+        }
+        Some(ControllerDestination {
+            source,
+            channel,
+            routings,
+        })
     }
 }
 
@@ -4479,6 +4560,105 @@ pub enum GeneralMidiSystem {
     /// `F0 7E <dev> 09 03 F7` — General MIDI 2 System On. The receiver
     /// resets to the GM 2 default state.
     Level2On,
+}
+
+/// The control source of a **Controller Destination Setting** message
+/// (CA-022) — the Sub-ID #2 of the Universal Real-Time `F0 7F <dev> 09
+/// <sub_id2> …` packet, plus the controller number for the Control
+/// Change form.
+///
+/// Decoded via [`UniversalSysExEvent::controller_destination`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControllerDestinationSource {
+    /// Sub-ID #2 = `0x01` — Channel Pressure (Aftertouch).
+    ChannelPressure,
+    /// Sub-ID #2 = `0x02` — Polyphonic Key Pressure (Aftertouch).
+    PolyphonicKeyPressure,
+    /// Sub-ID #2 = `0x03` — a Control Change message; the field is the
+    /// controller number `cc`. CA-022 allows only `0x01..=0x1F` and
+    /// `0x40..=0x5F` here ("Any other controller number must be ignored
+    /// by the receiver"), which the decoder enforces.
+    ControlChange(u8),
+}
+
+/// One controlled parameter (`pp`) of a Controller Destination Setting
+/// routing, per the CA-022 "Controlled Parameters and Ranges" table.
+///
+/// Each parameter arrives paired with a range byte `rr` whose scale is
+/// "defined by R/P" — the governing recommended practice (GM2's
+/// response definitions, for instance; CA-022's own worked example
+/// shows `0x42` = +2 semitones for Pitch Control, `0x60` = +4800 cents
+/// for Filter Cutoff, `0x20` = 25 % for LFO Amplitude Depth). The
+/// decoder surfaces `rr` raw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlledParameter {
+    /// `pp = 00` — Pitch Control.
+    PitchControl,
+    /// `pp = 01` — Filter Cutoff Control.
+    FilterCutoffControl,
+    /// `pp = 02` — Amplitude Control.
+    AmplitudeControl,
+    /// `pp = 03` — LFO Pitch Depth.
+    LfoPitchDepth,
+    /// `pp = 04` — LFO Filter Depth.
+    LfoFilterDepth,
+    /// `pp = 05` — LFO Amplitude Depth.
+    LfoAmplitudeDepth,
+    /// `pp = 06..=7F` — reserved for future MMA/AMEI definition
+    /// (manufacturers must not add proprietary parameters), surfaced
+    /// with the raw byte.
+    Reserved(u8),
+}
+
+impl ControlledParameter {
+    /// Map a raw `pp` byte to its CA-022 table entry.
+    pub fn from_byte(pp: u8) -> Self {
+        match pp {
+            0x00 => ControlledParameter::PitchControl,
+            0x01 => ControlledParameter::FilterCutoffControl,
+            0x02 => ControlledParameter::AmplitudeControl,
+            0x03 => ControlledParameter::LfoPitchDepth,
+            0x04 => ControlledParameter::LfoFilterDepth,
+            0x05 => ControlledParameter::LfoAmplitudeDepth,
+            other => ControlledParameter::Reserved(other & 0x7F),
+        }
+    }
+
+    /// The raw `pp` byte for this table entry.
+    pub fn byte(&self) -> u8 {
+        match self {
+            ControlledParameter::PitchControl => 0x00,
+            ControlledParameter::FilterCutoffControl => 0x01,
+            ControlledParameter::AmplitudeControl => 0x02,
+            ControlledParameter::LfoPitchDepth => 0x03,
+            ControlledParameter::LfoFilterDepth => 0x04,
+            ControlledParameter::LfoAmplitudeDepth => 0x05,
+            ControlledParameter::Reserved(b) => *b,
+        }
+    }
+}
+
+/// A decoded **Controller Destination Setting** message (CA-022) — a
+/// Universal Real-Time SysEx `F0 7F <dev> 09 <src> 0n [cc] [pp rr]… F7`
+/// assigning a control source (Channel Pressure, Polyphonic Key
+/// Pressure, or a Control Change number) to one or more sound
+/// parameters, each with a response-range byte.
+///
+/// Per CA-022, receiving a new message clears the source's previously
+/// set destinations on that channel, so `routings` is the complete
+/// routing set for `(source, channel)` from this tick on; an empty list
+/// clears the source's routings. Decoded via
+/// [`UniversalSysExEvent::controller_destination`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControllerDestination {
+    /// The control source being routed.
+    pub source: ControllerDestinationSource,
+    /// The MIDI channel (`0n`, `0..=15`) the routing applies to.
+    pub channel: u8,
+    /// The `[pp rr]` parameter/range pairs, in wire order. The range
+    /// byte's scale is defined by the governing recommended practice
+    /// (see [`ControlledParameter`]).
+    pub routings: Vec<(ControlledParameter, u8)>,
 }
 
 /// Sub-ID #1 category of a Universal System Exclusive packet — the
@@ -6772,6 +6952,29 @@ impl SmfFile {
                     tick: ev.tick,
                     track: ev.track,
                     system,
+                });
+            }
+        }
+        out.sort_by_key(|c| c.tick);
+        out
+    }
+
+    /// Collect every **Controller Destination Setting** (CA-022,
+    /// `F0 7F <dev> 09 <src> 0n [cc] [pp rr]… F7`) from every track,
+    /// pinned to the absolute tick at which it fires, in time order.
+    /// Each entry is decoded via
+    /// [`UniversalSysExEvent::controller_destination`]; packets the
+    /// decoder rejects (wrong realm, a disallowed Control Change number,
+    /// a dangling parameter byte) are skipped. Returns an empty `Vec`
+    /// when no track carries a Controller Destination Setting.
+    pub fn controller_destinations(&self) -> Vec<ControllerDestinationEvent> {
+        let mut out: Vec<ControllerDestinationEvent> = Vec::new();
+        for ev in self.universal_sysex_events() {
+            if let Some(destination) = ev.controller_destination() {
+                out.push(ControllerDestinationEvent {
+                    tick: ev.tick,
+                    track: ev.track,
+                    destination,
                 });
             }
         }
@@ -18046,5 +18249,157 @@ mod tests {
         blob.extend(track_chunk(&t0));
         let smf = parse(&blob).unwrap();
         assert!(smf.sound_controllers().is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // controller_destination() / controller_destinations() — CA-022.
+    // ----------------------------------------------------------------
+
+    /// Build a one-track SMF whose single event is the given F0 SysEx
+    /// payload (realm byte onward, EOX included by the caller).
+    fn smf_with_sysex(payload: &[u8]) -> SmfFile {
+        let mut events: Vec<u8> = Vec::new();
+        events.push(0x00);
+        events.push(0xF0);
+        events.extend_from_slice(&encode_vlq(payload.len() as u32));
+        events.extend_from_slice(payload);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        parse(&blob).unwrap()
+    }
+
+    #[test]
+    fn controller_destination_decodes_ca022_worked_example() {
+        // CA-022's example: Channel Pressure on channel 6 routed to
+        // Pitch (+2 semitones), Filter Cutoff (+4800 cents), and LFO
+        // Amplitude Depth (25 %).
+        let smf = smf_with_sysex(&[
+            0x7F, 0x7F, 0x09, 0x01, 0x06, 0x00, 0x42, 0x01, 0x60, 0x05, 0x20, 0xF7,
+        ]);
+        let evs = smf.universal_sysex_events();
+        assert_eq!(evs.len(), 1);
+        let dest = evs[0].controller_destination().expect("must decode");
+        assert_eq!(dest.source, ControllerDestinationSource::ChannelPressure);
+        assert_eq!(dest.channel, 6);
+        assert_eq!(
+            dest.routings,
+            vec![
+                (ControlledParameter::PitchControl, 0x42),
+                (ControlledParameter::FilterCutoffControl, 0x60),
+                (ControlledParameter::LfoAmplitudeDepth, 0x20),
+            ],
+        );
+    }
+
+    #[test]
+    fn controller_destination_control_change_form_carries_cc_number() {
+        // F0 7F 7F 09 03 0n cc [pp rr] F7 — the CC form inserts the
+        // controller number before the pairs.
+        let smf = smf_with_sysex(&[0x7F, 0x7F, 0x09, 0x03, 0x02, 0x01, 0x02, 0x40, 0xF7]);
+        let evs = smf.universal_sysex_events();
+        let dest = evs[0].controller_destination().expect("must decode");
+        assert_eq!(
+            dest.source,
+            ControllerDestinationSource::ControlChange(0x01)
+        );
+        assert_eq!(dest.channel, 2);
+        assert_eq!(
+            dest.routings,
+            vec![(ControlledParameter::AmplitudeControl, 0x40)],
+        );
+    }
+
+    #[test]
+    fn controller_destination_rejects_disallowed_cc_numbers() {
+        // CA-022: only 01-1F and 40-5F are allowed; others must be
+        // ignored by the receiver. 0x20 and 0x60 sit just outside.
+        for bad_cc in [0x00u8, 0x20, 0x3F, 0x60, 0x7F] {
+            let smf = smf_with_sysex(&[0x7F, 0x7F, 0x09, 0x03, 0x00, bad_cc, 0x00, 0x40, 0xF7]);
+            let evs = smf.universal_sysex_events();
+            assert_eq!(
+                evs[0].controller_destination(),
+                None,
+                "cc {bad_cc:#04x} must be ignored",
+            );
+        }
+    }
+
+    #[test]
+    fn controller_destination_none_on_non_realtime_gm_family() {
+        // Non-RT 0x09 is General MIDI System On/Off — same Sub-ID #1,
+        // different realm. GM 1 On must not decode as a destination.
+        let smf = smf_with_sysex(&[0x7E, 0x7F, 0x09, 0x01, 0xF7]);
+        let evs = smf.universal_sysex_events();
+        assert_eq!(evs[0].controller_destination(), None);
+        assert_eq!(
+            evs[0].general_midi_system(),
+            Some(GeneralMidiSystem::Level1On),
+        );
+    }
+
+    #[test]
+    fn controller_destination_none_on_dangling_parameter_byte() {
+        // A pp with no rr (EOX where the range byte belongs) is a
+        // truncated pair — decode to None, not a half routing.
+        let smf = smf_with_sysex(&[0x7F, 0x7F, 0x09, 0x01, 0x00, 0x00, 0xF7]);
+        let evs = smf.universal_sysex_events();
+        assert_eq!(evs[0].controller_destination(), None);
+    }
+
+    #[test]
+    fn controller_destination_empty_pair_list_clears_routings() {
+        // CA-022 clears previously-set destinations on receipt; an
+        // empty list is the explicit clear.
+        let smf = smf_with_sysex(&[0x7F, 0x7F, 0x09, 0x02, 0x0F, 0xF7]);
+        let evs = smf.universal_sysex_events();
+        let dest = evs[0].controller_destination().expect("must decode");
+        assert_eq!(
+            dest.source,
+            ControllerDestinationSource::PolyphonicKeyPressure
+        );
+        assert_eq!(dest.channel, 15);
+        assert!(dest.routings.is_empty());
+    }
+
+    #[test]
+    fn controller_destination_reserved_parameter_surfaces_raw_byte() {
+        let smf = smf_with_sysex(&[0x7F, 0x7F, 0x09, 0x01, 0x00, 0x06, 0x10, 0xF7]);
+        let evs = smf.universal_sysex_events();
+        let dest = evs[0].controller_destination().expect("must decode");
+        assert_eq!(
+            dest.routings,
+            vec![(ControlledParameter::Reserved(0x06), 0x10)],
+        );
+        assert_eq!(dest.routings[0].0.byte(), 0x06);
+    }
+
+    #[test]
+    fn controller_destinations_iterator_merges_and_skips_rejects() {
+        // Track 0 @10: valid Channel Pressure destination. Track 1 @5:
+        // a disallowed-CC packet the decoder rejects.
+        let mut t0: Vec<u8> = Vec::new();
+        t0.extend_from_slice(&encode_vlq(10));
+        t0.extend_from_slice(&[0xF0, 0x08]);
+        t0.extend_from_slice(&[0x7F, 0x7F, 0x09, 0x01, 0x03, 0x00, 0x42, 0xF7]);
+        t0.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut t1: Vec<u8> = Vec::new();
+        t1.extend_from_slice(&encode_vlq(5));
+        t1.extend_from_slice(&[0xF0, 0x09]);
+        t1.extend_from_slice(&[0x7F, 0x7F, 0x09, 0x03, 0x00, 0x60, 0x00, 0x40, 0xF7]);
+        t1.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(1, 2, 96);
+        blob.extend(track_chunk(&t0));
+        blob.extend(track_chunk(&t1));
+        let smf = parse(&blob).unwrap();
+        let dests = smf.controller_destinations();
+        assert_eq!(dests.len(), 1, "the rejected packet must be skipped");
+        assert_eq!(dests[0].tick, 10);
+        assert_eq!(dests[0].track, 0);
+        assert_eq!(dests[0].destination.channel, 3);
+        assert_eq!(
+            dests[0].destination.routings,
+            vec![(ControlledParameter::PitchControl, 0x42)],
+        );
     }
 }
