@@ -2063,6 +2063,24 @@ impl ControlChangeEvent {
             _ => return None,
         })
     }
+
+    /// The lower 7 velocity bits carried by a CC 88 **High-Resolution
+    /// Velocity Prefix** (`Bn 58 vv`, CA-031), or `None` for any other
+    /// controller.
+    ///
+    /// Per CA-031, `vv` is affixed *below* the 7-bit velocity of the
+    /// next Note On / Note Off on the same channel, producing a 14-bit
+    /// velocity `(velocity << 7) | vv` (16,256 usable Note On steps —
+    /// `0x0080..=0x3FFF`, since the upper bits come from a non-zero
+    /// Note On velocity). The prefix affects only that one note message
+    /// — the receiver clears the lower bits of its velocity register
+    /// after each Note On / Note Off — and a `9n key 0` (velocity-0
+    /// Note-Off form) stays a valid Note Off with the prefix having no
+    /// effect. [`SmfFile::notes`] folds this pairing into
+    /// [`Note::on_velocity14`] / [`Note::off_velocity14`].
+    pub fn high_res_velocity_prefix(&self) -> Option<u8> {
+        (self.controller == 88).then_some(self.value)
+    }
 }
 
 /// One Channel Mode Message (`Bn cc vv`, `cc` in `120..=127`) pinned to
@@ -2418,6 +2436,23 @@ pub struct Note {
     /// receivers ignore release velocity, but it is preserved here for
     /// callers that drive a release-sensitive instrument.
     pub off_velocity: u8,
+    /// The 14-bit Note On velocity assembled from a CC 88
+    /// **High-Resolution Velocity Prefix** (CA-031), when one preceded
+    /// this note's Note On on the same channel: `(velocity << 7) |
+    /// prefix`, so the standard 7-bit velocity supplies the upper bits
+    /// and the prefix the lower. `None` when no prefix was pending —
+    /// per CA-031 a receiver then acts on the 7 upper bits alone. A
+    /// prefix affects only the *next* Note On or Note Off on its
+    /// channel, and a `9n key 0` (the velocity-0 Note-Off form)
+    /// consumes a pending prefix with **no effect** — CA-031 keeps that
+    /// byte sequence a valid Note Off.
+    pub on_velocity14: Option<u16>,
+    /// The 14-bit Note Off (release) velocity assembled from a CC 88
+    /// prefix pending when the explicit `8n` Note Off arrived:
+    /// `(off_velocity << 7) | prefix`. `None` when the note closed with
+    /// no pending prefix or via the `9n key 0` form (which carries no
+    /// release velocity and, per CA-031, ignores the prefix).
+    pub off_velocity14: Option<u16>,
 }
 
 impl Note {
@@ -2448,6 +2483,18 @@ impl Note {
     /// when a Note Off lands on the same tick as the Note On.
     pub fn duration_ticks(&self) -> u64 {
         self.end_tick - self.start_tick
+    }
+
+    /// The 14-bit attack velocity per CA-031 (*CC #88 High Resolution
+    /// Velocity Prefix*): the assembled `(velocity << 7) | prefix` when
+    /// a CC 88 prefix preceded the Note On, otherwise the 7-bit
+    /// velocity promoted into the upper bits (`velocity << 7`) — the
+    /// exact value a CA-031 receiver acts on when the prefix is absent
+    /// (lower 7 bits of its 14-bit velocity register cleared). The
+    /// smallest value a conforming Note On can produce is `0x0080`
+    /// (velocity 1, prefix 0) and the largest `0x3FFF`.
+    pub fn velocity14(&self) -> u16 {
+        self.on_velocity14.unwrap_or((self.velocity as u16) << 7)
     }
 }
 
@@ -6805,6 +6852,15 @@ impl SmfFile {
     /// every Note On with a Note Off; a hanging note is a producer bug,
     /// and most receivers silence it at end-of-track.)
     ///
+    /// **High-resolution velocity (CA-031).** A CC 88 *High-Resolution
+    /// Velocity Prefix* (`Bn 58 vv`) pending on a channel affixes its 7
+    /// bits below the next Note On / Note Off velocity on that channel,
+    /// surfacing as [`Note::on_velocity14`] / [`Note::off_velocity14`]
+    /// (`(velocity << 7) | vv`). The register clears after each note
+    /// message; other messages may sit between the prefix and its note.
+    /// A `9n key 0` closure stays a plain Note Off — the prefix is
+    /// consumed with no effect, per CA-031.
+    ///
     /// Returns an empty `Vec` for a file with no note activity (e.g. a
     /// tempo-map-only conductor track). Cost is `O(n log n)` in the
     /// total event count for the merge sort, bounded above by
@@ -6827,9 +6883,18 @@ impl SmfFile {
             for (order, ev) in track.events.iter().enumerate() {
                 abs = abs.saturating_add(ev.delta as u64);
                 if let Event::Channel(ChannelMessage { channel, body }) = &ev.kind {
+                    // Note events drive the pairing; CC 88 (High-
+                    // Resolution Velocity Prefix, CA-031) rides along so
+                    // the walk can affix its lower 7 bits to the next
+                    // note message on the channel. Other messages may
+                    // legally sit between the prefix and its note (CA-031
+                    // permits intervening MIDI messages), and they simply
+                    // never enter this stream.
                     if matches!(
                         body,
-                        ChannelBody::NoteOn { .. } | ChannelBody::NoteOff { .. }
+                        ChannelBody::NoteOn { .. }
+                            | ChannelBody::NoteOff { .. }
+                            | ChannelBody::ControlChange { controller: 88, .. }
                     ) {
                         merged.push(AbsNote {
                             tick: abs,
@@ -6857,25 +6922,45 @@ impl SmfFile {
             start_tick: u64,
             track: usize,
             velocity: u8,
+            on_velocity14: Option<u16>,
         }
         // 16 channels × 128 keys; lazily-grown FIFO per slot.
         let mut open: Vec<Vec<Pending>> = (0..(16 * 128)).map(|_| Vec::new()).collect();
         let slot = |channel: u8, key: u8| -> usize { (channel as usize) * 128 + key as usize };
+        // Per-channel pending CC 88 High-Resolution Velocity Prefix
+        // (CA-031): the lower 7 bits affixed to the *next* Note On /
+        // Note Off on the matching channel, cleared once that note
+        // message has been parsed.
+        let mut hr_prefix: [Option<u8>; 16] = [None; 16];
 
         let mut out: Vec<Note> = Vec::new();
         for ev in &merged {
+            let ch = (ev.channel as usize) % 16;
             match ev.body {
+                ChannelBody::ControlChange {
+                    controller: 88,
+                    value,
+                } => {
+                    hr_prefix[ch] = Some(*value & 0x7F);
+                }
                 ChannelBody::NoteOn { key, velocity } if *velocity > 0 => {
+                    let on_velocity14 = hr_prefix[ch]
+                        .take()
+                        .map(|lsb| ((*velocity as u16) << 7) | lsb as u16);
                     open[slot(ev.channel, *key)].push(Pending {
                         start_tick: ev.tick,
                         track: ev.track,
                         velocity: *velocity,
+                        on_velocity14,
                     });
                 }
                 // Note On with velocity 0 is the running-status Note-Off
                 // form: close the earliest open note of this pitch with a
-                // zero release velocity.
+                // zero release velocity. Per CA-031 a preceding CC 88 has
+                // *no effect* on this form (it must stay a valid Note
+                // Off), but the note message still clears the register.
                 ChannelBody::NoteOn { key, velocity: _ } => {
+                    hr_prefix[ch] = None;
                     let fifo = &mut open[slot(ev.channel, *key)];
                     if !fifo.is_empty() {
                         let p = fifo.remove(0);
@@ -6887,10 +6972,15 @@ impl SmfFile {
                             key: *key,
                             velocity: p.velocity,
                             off_velocity: 0,
+                            on_velocity14: p.on_velocity14,
+                            off_velocity14: None,
                         });
                     }
                 }
                 ChannelBody::NoteOff { key, velocity } => {
+                    let off_velocity14 = hr_prefix[ch]
+                        .take()
+                        .map(|lsb| ((*velocity as u16) << 7) | lsb as u16);
                     let fifo = &mut open[slot(ev.channel, *key)];
                     if !fifo.is_empty() {
                         let p = fifo.remove(0);
@@ -6902,6 +6992,8 @@ impl SmfFile {
                             key: *key,
                             velocity: p.velocity,
                             off_velocity: *velocity,
+                            on_velocity14: p.on_velocity14,
+                            off_velocity14,
                         });
                     }
                 }
@@ -16255,6 +16347,148 @@ mod tests {
         let muxed = smf.to_bytes().unwrap();
         let reparsed = parse(&muxed).unwrap();
         assert_eq!(original, reparsed.notes());
+    }
+
+    // ----------------------------------------------------------------
+    // CC 88 High-Resolution Velocity Prefix (CA-031) in notes().
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn notes_cc88_prefix_assembles_14_bit_on_velocity() {
+        // Bn 58 2A then 9n 3C 64: on_velocity14 = (0x64 << 7) | 0x2A.
+        // The register clears after the note, so a second note carries
+        // no 14-bit velocity.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xB0, 0x58, 0x2A]); // CC 88 prefix
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // note on
+        events.extend_from_slice(&encode_vlq(96));
+        events.extend_from_slice(&[0x80, 0x3C, 0x40]); // note off (consumes nothing)
+        events.extend_from_slice(&[0x00, 0x90, 0x3E, 0x50]); // second note, no prefix
+        events.extend_from_slice(&encode_vlq(96));
+        events.extend_from_slice(&[0x80, 0x3E, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].on_velocity14, Some(((0x64u16) << 7) | 0x2A));
+        assert_eq!(notes[0].velocity14(), ((0x64u16) << 7) | 0x2A);
+        assert_eq!(notes[0].off_velocity14, None);
+        assert_eq!(notes[1].on_velocity14, None);
+        // Without a prefix the 14-bit view is the 7-bit velocity in the
+        // upper bits with the lower bits cleared, per CA-031.
+        assert_eq!(notes[1].velocity14(), (0x50u16) << 7);
+    }
+
+    #[test]
+    fn notes_cc88_prefix_survives_intervening_messages() {
+        // CA-031: "There may be other MIDI messages in between the High
+        // Resolution Velocity Prefix message and the subsequent Note On".
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xB0, 0x58, 0x01]); // prefix
+        events.extend_from_slice(&[0x00, 0xB0, 0x07, 0x60]); // CC 7 in between
+        events.extend_from_slice(&[0x00, 0xE0, 0x00, 0x40]); // pitch bend in between
+        events.extend_from_slice(&[0x00, 0x90, 0x01, 0x01]); // softest note on
+        events.extend_from_slice(&encode_vlq(48));
+        events.extend_from_slice(&[0x80, 0x01, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 1);
+        // CA-031's smallest possible 14-bit Note On velocity is 0x0080
+        // (upper byte's LSB set, prefix 0) — velocity 1 prefix 1 gives
+        // 0x0081, just above it.
+        assert_eq!(notes[0].on_velocity14, Some(0x0081));
+    }
+
+    #[test]
+    fn notes_cc88_prefix_is_channel_scoped() {
+        // A prefix on channel 0 must not attach to a note on channel 1.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xB0, 0x58, 0x7F]); // prefix, ch 0
+        events.extend_from_slice(&[0x00, 0x91, 0x3C, 0x40]); // note on, ch 1
+        events.extend_from_slice(&encode_vlq(48));
+        events.extend_from_slice(&[0x81, 0x3C, 0x00]);
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x40]); // note on, ch 0
+        events.extend_from_slice(&encode_vlq(48));
+        events.extend_from_slice(&[0x80, 0x3C, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 2);
+        let ch1 = notes.iter().find(|n| n.channel() == 1).unwrap();
+        let ch0 = notes.iter().find(|n| n.channel() == 0).unwrap();
+        assert_eq!(ch1.on_velocity14, None, "prefix leaked across channels");
+        assert_eq!(ch0.on_velocity14, Some(((0x40u16) << 7) | 0x7F));
+    }
+
+    #[test]
+    fn notes_cc88_prefix_has_no_effect_on_velocity_zero_note_off() {
+        // CA-031: "If 9n kk 00 is received, that still qualifies as a
+        // valid Note Off, and the preceding Bn 58 xx has no effect" —
+        // and the register clears, so a *following* note also sees none.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // note on (no prefix)
+        events.extend_from_slice(&[0x00, 0xB0, 0x58, 0x33]); // prefix
+        events.extend_from_slice(&encode_vlq(96));
+        events.extend_from_slice(&[0x90, 0x3C, 0x00]); // vel-0 note off
+        events.extend_from_slice(&[0x00, 0x90, 0x3E, 0x30]); // next note
+        events.extend_from_slice(&encode_vlq(96));
+        events.extend_from_slice(&[0x80, 0x3E, 0x00]);
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(
+            notes[0].off_velocity14, None,
+            "vel-0 off must ignore prefix"
+        );
+        assert_eq!(
+            notes[1].on_velocity14, None,
+            "register must clear after the off"
+        );
+    }
+
+    #[test]
+    fn notes_cc88_prefix_applies_to_explicit_note_off_release_velocity() {
+        // The prefix affixes to "the subsequent Note On / Note Off" —
+        // an explicit 8n release velocity is refined to 14 bits too.
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // note on
+        events.extend_from_slice(&[0x00, 0xB0, 0x58, 0x15]); // prefix
+        events.extend_from_slice(&encode_vlq(96));
+        events.extend_from_slice(&[0x80, 0x3C, 0x22]); // explicit off, rel-vel 0x22
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let notes = smf.notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].on_velocity14, None);
+        assert_eq!(notes[0].off_velocity(), 0x22);
+        assert_eq!(notes[0].off_velocity14, Some(((0x22u16) << 7) | 0x15));
+    }
+
+    #[test]
+    fn notes_cc88_classifier_on_control_change_event() {
+        let mut events: Vec<u8> = Vec::new();
+        events.extend_from_slice(&[0x00, 0xB0, 0x58, 0x2A]); // CC 88
+        events.extend_from_slice(&[0x00, 0xB0, 0x07, 0x2A]); // CC 7
+        events.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+        let mut blob = header_chunk(0, 1, 96);
+        blob.extend(track_chunk(&events));
+        let smf = parse(&blob).unwrap();
+        let ccs = smf.control_changes();
+        assert_eq!(ccs.len(), 2);
+        assert_eq!(ccs[0].high_res_velocity_prefix(), Some(0x2A));
+        assert_eq!(ccs[1].high_res_velocity_prefix(), None);
     }
 
     // ----------------------------------------------------------------

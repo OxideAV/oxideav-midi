@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 389 — smf CA-031 High-Resolution Velocity Prefix (CC 88)
+
+- `SmfFile::notes()` now folds the CC 88 **High-Resolution Velocity
+  Prefix** (CA-031) into the note pairing: a `Bn 58 vv` pending on a
+  channel affixes its 7 bits below the next Note On / Note Off velocity
+  on that channel, surfacing as `Note::on_velocity14` /
+  `Note::off_velocity14` (`(velocity << 7) | vv`, so the conforming
+  Note On range is `0x0080..=0x3FFF` — 16,256 steps). The register is
+  per-channel, clears after each note message, and tolerates other MIDI
+  messages between the prefix and its note, all per CA-031. A
+  `9n key 0` closure stays a plain Note Off — the prefix is consumed
+  with **no effect** (CA-031 keeps the Note On Running Status shortcut
+  valid) — while an explicit `8n` release velocity is refined to 14
+  bits like an attack.
+- `Note::velocity14()` returns the value a CA-031 receiver acts on:
+  the assembled 14-bit velocity, or `velocity << 7` when no prefix was
+  pending (lower bits cleared). `ControlChangeEvent::
+  high_res_velocity_prefix()` classifies the raw controller.
+- 6 new tests: assembly + register clearing, intervening-message
+  tolerance, channel scoping, the vel-0 Note-Off no-effect rule,
+  explicit-off release refinement, and the CC classifier.
+- Provenance: `docs/audio/midi/recommended-practices/ca31.pdf`
+  (CA-031, CC #88 High Resolution Velocity Prefix).
+
 ### Round 389 — synth RP-036 Default Pan Formula
 
 - The mixer's CC 10 pan law now follows RP-036 (*Default Pan Formula*)
