@@ -159,7 +159,10 @@ pub struct ChannelState {
     /// shape dynamics inside the headroom Volume reserves. RP-015's
     /// Reset All Controllers restores it to 127.
     pub expression: u8,
-    /// CC 10 (Pan), 0..=127. 64 = centre. Default 64.
+    /// CC 10 (Pan), 0..=127. 64 = centre. Default 64. Rendered with the
+    /// RP-036 Default Pan Formula: gains `cos`/`sin` of
+    /// `π/2 · max(0, pan − 1) / 126`, so 64 is a true centre and both 0
+    /// and 1 pan hard left (the effective range is 1..=127).
     pub pan: u8,
     /// CC 64 (Sustain Pedal). `true` while the pedal is depressed
     /// (value >= 64); the mixer holds note-offs until it lifts.
@@ -2451,8 +2454,15 @@ impl Mixer {
             // Expression, and Expression at 127 is transparent. The note
             // gain is 1.0 unless the Soft Pedal was down at strike time.
             let vol = (st.volume as f32 / 127.0) * (st.expression as f32 / 127.0) * slot.note_gain;
-            // Constant-power pan: θ in [0, π/2], left = cos(θ), right = sin(θ).
-            let pan_norm = (st.pan as f32 / 127.0).clamp(0.0, 1.0);
+            // Constant-power pan per RP-036 (Default Pan Formula):
+            //   Left  gain = cos(π/2 · max(0, CC10 − 1) / 126)
+            //   Right gain = sin(π/2 · max(0, CC10 − 1) / 126)
+            // The 0..=127 controller range cannot represent its own
+            // midpoint (63.5), so RP-036 narrows the effective range to
+            // 1..=127 — values 0 and 1 both pan hard left — making 64 a
+            // *true* centre (cos == sin at π/4) with equal power
+            // (cos² + sin² = 1) across the whole sweep.
+            let pan_norm = (st.pan.saturating_sub(1) as f32 / 126.0).clamp(0.0, 1.0);
             let theta = pan_norm * std::f32::consts::FRAC_PI_2;
 
             // CA-024 per-channel effect send fractions (CC 91 / CC 93).
@@ -2698,15 +2708,60 @@ mod tests {
         // Both channels should be > 0.
         assert!(l[0] > 0.0, "left silent");
         assert!(r[0] > 0.0, "right silent");
-        // Pan = 64 maps to ~0.504 in the constant-power law, slightly
-        // R-biased — within 5 % of centre is what GM treats as
-        // perceptually equal.
+        // Pan = 64 is a *true* centre per RP-036 (Default Pan Formula):
+        // (64 − 1)/126 = 0.5 exactly, so cos(π/4) == sin(π/4) and the
+        // two channels carry identical gain.
         let ratio = (l[0] / r[0]).abs();
         assert!(
-            (ratio - 1.0).abs() < 0.05,
-            "L/R ratio {} too far from unity at pan=64",
+            (ratio - 1.0).abs() < 1e-6,
+            "L/R ratio {} not unity at pan=64 (RP-036 true centre)",
             ratio,
         );
+    }
+
+    #[test]
+    fn pan_value_one_is_also_hard_left_per_rp036() {
+        // RP-036: the effective CC 10 range is 1..=127; values 0 and 1
+        // both pan hard left (max(0, CC10 − 1) saturates the subtraction).
+        let mut at0 = Mixer::new();
+        at0.channel_state_mut(0).pan = 0;
+        at0.note_on(0, 60, 100, voice(0.5, 32));
+        let (mut l0, mut r0) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        at0.mix_stereo(&mut l0, &mut r0);
+        let mut at1 = Mixer::new();
+        at1.channel_state_mut(0).pan = 1;
+        at1.note_on(0, 60, 100, voice(0.5, 32));
+        let (mut l1, mut r1) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        at1.mix_stereo(&mut l1, &mut r1);
+        assert_eq!(l0[0], l1[0], "pan=0 and pan=1 must render identically");
+        assert!(r1[0].abs() < 1e-6, "pan=1 right={} should be silent", r1[0]);
+    }
+
+    #[test]
+    fn pan_law_is_equal_power_across_sweep() {
+        // RP-036's cos/sin law distributes equal power at every pan
+        // position: L² + R² is constant. Verify the rendered gains at a
+        // sample of controller values against a hard-left reference.
+        let reference = {
+            let mut m = Mixer::new();
+            m.channel_state_mut(0).pan = 0;
+            m.note_on(0, 60, 100, voice(0.5, 32));
+            let (mut l, mut r) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+            m.mix_stereo(&mut l, &mut r);
+            l[0] * l[0] + r[0] * r[0]
+        };
+        for pan in [16u8, 32, 64, 96, 111, 127] {
+            let mut m = Mixer::new();
+            m.channel_state_mut(0).pan = pan;
+            m.note_on(0, 60, 100, voice(0.5, 32));
+            let (mut l, mut r) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+            m.mix_stereo(&mut l, &mut r);
+            let power = l[0] * l[0] + r[0] * r[0];
+            assert!(
+                (power - reference).abs() < 1e-6,
+                "pan={pan}: power {power} != hard-left reference {reference}",
+            );
+        }
     }
 
     #[test]

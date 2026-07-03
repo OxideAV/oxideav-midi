@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 389 — synth RP-036 Default Pan Formula
+
+- The mixer's CC 10 pan law now follows RP-036 (*Default Pan Formula*)
+  exactly: `Left = cos(π/2 · max(0, CC10 − 1)/126)`, `Right = sin(…)`.
+  The previous constant-power law normalised by `pan/127`, which cannot
+  represent the controller range's true midpoint (63.5) — pan 64
+  rendered slightly right-biased. Per RP-036 the effective range is
+  1..=127 (values 0 and 1 both pan hard left, via a saturating
+  `CC10 − 1`), making 64 an exact centre (`cos(π/4) == sin(π/4)`) while
+  keeping the equal-power property (`L² + R²` constant) across the
+  sweep. RP-036 declares this formula the default response for
+  AMEI/MMA specifications, overriding the GM1/GM2/DLS1/DLS2 curves.
+- The stereo-voice balance path derives from the same θ, so its centre
+  (`cos·√2` / `sin·√2`, clamped to 1.0) stays exactly 1.0/1.0 at 64.
+- Rendered PCM changes slightly for any score that plays mono voices
+  (the pan-64 recentring alone shifts every centred channel), so
+  `--corpus` PCM hashes move with this commit — a correctness change,
+  not a regression.
+- New tests: pan 64 renders L == R; pan 0 and pan 1 render identically
+  (both hard left, right bus silent); equal-power sweep at
+  16/32/64/96/111/127 matches the hard-left reference power.
+- Provenance: `docs/audio/midi/recommended-practices/rp36.pdf`
+  (RP-036 Default Pan Formula).
+
 ### Round 381 — synth hot-path: SF2 voice render fast path
 
 - `Sf2Voice::render` now hoists the mod-env→pitch / filter decision out
