@@ -330,6 +330,13 @@ pub struct ChannelState {
     /// Most recent value of the routed Control Change (0 until the
     /// controller first moves).
     pub ctrl_dest_cc_value: u8,
+    /// `true` while the channel is in **Mode 4 (Omni Off, Mono)** —
+    /// GM2 RP-024 §2.5/§3.5.6: Melody Channels switch via CC 126 with
+    /// M = 1 (any other M is invalid and the message is ignored) and
+    /// back to the default Mode 3 (Poly) via CC 127. A Mono-Mode
+    /// channel sounds one note at a time: each note-on releases the
+    /// channel's previous note.
+    pub mono: bool,
     /// Sound Controllers CC 71–78 (RP-021 defaults; GM2 RP-024
     /// §3.3.11–§3.3.18 response semantics). All default to 64 ("no
     /// change"); non-neutral values are captured into each new voice
@@ -385,6 +392,7 @@ impl Default for ChannelState {
             ctrl_dest_cc: None,
             ctrl_dest_cc_table: CTRL_DEST_DEFAULT_TABLE,
             ctrl_dest_cc_value: 0,
+            mono: false,
             sound_controls: SoundControls::default(),
             high_res_velocity_prefix: None,
         }
@@ -1329,6 +1337,43 @@ impl Mixer {
             st.bank_lsb_pending = 0;
             st.rhythm = idx == 9;
             st.program = 0;
+        }
+    }
+
+    // ───────────── Channel Mode 3/4 (GM2 §2.5 / §3.5.6 / §3.5.7) ─────────────
+
+    /// CC 126 **Mono Mode On** (GM2 RP-024 §3.5.6). On a Melody
+    /// Channel: valid only with M = 1 — any other value byte is
+    /// invalid and the whole message is ignored (§2.5); when valid,
+    /// all Notes sounding on the channel turn off and the channel
+    /// switches to Mode 4 (one note at a time). On a Rhythm Channel:
+    /// the Notes turn off but the receiver "may or may not change
+    /// modes" — this synth keeps drums polyphonic.
+    pub fn set_mono_mode(&mut self, channel: u8, m: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        if self.channels[ch].rhythm {
+            self.all_notes_off_channel(channel);
+            return;
+        }
+        if m != 1 {
+            return; // §2.5: invalid M → the Mode message is ignored
+        }
+        self.all_notes_off_channel(channel);
+        self.channels[ch].mono = true;
+    }
+
+    /// CC 127 **Poly Mode On** (GM2 RP-024 §3.5.7): all Notes sounding
+    /// on the channel turn off and the channel returns to Mode 3.
+    pub fn set_poly_mode(&mut self, channel: u8) {
+        self.all_notes_off_channel(channel);
+        self.channels[channel as usize % NUM_CHANNELS].mono = false;
+    }
+
+    /// Reset every channel to the initial **Mode 3 (Omni Off, Poly)**
+    /// (GM2 RP-024 §2.5). Called by the GM/GM2 System-On reset path.
+    pub fn reset_channel_modes(&mut self) {
+        for st in self.channels.iter_mut() {
+            st.mono = false;
         }
     }
 
@@ -2767,6 +2812,21 @@ impl Mixer {
         if self.channel_masked[channel as usize % NUM_CHANNELS] {
             return;
         }
+        // GM2 §3.5.6 Mode 4 (Mono): a Mono-Mode channel sounds one
+        // note at a time — the new note releases every still-held
+        // note on the channel (their release tails may overlap the
+        // new attack; the pool handles that naturally).
+        if self.channels[channel as usize % NUM_CHANNELS].mono {
+            for slot in self.slots.iter_mut() {
+                if slot.channel == channel && !slot.released {
+                    if let Some(v) = slot.voice.as_mut() {
+                        v.release();
+                        slot.released = true;
+                        slot.sustained = false;
+                    }
+                }
+            }
+        }
         // Exclusive-class cut: drop every prior voice on this channel
         // with the same non-zero class id. Done before allocating the
         // new slot so the freed slot is preferred by `pick_slot`.
@@ -3838,6 +3898,62 @@ mod tests {
             tail_energy > 0.0,
             "key-based reverb send must activate the effects bus",
         );
+    }
+
+    #[test]
+    fn mono_mode_releases_previous_note_on_new_note_on() {
+        // GM2 §3.5.6: Mode 4 sounds one note at a time.
+        let mut m = Mixer::new();
+        m.set_mono_mode(0, 1);
+        m.note_on(0, 60, 100, voice(0.5, 4096));
+        m.note_on(0, 62, 100, voice(0.5, 4096));
+        // The ConstVoice test double finishes immediately on release,
+        // so only the second note still renders.
+        let (mut l, mut r) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        let active = m.mix_stereo(&mut l, &mut r);
+        assert_eq!(active, 1, "mono channel must sound one note at a time");
+    }
+
+    #[test]
+    fn mono_mode_with_invalid_m_is_ignored() {
+        // GM2 §2.5: "Melody Channels also support MODE 4 when M=1
+        // only. Any other value of M is invalid, causing the Mode
+        // message to be ignored."
+        let mut m = Mixer::new();
+        m.note_on(0, 60, 100, voice(0.5, 4096));
+        m.set_mono_mode(0, 2);
+        assert!(!m.channel_state(0).mono);
+        assert_eq!(
+            m.live_voice_count(),
+            1,
+            "invalid M must not even turn notes off",
+        );
+    }
+
+    #[test]
+    fn poly_mode_on_restores_polyphony() {
+        let mut m = Mixer::new();
+        m.set_mono_mode(0, 1);
+        assert!(m.channel_state(0).mono);
+        m.set_poly_mode(0);
+        assert!(!m.channel_state(0).mono);
+        m.note_on(0, 60, 100, voice(0.5, 4096));
+        m.note_on(0, 62, 100, voice(0.5, 4096));
+        let (mut l, mut r) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        assert_eq!(m.mix_stereo(&mut l, &mut r), 2);
+    }
+
+    #[test]
+    fn rhythm_channel_mono_mode_keeps_polyphony() {
+        // GM2 §3.5.6: on rhythm channels the notes turn off but the
+        // receiver may keep its mode — this synth keeps drums poly.
+        let mut m = Mixer::new();
+        m.set_mono_mode(9, 1);
+        assert!(!m.channel_state(9).mono);
+        m.note_on(9, 36, 100, voice(0.5, 4096));
+        m.note_on(9, 38, 100, voice(0.5, 4096));
+        let (mut l, mut r) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        assert_eq!(m.mix_stereo(&mut l, &mut r), 2, "drums stay polyphonic");
     }
 
     #[test]

@@ -330,13 +330,14 @@ impl Scheduler {
                     // it for sequencers that care).
                     122 => { /* Local Control — no local keyboard to gate */ }
                     // CC 123 = All Notes Off; CC 124/125 = Omni Off/On (+ all
-                    // notes off); CC 126/127 = Mono/Poly On (+ all notes off).
-                    // Every one of these channel-mode messages turns the
-                    // channel's notes off via the normal release path per the
-                    // MIDI 1.0 Channel Mode table. Omni/Mono/Poly voice-mode
-                    // selection beyond the implied All-Notes-Off is not modelled
-                    // (the synth is always polyphonic + omni-off).
-                    123..=127 => mixer.all_notes_off_channel(channel),
+                    // notes off). Omni selection beyond the implied
+                    // All-Notes-Off is not modelled (GM2 doesn't support
+                    // Omni — §3.5.4/§3.5.5 keep the mode unchanged).
+                    123..=125 => mixer.all_notes_off_channel(channel),
+                    // CC 126/127 — Mono Mode On (M = value byte) / Poly
+                    // Mode On, per GM2 §3.5.6/§3.5.7.
+                    126 => mixer.set_mono_mode(channel, value),
+                    127 => mixer.set_poly_mode(channel),
                     _ => { /* other CCs not modelled */ }
                 }
             }
@@ -462,6 +463,7 @@ fn dispatch_universal_non_real_time(payload: &[u8], mixer: &mut crate::mixer::Mi
         mixer.reset_gm_effects(); // GM2 reverb/chorus defaults (CA-024)
         mixer.reset_gm_banks(); // GM2 bank/role defaults (RP-024 §3.3.1)
         mixer.reset_sp_midi_tables(); // SP-MIDI initialized state (RP-034 §3.1.2)
+        mixer.reset_channel_modes(); // back to Mode 3 Poly (GM2 §2.5)
     } else if sub_id1 == 0x08 {
         // MIDI Tuning Standard. The non-real-time area carries the
         // single-note tuning bank form (07) and the non-real-time
