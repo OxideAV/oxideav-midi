@@ -4102,6 +4102,79 @@ impl UniversalSysExEvent {
         })
     }
 
+    /// Decode this packet as a **Scalable Polyphony MIDI MIP**
+    /// (Maximum Instantaneous Polyphony) message — RP-034 §2.1 — when
+    /// it is one, returning the priority-ordered channel/MIP entries.
+    ///
+    /// Per RP-034 §2.1 the message travels as a Universal Real-Time
+    /// SysEx with Sub-ID #1 = `0x0B` / Sub-ID #2 = `0x01`:
+    /// `F0 7F <dev> 0B 01 {cc vv}… F7` — fixed two-byte pairs, channel
+    /// byte first (`0x00` = ch 1 … `0x0F` = ch 16), then that
+    /// channel's MIP value; no count byte, the list runs to EOX. The
+    /// pair order **is** the Channel Priority order (first = highest),
+    /// and each MIP value is **cumulative** per §2.2: the total
+    /// instantaneous polyphony needed to play that channel together
+    /// with all higher-priority channels.
+    ///
+    /// Returns `None` unless the packet is Real-Time `0B 01` — the
+    /// Non-Real-Time `0x0B` family is File Reference (CA-018) — or
+    /// when the message is invalid per RP-034 §3.1.3 / §3.3: more
+    /// pairs than the 16 supported channels, a channel presented more
+    /// than once, a MIP value smaller than its predecessor, a channel
+    /// byte outside `0x00..=0x0F`, the reserved MIP value 0, or a
+    /// dangling channel byte with no MIP value before EOX.
+    pub fn scalable_polyphony_mip(&self) -> Option<ScalablePolyphonyMip> {
+        if !matches!(self.classification.realm, UniversalRealm::RealTime) {
+            return None;
+        }
+        if !matches!(
+            self.classification.sub_id1,
+            UniversalSubId1::FileReferenceOrScalablePolyphonyMip(
+                UniversalSubId2::RtScalablePolyphonyMipMessage
+            )
+        ) {
+            return None;
+        }
+        // <realm=7F> <device_id> <sub_id1=0B> <sub_id2=01> {cc vv}… [F7]
+        let mut entries: Vec<MipEntry> = Vec::new();
+        let mut seen = [false; 16];
+        let mut prev: Option<u8> = None;
+        let mut idx = 4;
+        while let Some(&cc) = self.data.get(idx) {
+            if cc == 0xF7 {
+                break; // end-of-exclusive terminates the pair list
+            }
+            let vv = *self.data.get(idx + 1)?; // dangling cc → None
+            if vv == 0xF7 {
+                return None; // pair truncated by EOX
+            }
+            // RP-034 §3.1.3 validity: ≤ 16 pairs, no repeated channel,
+            // non-decreasing MIP values; §3.3: MIP 0 is reserved. A
+            // channel byte above 0x0F addresses no supported channel.
+            if cc > 0x0F || entries.len() >= 16 {
+                return None;
+            }
+            if seen[cc as usize] {
+                return None;
+            }
+            let vv = vv & 0x7F;
+            if vv == 0 {
+                return None;
+            }
+            if prev.is_some_and(|p| vv < p) {
+                return None;
+            }
+            seen[cc as usize] = true;
+            prev = Some(vv);
+            entries.push(MipEntry {
+                channel: cc,
+                cumulative_polyphony: vv,
+            });
+            idx += 2;
+        }
+        Some(ScalablePolyphonyMip { entries })
+    }
+
     /// Decode this packet as a **Sample Dump Extensions** message
     /// (CA-019) when it is one, returning the typed sub-command:
     /// Extended Dump Header (`05`), Extended Loop Point Transmission
@@ -5244,6 +5317,58 @@ pub struct ControllerDestination {
     /// byte's scale is defined by the governing recommended practice
     /// (see [`ControlledParameter`]).
     pub routings: Vec<(ControlledParameter, u8)>,
+}
+
+/// One `{cc vv}` pair of a Scalable Polyphony MIDI **MIP** message
+/// (RP-034 §2.1): a MIDI channel and its **cumulative** Maximum
+/// Instantaneous Polyphony value. Decoded via
+/// [`UniversalSysExEvent::scalable_polyphony_mip`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MipEntry {
+    /// 0-based MIDI channel (`0x00` = ch 1 … `0x0F` = ch 16).
+    pub channel: u8,
+    /// Cumulative MIP (RP-034 §2.2): the total instantaneous polyphony
+    /// required to play this channel **and every higher-priority
+    /// (earlier-listed) channel combined**. `1..=127`; 0 is reserved
+    /// (§3.3) and never appears in a decoded message.
+    pub cumulative_polyphony: u8,
+}
+
+/// A decoded **Scalable Polyphony MIDI MIP** message (RP-034 §2.1) —
+/// the composer's Channel Priority table (entry order, first =
+/// highest priority) and cumulative-MIP table in one. Channels *not*
+/// listed must be masked (muted) by an SP-MIDI player (§2.2). Decoded
+/// via [`UniversalSysExEvent::scalable_polyphony_mip`], which enforces
+/// the §3.1.3 validity rules.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScalablePolyphonyMip {
+    /// The `{cc vv}` pairs in wire (= priority) order.
+    pub entries: Vec<MipEntry>,
+}
+
+impl ScalablePolyphonyMip {
+    /// The Channel Priority order (RP-034 §2.2): 0-based channel
+    /// numbers, highest priority first.
+    pub fn channel_priority(&self) -> Vec<u8> {
+        self.entries.iter().map(|e| e.channel).collect()
+    }
+
+    /// RP-034 §2.2 Figure 1 **Channel Masking Algorithm** for a device
+    /// that can sound `polyphony` simultaneous notes (its "SPn"
+    /// Polyphony Level, §3.3): start with every channel muted, then
+    /// un-mute each listed channel whose cumulative MIP value fits
+    /// within the budget. Returns 16 booleans, `true` = masked
+    /// (muted), indexed by 0-based channel. Channels absent from the
+    /// message stay masked per §2.2.
+    pub fn masked_channels(&self, polyphony: u8) -> [bool; 16] {
+        let mut mute = [true; 16];
+        for e in &self.entries {
+            if e.cumulative_polyphony <= polyphony {
+                mute[e.channel as usize % 16] = false;
+            }
+        }
+        mute
+    }
 }
 
 /// A decoded **Key-Based Instrument Control** message (CA-023) — a
@@ -19370,6 +19495,134 @@ mod tests {
             vec![(ControlledParameter::Reserved(0x06), 0x10)],
         );
         assert_eq!(dest.routings[0].0.byte(), 0x06);
+    }
+
+    // ----------------------------------------------------------------
+    // scalable_polyphony_mip() — RP-034.
+    // ----------------------------------------------------------------
+
+    /// The RP-034 §2.2.1 worked-example MIP message (bytes after F0):
+    /// Channel Priority {1, 10, 2, 3, 4, 11, 5, 9, 6, 8, 7, 12…16}
+    /// with cumulative MIP {4, 9, 10, 12, 12, 16, 17, 20, 26, 26, …}.
+    const RP034_EXAMPLE: [u8; 38] = [
+        0x7F, 0x7F, 0x0B, 0x01, 0x00, 0x04, 0x09, 0x09, 0x01, 0x0A, 0x02, 0x0C, 0x03, 0x0C, 0x0A,
+        0x10, 0x04, 0x11, 0x08, 0x14, 0x05, 0x1A, 0x07, 0x1A, 0x06, 0x1A, 0x0B, 0x1A, 0x0C, 0x1A,
+        0x0D, 0x1A, 0x0E, 0x1A, 0x0F, 0x1A, 0xF7, 0x00,
+    ];
+
+    #[test]
+    fn scalable_polyphony_mip_decodes_rp034_worked_example() {
+        let smf = smf_with_sysex(&RP034_EXAMPLE[..37]);
+        let evs = smf.universal_sysex_events();
+        assert_eq!(evs.len(), 1);
+        let mip = evs[0].scalable_polyphony_mip().expect("must decode");
+        assert_eq!(mip.entries.len(), 16);
+        // First pair = highest priority: channel 1 (0x00) needs 4 notes.
+        assert_eq!(
+            mip.entries[0],
+            MipEntry {
+                channel: 0,
+                cumulative_polyphony: 4
+            }
+        );
+        // Second: channel 10 (0x09), cumulative 9.
+        assert_eq!(
+            mip.entries[1],
+            MipEntry {
+                channel: 9,
+                cumulative_polyphony: 9
+            }
+        );
+        assert_eq!(
+            mip.channel_priority(),
+            vec![0, 9, 1, 2, 3, 10, 4, 8, 5, 7, 6, 11, 12, 13, 14, 15],
+        );
+    }
+
+    #[test]
+    fn scalable_polyphony_mip_masking_matches_rp034_figure_3() {
+        // RP-034 §2.2.1 / Figure 3: SP4 & SP8 play ch 1 only; SP16
+        // plays ch 1–4 + 10–11; SP24 plays ch 1–5, 9, 10–11; SP32
+        // plays everything. §2.2 note: a 12-note device plays ch 1–4
+        // and 10 (the longest fitting priority prefix), not merely
+        // {1, 10, 2, 3}.
+        let smf = smf_with_sysex(&RP034_EXAMPLE[..37]);
+        let evs = smf.universal_sysex_events();
+        let mip = evs[0].scalable_polyphony_mip().unwrap();
+        let unmasked = |poly: u8| -> Vec<u8> {
+            mip.masked_channels(poly)
+                .iter()
+                .enumerate()
+                .filter(|(_, &m)| !m)
+                .map(|(i, _)| i as u8 + 1) // one-based, as the spec text
+                .collect()
+        };
+        assert_eq!(unmasked(4), vec![1]);
+        assert_eq!(unmasked(8), vec![1]);
+        assert_eq!(unmasked(12), vec![1, 2, 3, 4, 10]);
+        assert_eq!(unmasked(16), vec![1, 2, 3, 4, 10, 11]);
+        assert_eq!(unmasked(24), vec![1, 2, 3, 4, 5, 9, 10, 11]);
+        assert_eq!(unmasked(32), (1..=16).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn scalable_polyphony_mip_rejects_rp034_invalid_messages() {
+        // RP-034 §3.1.3: repeated channel.
+        let smf = smf_with_sysex(&[0x7F, 0x7F, 0x0B, 0x01, 0x00, 0x04, 0x00, 0x08, 0xF7]);
+        assert_eq!(
+            smf.universal_sysex_events()[0].scalable_polyphony_mip(),
+            None
+        );
+        // §3.1.3: decreasing MIP value.
+        let smf = smf_with_sysex(&[0x7F, 0x7F, 0x0B, 0x01, 0x00, 0x08, 0x01, 0x04, 0xF7]);
+        assert_eq!(
+            smf.universal_sysex_events()[0].scalable_polyphony_mip(),
+            None
+        );
+        // §3.3: MIP value 0 is reserved.
+        let smf = smf_with_sysex(&[0x7F, 0x7F, 0x0B, 0x01, 0x00, 0x00, 0xF7]);
+        assert_eq!(
+            smf.universal_sysex_events()[0].scalable_polyphony_mip(),
+            None
+        );
+        // Channel byte beyond 0x0F addresses no supported channel.
+        let smf = smf_with_sysex(&[0x7F, 0x7F, 0x0B, 0x01, 0x10, 0x04, 0xF7]);
+        assert_eq!(
+            smf.universal_sysex_events()[0].scalable_polyphony_mip(),
+            None
+        );
+        // Dangling channel byte with no MIP value.
+        let smf = smf_with_sysex(&[0x7F, 0x7F, 0x0B, 0x01, 0x00, 0xF7]);
+        assert_eq!(
+            smf.universal_sysex_events()[0].scalable_polyphony_mip(),
+            None
+        );
+    }
+
+    #[test]
+    fn scalable_polyphony_mip_equal_values_are_valid_clusters() {
+        // RP-034 §2.2.2: equal successive MIP values 'cluster'
+        // channels (the non-decreasing rule allows equality).
+        let smf = smf_with_sysex(&[
+            0x7F, 0x7F, 0x0B, 0x01, 0x00, 0x04, 0x01, 0x04, 0x02, 0x04, 0xF7,
+        ]);
+        let mip = smf.universal_sysex_events()[0]
+            .scalable_polyphony_mip()
+            .expect("equal values must decode");
+        assert_eq!(mip.entries.len(), 3);
+        // All three fit an SP4 device together.
+        assert_eq!(mip.masked_channels(4)[..3], [false, false, false]);
+    }
+
+    #[test]
+    fn scalable_polyphony_mip_none_on_non_realtime_file_reference_family() {
+        // Non-RT 0x0B is File Reference (CA-018) — same Sub-ID #1,
+        // different realm.
+        let smf = smf_with_sysex(&[0x7E, 0x7F, 0x0B, 0x01, 0x00, 0x00, 0x00, 0x00, 0xF7]);
+        assert_eq!(
+            smf.universal_sysex_events()[0].scalable_polyphony_mip(),
+            None
+        );
     }
 
     // ----------------------------------------------------------------
