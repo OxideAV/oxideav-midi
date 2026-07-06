@@ -4154,6 +4154,15 @@ impl UniversalSysExEvent {
     /// length / loop words, lifting the base header's 2 MB / period
     /// limits.
     ///
+    /// **Byte-order note (documented erratum).** CA-019 leaves its
+    /// `ss ss` Sample Number field unannotated, and its Page-4 worked
+    /// examples print sample #1 as `00 01` — MSB-first, contradicting
+    /// the parent Sample Dump Standard, whose header / request /
+    /// extension trees all pin `ss ss` as "LSB first". This decoder
+    /// follows the normative SDS convention (LSB first: sample #1 is
+    /// `01 00`); the CA-019 examples are an editorial MSB/LSB
+    /// transposition. See `docs/audio/midi/midi-errata.md` erratum E1.
+    ///
     /// Returns `None` unless the packet is Non-Real-Time (the Real-Time
     /// `0x05` family is MTC Cueing) with one of the five sub-commands,
     /// carrying all of the sub-command's declared bytes — truncated
@@ -19971,8 +19980,31 @@ mod tests {
         // LSB-first convention this decoder applies uniformly (the
         // CA-019 example prose calls it "sample #1"; the byte order of
         // the un-annotated ss ss field is resolved in the Standard's
-        // favour — see the SampleDumpExtension doc note).
+        // favour — confirmed by docs/audio/midi/midi-errata.md E1,
+        // which documents the CA-019 worked examples as an editorial
+        // MSB/LSB transposition).
         assert_eq!(name.sample_number, 128);
+    }
+
+    #[test]
+    fn sample_dump_extension_sample_number_is_lsb_first_per_erratum_e1() {
+        // midi-errata.md E1: sample #1 travels as `01 00` (low 7 bits
+        // first, per the parent SDS "LSB first" convention), NOT the
+        // `00 01` printed in CA-019's Page-4 worked examples. The
+        // corrected Sample Name Request for sample #1 is
+        // `F0 7E <dev> 05 04 01 00 F7`.
+        let smf = smf_with_sysex(&[0x7E, 0x01, 0x05, 0x04, 0x01, 0x00, 0xF7]);
+        assert_eq!(
+            smf.universal_sysex_events()[0].sample_dump_extension(),
+            Some(SampleDumpExtension::SampleNameRequest { sample_number: 1 }),
+        );
+        // A number ≥ 128 exercises both bytes: 300 = 0x12C →
+        // low 7 = 0x2C, high 7 = 0x02.
+        let smf = smf_with_sysex(&[0x7E, 0x01, 0x05, 0x04, 0x2C, 0x02, 0xF7]);
+        assert_eq!(
+            smf.universal_sysex_events()[0].sample_dump_extension(),
+            Some(SampleDumpExtension::SampleNameRequest { sample_number: 300 }),
+        );
     }
 
     #[test]

@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 392 — GM2 synth semantics + SP-MIDI channel masking
+
+- **GM2 square-law volume curves** (RP-024 §3.3.4/§3.3.6/§4.1): CC 7
+  Channel Volume, CC 11 Expression and the Universal Master Volume now
+  render through `gain[dB] = 40·log10(v/max)` (amplitude ∝ value²)
+  instead of the previous linear map — CC 7 = 64 is now −11.9 dB (was
+  −6.0 dB); tests pin the RP-024 dB reference tables. Synth output
+  changes for any score driving these controls off-max (spec-correct).
+- **GM2 Bank Select + Rhythm/Melody channel roles** (RP-024
+  §2.4/§3.3.1, RP-035 §2.1): CC 0/32 pend until Program Change; MSB
+  `78H`/`79H` switches the channel role; Channel 10 boots Rhythm. Drum
+  exemptions (tuning, MTS, portamento, mod wheel…) follow the live
+  role. New defaulted `Instrument::make_voice_banked` carries the
+  latched bank; the SF2 backend maps `78H` → percussion bank 128 /
+  `79H/vv` → bank `vv` with the §2.6 undefined-program fallbacks — a
+  GM SoundFont's channel-10 drums now pick the bank-128 kit.
+- **RP-021 Sound Controllers CC 71–78 into synthesis** (GM2
+  §3.3.11–§3.3.18): relative-around-64 semantics; envelope times and
+  vibrato scale by `2^((v−64)/32)`, resonance ±3 cb/step, CC 74
+  Brightness ±50 cents/step of live filter cutoff on SF2 + SFZ/DLS
+  voices (on-demand biquad). Captured per note via the new
+  `Voice::apply_sound_controls`; Rhythm Channels don't respond.
+- **CA-022 Controller Destination Setting → routing** (GM2 §4.6/§3.7):
+  Channel Pressure / routed-CC destinations for Pitch (±24 semi),
+  Filter Cutoff (150 cents/step), Amplitude ((127/64)·100 % max), and
+  LFO Pitch/Filter/Amplitude Depth (600 / 2400 cents / 100 %),
+  last-message-wins per channel, one CC slot at a time (01–1F/40–5F).
+  Three new defaulted `Voice` hooks; the SFZ/DLS voice implements the
+  full set plus `set_mod_depth_cents` (CC 1 modulation is now audible
+  there, on a 5 Hz default LFO when the region has no preset vibrato).
+- **SP-MIDI (RP-034/RP-035)**: `UniversalSysExEvent::
+  scalable_polyphony_mip()` decodes the MIP message (§2.1 `{cc vv}`
+  pairs, cumulative values, §3.1.3/§3.3 validity enforced) with the
+  §2.2 Figure 1 `masked_channels()` algorithm; the mixer takes a
+  Polyphony Level (`set_sp_midi_polyphony`) and masks channels on each
+  MIP receipt — note-ons filtered, sounding voices cut, unlisted
+  channels muted, invalid messages inert, GM/GM2 On restoring the
+  §3.1.1 initialized state. Tests pin the §2.2.1 worked-example byte
+  string and its Figure-3 SP4/SP12/SP16/SP24/SP32 renderings.
+- **CA-019 byte-order erratum confirmed** (docs midi-errata.md E1):
+  the crate's LSB-first reading of the un-annotated `ss ss` Sample
+  Number matches the parent SDS convention; CA-019's own MSB-first
+  worked examples are the documented editorial slip. No behaviour
+  change; a dedicated test pins sample #1 = `01 00` and a two-byte
+  number.
+
 ### Round 389 — smf RP-050 MIDI Visual Control decoder
 
 - `UniversalSysExEvent::midi_visual_control()` decodes the RP-050

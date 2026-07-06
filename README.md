@@ -172,7 +172,11 @@ total events capped at 1 M to keep malformed input bounded.
   `file_reference()` the CA-018 URL-based sound-file message (Open /
   Select / Open-and-Select / Close with length validation, typed
   DLS/SF2 instrument-map + WAV select views, and the CA-028
-  map-entire-file `bank_offset()` extension); and
+  map-entire-file `bank_offset()` extension);
+  `scalable_polyphony_mip()` the SP-MIDI **MIP** message (RP-034 §2.1:
+  priority-ordered `{cc vv}` pairs with cumulative polyphony values,
+  the §3.1.3/§3.3 validity rules enforced at decode, plus the §2.2
+  Figure 1 `masked_channels()` algorithm); and
   `midi_visual_control()` the RP-050 MIDI Visual Control Data Set
   (Parameter Address Map naming via `MvcParameter`, `is_mvc_on()` /
   `is_mvc_off()`, checksum verdict reported not rejected). Each has a
@@ -180,7 +184,11 @@ total events capped at 1 M to keep malformed input bounded.
   `mmc_responses()`, `show_control_messages()`, `identity_replies()`,
   `general_midi_system_messages()`, `sample_dump_extensions()`,
   `controller_destinations()`, `key_based_instrument_controls()`,
-  `file_references()`, `midi_visual_controls()`).
+  `file_references()`, `midi_visual_controls()`). CA-019's un-annotated
+  `ss ss` Sample Number is read **LSB-first** per the parent Sample
+  Dump Standard — the MSB-first byte order in CA-019's own worked
+  examples is a documented erratum (`docs/audio/midi/midi-errata.md`
+  E1) confirming this crate's reading.
 - **Tick → wall-clock time** — `tempo_timeline()` folds the tempo map
   against the header `Division` into a `TempoTimeline`; its
   `tick_to_seconds(tick)` resolves any absolute tick to elapsed seconds
@@ -273,10 +281,53 @@ the MIDI Association *UMP Format and MIDI 2.0 Protocol* spec
   / Fine / Coarse Tuning (Universal Real-Time SysEx), and GM2 Global
   Parameter Control. CC 10 panning follows the **RP-036 Default Pan
   Formula** exactly (`cos`/`sin` of `π/2 · max(0, pan − 1)/126`): 64 is
-  a true equal-power centre and 0/1 both pan hard left. The **CC 88
+  a true equal-power centre and 0/1 both pan hard left. **CC 7 / CC 11
+  / Master Volume follow the GM2 square-law response curve** (RP-024
+  §3.3.4/§3.3.6/§4.1: amplitude ∝ value², `gain[dB] = 40·log10(v/127)`,
+  volume and expression composing additively in dB). The **CC 88
   High-Resolution Velocity Prefix** (CA-031) refines the next note-on's
   gain by its 14-bit velocity ratio (prefix-free scores render
   bit-identically; a Note Off expires a pending prefix).
+- `mixer` **GM2 channel roles + bank select** (RP-024 §2.4/§3.3.1) —
+  CC 0/32 Bank Select is *pending* until the next Program Change, which
+  latches the pair and switches the channel role: MSB `78H` → Rhythm
+  Channel, `79H` → Melody (required on ch 10/11 per RP-035 §2.1,
+  honoured on all channels per the [optional] clause). Channel 10 boots
+  as Rhythm in `78H/00H`. Every drum exemption (tuning RPNs, master
+  tuning, MTS, portamento, mod wheel, sound controllers) follows the
+  live role, not the fixed index. `Instrument::make_voice_banked`
+  carries the latched bank to voice lookup; the SF2 backend maps
+  `78H/xxH` → SoundFont percussion bank 128 and `79H/vv` → bank `vv`,
+  with the GM2 §2.6 undefined-program fallbacks (kit → `(128,0)`,
+  variation → the GM1 set).
+- `mixer` **RP-021 Sound Controllers CC 71–78** (GM2 §3.3.11–§3.3.18) —
+  relative parameters centred at 64, captured into each new voice
+  (`Voice::apply_sound_controls`): Filter Resonance (±3 cb/step),
+  Release / Attack / Decay Time and Vibrato Rate / Depth / Delay
+  (×`2^((v−64)/32)`), and CC 74 Brightness routed **live** as a
+  ±50 cents/step filter-cutoff shift on both the SF2 and SFZ/DLS voice
+  types (biquad instantiated on demand when an open voice is darkened).
+  Rhythm Channels record but don't respond, per the GM2 recommendation.
+- `mixer` **CA-022 Controller Destination Setting** (GM2 §4.6/§3.7) —
+  the Universal Real-Time `09 01/03` messages route Channel Pressure or
+  one Control Change (01–1F/40–5F) per channel into the GM2 controlled-
+  parameter table: Pitch (±24 semitones), Filter Cutoff (150
+  cents/step), Amplitude (0–(127/64)·100 %), and LFO Pitch / Filter /
+  Amplitude Depth (0–600 / 0–2400 cents / 0–100 % tremolo), summing
+  with the timbre's default pressure response. Only the last message
+  per channel is active; one CC routing at a time. The SFZ/DLS voice
+  implements the full destination set (including a 5 Hz default LFO
+  when the region has no preset vibrato — which also makes **CC 1
+  modulation audible** on those voices); the SF2 voice implements the
+  cutoff destination.
+- `mixer` **SP-MIDI Channel Masking** (RP-034/RP-035) — the mixer
+  accepts a device Polyphony Level (`set_sp_midi_polyphony`, the §3.3
+  "SPn" budget) and evaluates each received MIP message through the
+  §2.2 Figure 1 algorithm: masked channels have their note-ons
+  filtered and their sounding voices cut; unlisted channels mask;
+  invalid messages (§3.1.3) leave the previous table in force; GM/GM2
+  System On restores the §3.1.1 initialized state. Unconfigured, MIP
+  messages are recorded but mask nothing.
 - `mixer` **continuous controllers + pedals** — **CC 11 Expression**
   multiplies Channel Volume at mix time (Expression is a percentage of
   Volume per the MIDI 1.0 Control Change table; default 127 = transparent).
@@ -316,11 +367,13 @@ the MIDI Association *UMP Format and MIDI 2.0 Protocol* spec
 - `scheduler` — merges every track into one time-ordered stream,
   converts ticks → samples against tempo + division, and dispatches
   events into the mixer at the right sample. Routes the channel-voice
-  controllers (Expression, Portamento CC 5/65/84, the Sustain / Sostenuto
-  / Soft pedals, Reset All Controllers, and the All Sound Off / All Notes
-  Off channel-mode family) plus the Universal SysEx surface (GM 1/2 System
-  On/Off, Master Volume/Balance/Tuning, MIDI Tuning Standard, Data Inc/Dec,
-  GM2 GPC).
+  controllers (Bank Select CC 0/32, Expression, Portamento CC 5/65/84,
+  the Sound Controllers CC 71–78, the Sustain / Sostenuto / Soft pedals,
+  Reset All Controllers, and the All Sound Off / All Notes Off
+  channel-mode family) plus the Universal SysEx surface (GM 1/2 System
+  On/Off, Master Volume/Balance/Tuning, MIDI Tuning Standard, Data
+  Inc/Dec, GM2 GPC, CA-022 Controller Destination Setting, and the
+  SP-MIDI MIP message).
 - `tuning` — MIDI Tuning Standard (MTS) microtuning state + Universal
   SysEx decoders (key-based + scale/octave tables, signed cents added
   to equal temperament; drum channel exempt).
