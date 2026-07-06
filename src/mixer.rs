@@ -135,6 +135,16 @@ struct VoiceSlot {
     glide_offset_cents: f32,
     glide_step_cents_per_sample: f32,
     glide_remaining_samples: u32,
+    /// Key-Based Instrument Controller Pan (CA-023 / GM2 §4.8, CC 10
+    /// per key, absolute) captured at note-on for Rhythm-Channel
+    /// voices. `None` = use the channel pan. Per GM2 §3.3.5 the
+    /// channel's CC 10 then *offsets* this per-key position.
+    pan_override: Option<u8>,
+    /// Key-Based Reverb Send (CC 91 per key, absolute) — replaces the
+    /// channel send for this voice when set.
+    reverb_send_override: Option<u8>,
+    /// Key-Based Chorus Send (CC 93 per key, absolute).
+    chorus_send_override: Option<u8>,
 }
 
 impl VoiceSlot {
@@ -152,6 +162,9 @@ impl VoiceSlot {
             glide_offset_cents: 0.0,
             glide_step_cents_per_sample: 0.0,
             glide_remaining_samples: 0,
+            pan_override: None,
+            reverb_send_override: None,
+            chorus_send_override: None,
         }
     }
 }
@@ -376,6 +389,33 @@ impl Default for ChannelState {
             high_res_velocity_prefix: None,
         }
     }
+}
+
+/// Per-key controller state installed by the **Key-Based Instrument
+/// Control** SysEx (CA-023 / GM2 RP-024 §4.8) for one key of a Rhythm
+/// Channel's percussion set. `None` fields keep the preset. GM2 §4.8
+/// pins the required set — Volume (relative, `00H-40H-7FH` = 0 – 100 –
+/// (127/64)·100 %), Pan / Reverb Send / Chorus Send (absolute) — and
+/// CA-023 redefines `nn = 78H/79H` (whose channel-message meanings,
+/// Mode Changes, cannot apply per key) as **Fine / Coarse Tuning**,
+/// relative around `40H`. This synth maps them like the channel-tuning
+/// RPNs' MSBs: coarse = `(v − 64)` semitones, fine = `(v − 64)·100/64`
+/// cents (CA-023 leaves the response to the governing recommended
+/// practice).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyBasedControls {
+    /// `nn = 07H` — Note Volume, relative (`40H` = 100 %).
+    pub volume: Option<u8>,
+    /// `nn = 0AH` — Pan, absolute (the channel CC 10 offsets it).
+    pub pan: Option<u8>,
+    /// `nn = 5BH` — Reverb Send, absolute.
+    pub reverb_send: Option<u8>,
+    /// `nn = 5DH` — Chorus Send, absolute.
+    pub chorus_send: Option<u8>,
+    /// `nn = 78H` — Fine Tuning (CA-023 redefinition), `40H` centre.
+    pub fine_tune: Option<u8>,
+    /// `nn = 79H` — Coarse Tuning (CA-023 redefinition), `40H` centre.
+    pub coarse_tune: Option<u8>,
 }
 
 /// GM2 default Controller Destination Setting range table (RP-024
@@ -1106,6 +1146,12 @@ pub struct Mixer {
     /// (muted). All-false until both a Polyphony Level and a MIP
     /// message are present.
     channel_masked: [bool; NUM_CHANNELS],
+    /// Key-Based Instrument Controller tables (CA-023 / GM2 §4.8):
+    /// per channel, per key. Applied to Rhythm-Channel voices at
+    /// note-on; cleared for a channel when a new percussion set is
+    /// selected there (GM2 §4.8: the device adopts the new set's
+    /// presets).
+    key_based: Vec<std::collections::HashMap<u8, KeyBasedControls>>,
     /// Master Balance (Universal Real Time SysEx `7F 7F 04 02`, 14-bit
     /// 0..=0x3FFF). Per the MIDI 1.0 Detailed Specification §"DEVICE
     /// CONTROL — MASTER VOLUME AND MASTER BALANCE" (M1 v4.2.1 p.57):
@@ -1175,6 +1221,7 @@ impl Mixer {
             sp_midi_polyphony: None,
             sp_midi_mip: None,
             channel_masked: [false; NUM_CHANNELS],
+            key_based: vec![std::collections::HashMap::new(); NUM_CHANNELS],
             master_balance_14: 0x2000,
             master_fine_tune_cents: 0,
             master_coarse_tune_semitones: 0,
@@ -1253,6 +1300,14 @@ impl Mixer {
             0x79 => st.rhythm = false,
             _ => {}
         }
+        // GM2 §4.8: "When a new percussion sound set is selected by a
+        // Program Change message, the receiving device should adopt
+        // the preset setting for each key-based instrument" — i.e.
+        // the channel's Key-Based Instrument Controller edits are
+        // dropped in favour of the new set's presets.
+        if self.channels[ch].rhythm {
+            self.key_based[ch].clear();
+        }
     }
 
     /// `true` while `channel` is a Rhythm Channel (GM2 RP-024 §2.4).
@@ -1275,6 +1330,45 @@ impl Mixer {
             st.rhythm = idx == 9;
             st.program = 0;
         }
+    }
+
+    // ───────── Key-Based Instrument Controllers (CA-023 / GM2 §4.8) ─────────
+
+    /// Apply one **Key-Based Instrument Control** message (CA-023 /
+    /// GM2 RP-024 §4.8): `[nn vv]` controller/value pairs addressed to
+    /// one `key` of `channel`'s percussion set. Supported controllers:
+    /// `07H` Note Volume (relative), `0AH` Pan, `5BH` Reverb Send,
+    /// `5DH` Chorus Send (absolute), and the CA-023-redefined `78H` /
+    /// `79H` Fine / Coarse Tuning; other controller numbers are
+    /// ignored (CA-023 bars Bank Select, Data Entry, RPN/NRPN and the
+    /// remaining Mode Changes outright, and GM2 defines no response
+    /// for the rest). The edits take effect on the key's **next**
+    /// note-on; GM2 recommends Melody Channels not respond, which this
+    /// synth honours by only consulting the table for Rhythm-Channel
+    /// notes.
+    pub fn set_key_based_controls(&mut self, channel: u8, key: u8, pairs: &[(u8, u8)]) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let entry = self.key_based[ch].entry(key & 0x7F).or_default();
+        for &(nn, vv) in pairs {
+            let vv = vv & 0x7F;
+            match nn & 0x7F {
+                0x07 => entry.volume = Some(vv),
+                0x0A => entry.pan = Some(vv),
+                0x5B => entry.reverb_send = Some(vv),
+                0x5D => entry.chorus_send = Some(vv),
+                0x78 => entry.fine_tune = Some(vv),
+                0x79 => entry.coarse_tune = Some(vv),
+                _ => {}
+            }
+        }
+    }
+
+    /// The Key-Based Instrument Controller state for `(channel, key)`,
+    /// if any edits are stored.
+    pub fn key_based_controls(&self, channel: u8, key: u8) -> Option<KeyBasedControls> {
+        self.key_based[channel as usize % NUM_CHANNELS]
+            .get(&(key & 0x7F))
+            .copied()
     }
 
     // ──────────────── SP-MIDI channel masking (RP-034 / RP-035) ────────────────
@@ -2693,6 +2787,14 @@ impl Mixer {
         let ch = channel as usize % NUM_CHANNELS;
         let st = self.channels[ch];
         let is_drum = st.rhythm;
+        // Key-Based Instrument Controllers (CA-023 / GM2 §4.8) apply
+        // to Rhythm-Channel notes only (GM2 recommends Melody Channels
+        // not respond).
+        let kb = if is_drum {
+            self.key_based[ch].get(&key).copied()
+        } else {
+            None
+        };
         // Compose pitch bend + per-channel fine/coarse + master
         // fine/coarse + (for MPE Members) the Manager Channel's bend
         // — picks up tuning on the new voice's very first sample so
@@ -2720,6 +2822,19 @@ impl Mixer {
         // exemption above.
         if !is_drum {
             cents += self.tuning.offset_cents(channel, key).round() as i32;
+        }
+        // Key-Based Fine / Coarse Tuning (CA-023 `nn = 78H/79H`): the
+        // drum-channel note-shift exemption doesn't apply — this IS
+        // the sanctioned per-key drum tuning mechanism. Mapped like
+        // the channel-tuning RPN MSBs: coarse (v−64) semitones, fine
+        // (v−64)·100/64 cents.
+        if let Some(kb) = kb {
+            if let Some(f) = kb.fine_tune {
+                cents += ((f as i32 - 64) * 100) / 64;
+            }
+            if let Some(c) = kb.coarse_tune {
+                cents += (c as i32 - 64) * 100;
+            }
         }
         // Portamento (CC 5 / 65 / 84): compute the glide for this note-on
         // (also updates the channel's last-played key + consumes a pending
@@ -2820,11 +2935,20 @@ impl Mixer {
             // Soft Pedal (CC 67): a note struck while the pedal is down is
             // attenuated; one struck with it up renders at unity. The
             // CA-031 high-resolution velocity refinement multiplies in —
-            // both are static per-note gains captured at strike time.
-            note_gain: hr_gain * if st.soft_pedal { SOFT_PEDAL_GAIN } else { 1.0 },
+            // both are static per-note gains captured at strike time, as
+            // is the Key-Based Note Volume (GM2 §4.8: relative, 40H =
+            // 100 %, 7FH = (127/64)·100 %).
+            note_gain: hr_gain
+                * if st.soft_pedal { SOFT_PEDAL_GAIN } else { 1.0 }
+                * kb.and_then(|k| k.volume)
+                    .map(|v| v as f32 / 64.0)
+                    .unwrap_or(1.0),
             glide_offset_cents,
             glide_step_cents_per_sample: glide_step,
             glide_remaining_samples: glide_remaining,
+            pan_override: kb.and_then(|k| k.pan),
+            reverb_send_override: kb.and_then(|k| k.reverb_send),
+            chorus_send_override: kb.and_then(|k| k.chorus_send),
         };
     }
 
@@ -2962,7 +3086,12 @@ impl Mixer {
             let sends_present = self
                 .channels
                 .iter()
-                .any(|c| c.reverb_send > 0 || c.chorus_send > 0);
+                .any(|c| c.reverb_send > 0 || c.chorus_send > 0)
+                || self.slots.iter().any(|s| {
+                    s.voice.is_some()
+                        && (s.reverb_send_override.unwrap_or(0) > 0
+                            || s.chorus_send_override.unwrap_or(0) > 0)
+                });
             self.fx.active |= sends_present;
         }
         let fx_active = self.fx.active;
@@ -3033,14 +3162,23 @@ impl Mixer {
             // 1..=127 — values 0 and 1 both pan hard left — making 64 a
             // *true* centre (cos == sin at π/4) with equal power
             // (cos² + sin² = 1) across the whole sweep.
-            let pan_norm = (st.pan.saturating_sub(1) as f32 / 126.0).clamp(0.0, 1.0);
+            // Key-Based Pan (GM2 §4.8) is the per-key base position of
+            // a percussion sound; the channel's CC 10 then *offsets*
+            // it (§3.3.5: "The Pan message will offset the values
+            // defined for the percussion set").
+            let pan_value = match slot.pan_override {
+                Some(kp) => (kp as i16 + st.pan as i16 - 64).clamp(0, 127) as u8,
+                None => st.pan,
+            };
+            let pan_norm = (pan_value.saturating_sub(1) as f32 / 126.0).clamp(0.0, 1.0);
             let theta = pan_norm * std::f32::consts::FRAC_PI_2;
 
-            // CA-024 per-channel effect send fractions (CC 91 / CC 93).
-            // Zero when the channel never touched the controller, so a
-            // dry score bypasses the bus entirely.
-            let reverb_send = st.reverb_send as f32 / 127.0;
-            let chorus_send = st.chorus_send as f32 / 127.0;
+            // CA-024 per-channel effect send fractions (CC 91 / CC 93),
+            // overridden per voice by the Key-Based Reverb / Chorus
+            // Send (GM2 §4.8, absolute). Zero when nothing touched the
+            // controllers, so a dry score bypasses the bus entirely.
+            let reverb_send = slot.reverb_send_override.unwrap_or(st.reverb_send) as f32 / 127.0;
+            let chorus_send = slot.chorus_send_override.unwrap_or(st.chorus_send) as f32 / 127.0;
             let any_send = fx_active && (reverb_send > 0.0 || chorus_send > 0.0);
 
             if stereo {
@@ -3586,6 +3724,120 @@ mod tests {
         m.reset_sp_midi_tables();
         assert!((0..16).all(|c| !m.sp_midi_channel_masked(c)));
         assert_eq!(m.sp_midi_polyphony(), Some(4));
+    }
+
+    #[test]
+    fn key_based_volume_scales_only_the_addressed_drum_key() {
+        // GM2 §4.8: Note Volume is relative — 20H = 50 % of 40H.
+        let mut m = Mixer::new();
+        m.set_key_based_controls(9, 36, &[(0x07, 0x20)]);
+        m.channel_state_mut(9).pan = 0; // hard left for a clean read
+        m.note_on(9, 36, 100, voice(0.5, 64));
+        let (mut l1, mut r1) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        m.mix_stereo(&mut l1, &mut r1);
+        let mut m2 = Mixer::new();
+        m2.channel_state_mut(9).pan = 0;
+        m2.note_on(9, 36, 100, voice(0.5, 64));
+        let (mut l2, mut r2) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        m2.mix_stereo(&mut l2, &mut r2);
+        let ratio = l1[0] / l2[0];
+        assert!(
+            (ratio - 0.5).abs() < 1e-5,
+            "key volume 20H must render 50 %, got {ratio}",
+        );
+        // A different key on the same channel is untouched.
+        let mut m3 = Mixer::new();
+        m3.set_key_based_controls(9, 36, &[(0x07, 0x20)]);
+        m3.channel_state_mut(9).pan = 0;
+        m3.note_on(9, 38, 100, voice(0.5, 64));
+        let (mut l3, mut r3) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        m3.mix_stereo(&mut l3, &mut r3);
+        assert_eq!(l3[0], l2[0], "other keys keep the preset volume");
+    }
+
+    #[test]
+    fn key_based_pan_is_absolute_and_channel_pan_offsets_it() {
+        // GM2 §4.8 Pan is absolute per key; §3.3.5: the channel CC 10
+        // then offsets the per-key position.
+        let mut m = Mixer::new();
+        m.set_key_based_controls(9, 36, &[(0x0A, 0x01)]); // hard left
+        m.note_on(9, 36, 100, voice(0.5, 64));
+        let (mut l, mut r) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        m.mix_stereo(&mut l, &mut r);
+        assert!(l[0] > 0.0 && r[0].abs() < 1e-9, "key pan 01H = hard left");
+        // Channel pan 127 (+63 offset) pushes the key position right.
+        let mut m2 = Mixer::new();
+        m2.set_key_based_controls(9, 36, &[(0x0A, 0x40)]); // key centre
+        m2.channel_state_mut(9).pan = 127;
+        m2.note_on(9, 36, 100, voice(0.5, 64));
+        let (mut l2, mut r2) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        m2.mix_stereo(&mut l2, &mut r2);
+        assert!(
+            r2[0] > l2[0],
+            "channel pan offset must push the key-based centre right",
+        );
+    }
+
+    #[test]
+    fn key_based_melody_channel_does_not_respond() {
+        // GM2 §4.8 [recommended]: Melody Channels shall not respond.
+        let mut m = Mixer::new();
+        m.set_key_based_controls(0, 60, &[(0x07, 0x00)]); // "mute" key 60
+        m.channel_state_mut(0).pan = 0;
+        m.note_on(0, 60, 100, voice(0.5, 64));
+        let (mut l, mut r) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        m.mix_stereo(&mut l, &mut r);
+        assert!(l[0] > 0.0, "melody notes ignore key-based edits");
+    }
+
+    #[test]
+    fn key_based_tuning_shifts_drum_key_pitch() {
+        // CA-023 nn=78H/79H redefined as Fine / Coarse Tuning — the
+        // sanctioned per-key drum tuning (the rhythm-channel
+        // note-shift exemption does not apply here).
+        let mut m = Mixer::new();
+        m.set_key_based_controls(9, 36, &[(0x79, 0x4C), (0x78, 0x60)]);
+        let (v, bend_cell, _) = instrumented_voice(0.5, 64);
+        m.note_on(9, 36, 100, v);
+        // +12 semitones coarse + 32·100/64 = +50 cents fine.
+        assert_eq!(*bend_cell.lock().unwrap(), 1250);
+    }
+
+    #[test]
+    fn key_based_table_cleared_on_rhythm_program_change() {
+        // GM2 §4.8: a new percussion set adopts its own presets.
+        let mut m = Mixer::new();
+        m.set_key_based_controls(9, 36, &[(0x07, 0x20)]);
+        assert!(m.key_based_controls(9, 36).is_some());
+        m.set_program(9, 8); // new drum set
+        assert!(
+            m.key_based_controls(9, 36).is_none(),
+            "program change on a rhythm channel must drop key edits",
+        );
+    }
+
+    #[test]
+    fn key_based_reverb_send_override_activates_fx_bus() {
+        // A per-key absolute Reverb Send must reach the effects bus
+        // even when no channel-level CC 91 was ever sent.
+        let mut m = Mixer::new();
+        m.set_key_based_controls(9, 36, &[(0x5B, 0x7F)]);
+        m.note_on(9, 36, 100, voice(0.5, 8));
+        // The 8-sample voice is dry up front; the reverb tail rings
+        // long after it ends (the comb delays span tens of ms at
+        // 44.1 kHz). Render past the first block and look for wet
+        // energy — any non-zero sample there proves the bus went live.
+        let (mut l, mut r) = (vec![0.0f32; 1024], vec![0.0f32; 1024]);
+        m.mix_stereo(&mut l, &mut r);
+        let mut tail_energy = 0.0f32;
+        for _ in 0..8 {
+            m.mix_stereo(&mut l, &mut r);
+            tail_energy += l.iter().chain(r.iter()).map(|s| s.abs()).sum::<f32>();
+        }
+        assert!(
+            tail_energy > 0.0,
+            "key-based reverb send must activate the effects bus",
+        );
     }
 
     #[test]

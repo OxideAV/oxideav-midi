@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Three new defaulted `Voice` hooks; the SFZ/DLS voice implements the
   full set plus `set_mod_depth_cents` (CC 1 modulation is now audible
   there, on a 5 Hz default LFO when the region has no preset vibrato).
+- **CA-023 Key-Based Instrument Controllers → synthesis** (GM2 §4.8):
+  the Universal Real-Time `0A 01` message now edits individual
+  percussion sounds — Note Volume (relative), Pan (absolute; channel
+  CC 10 offsets it per §3.3.5), Reverb/Chorus Send (absolute,
+  per-voice), Fine/Coarse Tuning (CA-023 `78H/79H` redefinition).
+  Rhythm-Channel-only; Program Change adopts the new set's presets.
 - **SP-MIDI (RP-034/RP-035)**: `UniversalSysExEvent::
   scalable_polyphony_mip()` decodes the MIP message (§2.1 `{cc vv}`
   pairs, cumulative values, §3.1.3/§3.3 validity enforced) with the

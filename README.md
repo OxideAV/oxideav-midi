@@ -320,6 +320,16 @@ the MIDI Association *UMP Format and MIDI 2.0 Protocol* spec
   when the region has no preset vibrato — which also makes **CC 1
   modulation audible** on those voices); the SF2 voice implements the
   cutoff destination.
+- `mixer` **CA-023 Key-Based Instrument Controllers** (GM2 §4.8) — the
+  Universal Real-Time `0A 01` message edits individual percussion
+  sounds on Rhythm Channels: Note Volume (relative, `40H` = 100 %),
+  Pan (absolute, with the channel CC 10 *offsetting* the per-key
+  position per §3.3.5), Reverb / Chorus Send (absolute, per-voice
+  override of the channel sends), and the CA-023-redefined `78H/79H`
+  Fine / Coarse Tuning (the sanctioned per-key drum tuning). Edits
+  apply at the key's next note-on; a Program Change on a Rhythm
+  Channel adopts the new set's presets (clears the table); Melody
+  Channels don't respond.
 - `mixer` **SP-MIDI Channel Masking** (RP-034/RP-035) — the mixer
   accepts a device Polyphony Level (`set_sp_midi_polyphony`, the §3.3
   "SPn" budget) and evaluates each received MIP message through the

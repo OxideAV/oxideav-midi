@@ -504,6 +504,22 @@ fn dispatch_universal_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer)
         }
         return;
     }
+    if sub_id1 == 0x0A {
+        // Key-Based Instrument Control (CA-023 / GM2 RP-024 §4.8):
+        // F0 7F <dev> 0A 01 0n kk [nn vv]… F7 — per-key controller
+        // edits for a Rhythm Channel's percussion sounds.
+        // (The caller already stripped the trailing F7.)
+        if payload.get(3) == Some(&0x01) && payload.len() >= 6 {
+            let channel = payload[4] & 0x0F;
+            let key = payload[5] & 0x7F;
+            let pairs: Vec<(u8, u8)> = payload[6..]
+                .chunks_exact(2)
+                .map(|c| (c[0] & 0x7F, c[1] & 0x7F))
+                .collect();
+            mixer.set_key_based_controls(channel, key, &pairs);
+        }
+        return;
+    }
     let sub_id2 = payload[3];
     if sub_id1 != 0x04 || payload.len() < 6 {
         return;
@@ -1287,6 +1303,23 @@ mod tests {
         dispatch_universal_sysex(&[0x7E, 0x7F, 0x09, 0x03, 0xF7], &mut mixer); // GM2 System On
         assert!(!mixer.sp_midi_channel_masked(1));
         assert_eq!(mixer.sp_midi_polyphony(), Some(4), "SPn survives reset");
+    }
+
+    #[test]
+    fn key_based_instrument_control_sysex_routes_to_mixer() {
+        // CA-023 / GM2 §4.8: F0 7F <dev> 0A 01 0n kk [nn vv]… F7 —
+        // set key 36 of channel 10 (0-based 9) to half volume, pan
+        // hard right, full reverb send.
+        let mut mixer = Mixer::new();
+        let data = [
+            0x7F, 0x7F, 0x0A, 0x01, 0x09, 0x24, 0x07, 0x20, 0x0A, 0x7F, 0x5B, 0x7F, 0xF7,
+        ];
+        dispatch_universal_sysex(&data, &mut mixer);
+        let kb = mixer.key_based_controls(9, 36).expect("edits stored");
+        assert_eq!(kb.volume, Some(0x20));
+        assert_eq!(kb.pan, Some(0x7F));
+        assert_eq!(kb.reverb_send, Some(0x7F));
+        assert_eq!(kb.chorus_send, None);
     }
 
     #[test]
