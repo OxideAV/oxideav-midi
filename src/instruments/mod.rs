@@ -62,6 +62,75 @@ pub mod sfz;
 pub mod tone;
 pub mod wav_pcm;
 
+/// Snapshot of a channel's **Sound Controllers** (CC 71–78) at
+/// note-on time — the RP-021 "Sound Controller Defaults" set with the
+/// response semantics GM2 (RP-024 §3.3.11–§3.3.18) pins down: every
+/// value is a *relative* parameter whose centre (null point) is 64 =
+/// "no change" from the timbre's preset, below 64 decreases and above
+/// 64 increases, with the exact response left to the implementation's
+/// discretion.
+///
+/// The mixer captures the snapshot into each freshly-struck voice via
+/// [`Voice::apply_sound_controls`]; a snapshot of all-64s is never
+/// delivered (nothing to change), so unmodified scores render
+/// bit-identically to the pre-CC-71–78 synth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoundControls {
+    /// CC 71 — Filter Resonance (Timbre / Harmonic Intensity), GM2
+    /// §3.3.11. Strengthens/weakens the preset filter resonance.
+    pub resonance: u8,
+    /// CC 72 — Release Time, GM2 §3.3.12.
+    pub release_time: u8,
+    /// CC 73 — Attack Time, GM2 §3.3.13.
+    pub attack_time: u8,
+    /// CC 74 — Brightness (filter cutoff), GM2 §3.3.14. Also the MPE
+    /// "third dimension"; routed live via [`Voice::set_timbre`] and
+    /// captured here for new notes.
+    pub brightness: u8,
+    /// CC 75 — Decay Time, GM2 §3.3.15.
+    pub decay_time: u8,
+    /// CC 76 — Vibrato Rate, GM2 §3.3.16.
+    pub vibrato_rate: u8,
+    /// CC 77 — Vibrato Depth, GM2 §3.3.17.
+    pub vibrato_depth: u8,
+    /// CC 78 — Vibrato Delay, GM2 §3.3.18.
+    pub vibrato_delay: u8,
+}
+
+impl Default for SoundControls {
+    fn default() -> Self {
+        // GM2 §3.3.11–§3.3.18: every Sound Controller defaults to 64
+        // (40H, "no change").
+        Self {
+            resonance: 64,
+            release_time: 64,
+            attack_time: 64,
+            brightness: 64,
+            decay_time: 64,
+            vibrato_rate: 64,
+            vibrato_depth: 64,
+            vibrato_delay: 64,
+        }
+    }
+}
+
+impl SoundControls {
+    /// `true` when every controller sits at its 64 "no change" centre.
+    pub fn is_neutral(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// This synth's discretionary map from a relative Sound Controller
+    /// value to a multiplicative scale: `2^((v − 64) / 32)` — centre
+    /// 64 → ×1 (no change), 0 → ×0.25, 127 → ×3.9. Exponential so the
+    /// audible change per step is uniform, matching how envelope times
+    /// and LFO rates are perceived; GM2 leaves the exact curve to the
+    /// manufacturer's discretion.
+    pub fn scale(value: u8) -> f32 {
+        2f32.powf((value.min(127) as f32 - 64.0) / 32.0)
+    }
+}
+
 /// One voice rendered into a planar f32 buffer.
 ///
 /// Voices are ephemeral — the synth holds them while a note is on,
@@ -109,6 +178,15 @@ pub trait Voice: Send {
     /// is the raw `0..=127` scalar; voices map it into their internal
     /// timbre parameter as they see fit. Default no-op.
     fn set_timbre(&mut self, _value_0_127: u8) {}
+
+    /// Capture a channel's Sound Controller snapshot (CC 71–78, GM2
+    /// RP-024 §3.3.11–§3.3.18) into this voice. Called by the mixer
+    /// **once**, immediately after note-on and before the first
+    /// render, and only when the snapshot is non-neutral — so
+    /// implementations may scale their envelope / LFO / filter state
+    /// in place without idempotency bookkeeping. Default no-op for
+    /// voices with nothing to scale.
+    fn apply_sound_controls(&mut self, _controls: &SoundControls) {}
 
     /// `true` when this voice produces native stereo output via
     /// [`render_stereo`](Voice::render_stereo) and should bypass the

@@ -298,7 +298,12 @@ impl Scheduler {
                 67 => mixer.set_soft_pedal(channel, value), // CC 67 — Soft Pedal
                 84 => mixer.set_portamento_control(channel, value), // CC 84 — Portamento Control
 
-                74 => mixer.set_timbre(channel, value), // MPE "third dimension" (CC #74)
+                // CC 71–78 — Sound Controllers (RP-021 defaults; GM2
+                // RP-024 §3.3.11–§3.3.18 response). CC 74 doubles as
+                // GM2 Brightness and the MPE "third dimension"; the
+                // mixer routes it live and captures the rest at
+                // note-on.
+                71..=78 => mixer.set_sound_controller(channel, controller, value),
                 // CC 88 — High-Resolution Velocity Prefix (CA-031): lower
                 // 7 bits affixed to the next Note On / Note Off velocity.
                 88 => mixer.set_high_res_velocity_prefix(channel, value),

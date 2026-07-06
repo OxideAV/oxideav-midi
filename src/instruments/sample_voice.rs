@@ -56,7 +56,15 @@
 
 use std::sync::Arc;
 
-use super::Voice;
+use super::{SoundControls, Voice};
+
+/// CC 74 Brightness response: cents of filter-cutoff shift per
+/// controller step away from the 64 centre (GM2 RP-024 §3.3.14 leaves
+/// the exact behaviour to the manufacturer's discretion; ±50
+/// cents/step gives a full swing of ≈ ±2.6 octaves). Shared by
+/// [`SamplePlayer`] and [`super::sf2::Sf2Voice`] so the two voice
+/// types brighten identically.
+pub const BRIGHTNESS_CENTS_PER_STEP: i32 = 50;
 
 /// Loop semantics for the sample-playback voice. Mirrors the SFZ
 /// `loop_mode` opcode + the DLS `WLOOP_TYPE_*` flags so both formats
@@ -409,6 +417,11 @@ pub struct SamplePlayer {
     /// the SF2 default 13500 cents *and* no mod-env routing pulls it
     /// into the audible range) — skips the per-sample compute entirely.
     filter: Option<BiquadState>,
+    /// CC 74 Brightness offset (GM2 RP-024 §3.3.14), in cents, summed
+    /// with the initial cutoff. 0 = centre (no change). Set live via
+    /// [`Voice::set_timbre`]; a negative offset on an "open" filter
+    /// instantiates the biquad on demand.
+    timbre_cutoff_offset_cents: i32,
 }
 
 /// Direct-form 1 biquad state for one channel. Coefficients are
@@ -545,6 +558,7 @@ impl SamplePlayer {
             initial_filter_q_cb: cfg.filter.q_centibels,
             filter_kind: cfg.filter.kind,
             filter,
+            timbre_cutoff_offset_cents: 0,
         }
     }
 
@@ -735,13 +749,15 @@ impl SamplePlayer {
     }
 
     /// Live filter cutoff at output frame `t`, in absolute cents.
-    /// Adds the mod-env contribution to the initial cutoff.
+    /// Adds the mod-env contribution and the CC 74 Brightness offset
+    /// (GM2 RP-024 §3.3.14) to the initial cutoff.
     fn live_cutoff_cents(&self, t: u32) -> i32 {
+        let base = self.initial_filter_fc_cents + self.timbre_cutoff_offset_cents;
         if self.mod_env_to_filter_cents == 0 {
-            return self.initial_filter_fc_cents;
+            return base;
         }
         let lvl = self.mod_env_at(t);
-        self.initial_filter_fc_cents + (lvl * self.mod_env_to_filter_cents as f32) as i32
+        base + (lvl * self.mod_env_to_filter_cents as f32) as i32
     }
 
     /// Linear-interpolate one frame at fractional position `phase`.
@@ -869,6 +885,52 @@ impl Voice for SamplePlayer {
         self.pressure_gain = 1.0 + 0.5 * p;
     }
 
+    fn set_timbre(&mut self, value_0_127: u8) {
+        // CC 74 Brightness (GM2 RP-024 §3.3.14): relative cutoff
+        // change, centre 64 = no change. This synth's discretionary
+        // response is ±50 cents per step (full swing ≈ ±2.6 octaves).
+        // Stored as an absolute offset so repeated CC 74 messages are
+        // idempotent; a darkening offset on an "open" (filter-less)
+        // voice instantiates the biquad on demand.
+        let offset = (value_0_127.min(127) as i32 - 64) * BRIGHTNESS_CENTS_PER_STEP;
+        self.timbre_cutoff_offset_cents = offset;
+        if self.filter.is_none() && offset < 0 {
+            self.filter = Some(BiquadState::new());
+        }
+    }
+
+    fn apply_sound_controls(&mut self, controls: &SoundControls) {
+        // GM2 RP-024 §3.3.11–§3.3.18. Envelope times / vibrato scale
+        // by 2^((v−64)/32) (see SoundControls::scale); called once at
+        // note-on, before the first render, so scaling in place is
+        // safe.
+        let scale_u32 = |samples: u32, v: u8| -> u32 {
+            if v == 64 {
+                return samples;
+            }
+            (samples as f64 * SoundControls::scale(v) as f64).round() as u32
+        };
+        // CC 73 Attack / CC 75 Decay / CC 72 Release times.
+        self.attack_samples = scale_u32(self.attack_samples, controls.attack_time).max(1);
+        self.decay_samples = scale_u32(self.decay_samples, controls.decay_time).max(1);
+        self.release_samples = scale_u32(self.release_samples, controls.release_time).max(1);
+        // CC 76/77/78 vibrato rate / depth / delay.
+        self.lfo_freq_hz *= SoundControls::scale(controls.vibrato_rate);
+        self.lfo_depth_cents *= SoundControls::scale(controls.vibrato_depth);
+        self.lfo_delay_samples = scale_u32(self.lfo_delay_samples, controls.vibrato_delay);
+        // CC 71 Filter Resonance: relative offset on the preset Q,
+        // ±3 centibels per step (discretionary), clamped at 0
+        // (Butterworth) so "weaker" can't go negative.
+        if controls.resonance != 64 {
+            self.initial_filter_q_cb =
+                (self.initial_filter_q_cb + (controls.resonance as i32 - 64) * 3).max(0);
+        }
+        // CC 74 Brightness — same live route as set_timbre.
+        if controls.brightness != 64 {
+            self.set_timbre(controls.brightness);
+        }
+    }
+
     fn exclusive_class(&self) -> u16 {
         self.exclusive_class
     }
@@ -884,6 +946,117 @@ mod tests {
             .map(|i| (i as f32 / n.saturating_sub(1).max(1) as f32) - 0.5)
             .collect::<Vec<f32>>()
             .into()
+    }
+
+    fn basic_cfg(n: usize, loop_mode: SampleLoopMode) -> SamplePlayerConfig {
+        let buf = ramp(n);
+        let len = buf.len() as u32;
+        SamplePlayerConfig {
+            samples: buf,
+            native_rate: 44_100,
+            loop_start: 0,
+            loop_end: len,
+            sample_end: len,
+            loop_mode,
+            pitch_ratio: 1.0,
+            amplitude: 1.0,
+            envelope: EnvelopeParams::default(),
+            vibrato: VibratoParams::default(),
+            mod_env: ModEnvParams::default(),
+            filter: FilterParams::default(),
+            exclusive_class: 0,
+        }
+    }
+
+    #[test]
+    fn sound_controls_scale_reference_points() {
+        // 2^((v−64)/32): centre → ×1, +32 → ×2, −32 → ×0.5, 0 → ×0.25.
+        assert!((SoundControls::scale(64) - 1.0).abs() < 1e-6);
+        assert!((SoundControls::scale(96) - 2.0).abs() < 1e-6);
+        assert!((SoundControls::scale(32) - 0.5).abs() < 1e-6);
+        assert!((SoundControls::scale(0) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sound_controls_scale_envelope_times_and_vibrato() {
+        // GM2 RP-024 §3.3.12/§3.3.13/§3.3.15–§3.3.18: CC 72/73/75
+        // scale the envelope stages, CC 76/77/78 the vibrato LFO.
+        let mut cfg = basic_cfg(64, SampleLoopMode::LoopContinuous);
+        cfg.vibrato = VibratoParams {
+            freq_hz: 5.0,
+            depth_cents: 40.0,
+            delay_s: 0.5,
+        };
+        let mut v = SamplePlayer::new(cfg, 44_100);
+        let (a0, d0, r0) = (v.attack_samples, v.decay_samples, v.release_samples);
+        let lfo_delay0 = v.lfo_delay_samples;
+        v.apply_sound_controls(&SoundControls {
+            attack_time: 96,   // ×2
+            decay_time: 32,    // ×0.5
+            release_time: 96,  // ×2
+            vibrato_rate: 96,  // ×2
+            vibrato_depth: 32, // ×0.5
+            vibrato_delay: 96, // ×2
+            ..SoundControls::default()
+        });
+        assert_eq!(v.attack_samples, a0 * 2, "CC 73 = 96 doubles attack");
+        assert_eq!(v.decay_samples, d0 / 2, "CC 75 = 32 halves decay");
+        assert_eq!(v.release_samples, r0 * 2, "CC 72 = 96 doubles release");
+        assert!(
+            (v.lfo_freq_hz - 10.0).abs() < 1e-4,
+            "CC 76 = 96 doubles rate"
+        );
+        assert!(
+            (v.lfo_depth_cents - 20.0).abs() < 1e-4,
+            "CC 77 = 32 halves depth",
+        );
+        assert_eq!(
+            v.lfo_delay_samples,
+            lfo_delay0 * 2,
+            "CC 78 = 96 doubles delay"
+        );
+    }
+
+    #[test]
+    fn brightness_below_centre_instantiates_filter_and_darkens() {
+        // GM2 RP-024 §3.3.14: CC 74 below 64 lowers the cutoff. On an
+        // "open" (filter-less) voice the biquad must appear on demand.
+        let cfg = basic_cfg(64, SampleLoopMode::LoopContinuous);
+        let mut v = SamplePlayer::new(cfg, 44_100);
+        assert!(v.filter.is_none(), "default FilterParams = open filter");
+        v.set_timbre(0); // darkest
+        assert_eq!(
+            v.timbre_cutoff_offset_cents,
+            -64 * BRIGHTNESS_CENTS_PER_STEP,
+        );
+        assert!(v.filter.is_some(), "darkening must instantiate the biquad");
+        // Repeated CC 74 is idempotent (absolute offset, not cumulative).
+        v.set_timbre(32);
+        assert_eq!(
+            v.timbre_cutoff_offset_cents,
+            -32 * BRIGHTNESS_CENTS_PER_STEP,
+        );
+    }
+
+    #[test]
+    fn resonance_offset_clamps_at_zero_q() {
+        // GM2 RP-024 §3.3.11: CC 71 below 64 weakens the resonance —
+        // never below 0 cb (Butterworth).
+        let cfg = basic_cfg(64, SampleLoopMode::LoopContinuous);
+        let mut v = SamplePlayer::new(cfg, 44_100);
+        assert_eq!(v.initial_filter_q_cb, 0);
+        v.apply_sound_controls(&SoundControls {
+            resonance: 0,
+            ..SoundControls::default()
+        });
+        assert_eq!(v.initial_filter_q_cb, 0, "Q must clamp at 0");
+        let cfg2 = basic_cfg(64, SampleLoopMode::LoopContinuous);
+        let mut v2 = SamplePlayer::new(cfg2, 44_100);
+        v2.apply_sound_controls(&SoundControls {
+            resonance: 96,
+            ..SoundControls::default()
+        });
+        assert_eq!(v2.initial_filter_q_cb, 96, "+32 steps × 3 cb = +96 cb");
     }
 
     #[test]

@@ -33,7 +33,7 @@
 //! held-chord killing every new note in a busy passage. Round-4 may
 //! revisit.
 
-use crate::instruments::Voice;
+use crate::instruments::{SoundControls, Voice};
 
 /// Hard cap on simultaneous voices. Picked to land below the audible
 /// "one more voice doesn't help" perception threshold for typical SF2
@@ -298,6 +298,14 @@ pub struct ChannelState {
     /// send level into the system Chorus effect (CA-024, CC #93). Default
     /// 0 (fully dry).
     pub chorus_send: u8,
+    /// Sound Controllers CC 71–78 (RP-021 defaults; GM2 RP-024
+    /// §3.3.11–§3.3.18 response semantics). All default to 64 ("no
+    /// change"); non-neutral values are captured into each new voice
+    /// at note-on (Melody Channels only — GM2 recommends Rhythm
+    /// Channels not respond). CC 74 Brightness additionally routes
+    /// live via [`Mixer::set_timbre`]. Per RP-015, Reset All
+    /// Controllers does **not** reset the Sound Controllers.
+    pub sound_controls: SoundControls,
     /// Pending CC 88 **High-Resolution Velocity Prefix** (CA-031): the
     /// lower 7 bits affixed below the *next* Note On / Note Off velocity
     /// on this channel, forming a 14-bit velocity
@@ -341,6 +349,7 @@ impl Default for ChannelState {
             mpe_role: MpeRole::None,
             reverb_send: 0,
             chorus_send: 0,
+            sound_controls: SoundControls::default(),
             high_res_velocity_prefix: None,
         }
     }
@@ -1659,16 +1668,30 @@ impl Mixer {
     pub fn set_mod_wheel(&mut self, channel: u8, value: u8) {
         let ch = channel as usize % NUM_CHANNELS;
         self.channels[ch].mod_wheel = value & 0x7F;
+        // GM2 RP-024 §3.3.2 [recommended]: "Rhythm Channels shall not
+        // respond to this message" — the value is recorded (the role
+        // may change later) but not routed to held drum voices.
+        if self.channels[ch].rhythm {
+            return;
+        }
         self.reapply_mod_wheel_for_channel(channel);
     }
 
-    /// Set CC #74 (Brightness / MPE Timbre, the "third dimension"). The
-    /// raw 0..=127 value is forwarded to every voice this channel-CC
-    /// reaches: per-channel for non-MPE, per-zone for MPE Manager,
-    /// per-channel-only (= the held member-channel notes) for MPE
-    /// Member.
+    /// Set CC #74 (Brightness per GM2 RP-024 §3.3.14 / MPE Timbre, the
+    /// "third dimension"). The raw 0..=127 value is forwarded to every
+    /// voice this channel-CC reaches: per-channel for non-MPE,
+    /// per-zone for MPE Manager, per-channel-only (= the held
+    /// member-channel notes) for MPE Member. Also recorded in the
+    /// channel's Sound Controller snapshot so new notes strike with
+    /// the current brightness. Rhythm Channels record but do not route
+    /// (GM2 §3.3.14 [recommended]: "Rhythm Channels shall not respond
+    /// to this message").
     pub fn set_timbre(&mut self, channel: u8, value: u8) {
         let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].sound_controls.brightness = value & 0x7F;
+        if self.channels[ch].rhythm {
+            return;
+        }
         let role = self.channels[ch].mpe_role;
         for slot in self.slots.iter_mut() {
             if self.channels[slot.channel as usize % NUM_CHANNELS].matches_for_zone_broadcast(
@@ -1680,6 +1703,35 @@ impl Mixer {
                     v.set_timbre(value & 0x7F);
                 }
             }
+        }
+    }
+
+    /// Set one of the Sound Controllers CC 71–78 (RP-021 names, GM2
+    /// RP-024 §3.3.11–§3.3.18 response semantics) on a channel.
+    /// `controller` is the raw CC number; anything outside `71..=78`
+    /// is ignored. Values are relative with centre 64 = "no change".
+    ///
+    /// CC 74 (Brightness) routes live to held voices via
+    /// [`Self::set_timbre`]; the envelope-time / vibrato / resonance
+    /// controllers are captured by each **new** note-on ("Exact
+    /// behavior is left to the manufacturer's discretion" — this synth
+    /// treats them as strike-time parameters, matching how its voices
+    /// own their envelope state). Rhythm Channels record but do not
+    /// apply (GM2 [recommended]: Rhythm Channels shall not respond).
+    pub fn set_sound_controller(&mut self, channel: u8, controller: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let v = value & 0x7F;
+        match controller {
+            71 => self.channels[ch].sound_controls.resonance = v,
+            72 => self.channels[ch].sound_controls.release_time = v,
+            73 => self.channels[ch].sound_controls.attack_time = v,
+            // Route through the live path (which also stores it).
+            74 => self.set_timbre(channel, v),
+            75 => self.channels[ch].sound_controls.decay_time = v,
+            76 => self.channels[ch].sound_controls.vibrato_rate = v,
+            77 => self.channels[ch].sound_controls.vibrato_depth = v,
+            78 => self.channels[ch].sound_controls.vibrato_delay = v,
+            _ => {}
         }
     }
 
@@ -2375,6 +2427,13 @@ impl Mixer {
         if initial_cents != 0 {
             voice.set_pitch_bend_cents(initial_cents);
         }
+        // Sound Controllers CC 71–78 (GM2 RP-024 §3.3.11–§3.3.18):
+        // capture the channel's snapshot into the fresh voice. Skipped
+        // when neutral (all-64) so unmodified scores stay bit-identical,
+        // and on Rhythm Channels (GM2 [recommended] non-response).
+        if !is_drum && !st.sound_controls.is_neutral() {
+            voice.apply_sound_controls(&st.sound_controls);
+        }
         // Compose Member + Manager channel pressure for MPE; otherwise
         // just hand the channel's value through.
         let pressure_byte = match st.mpe_role {
@@ -2391,9 +2450,10 @@ impl Mixer {
             voice.set_pressure(pressure_byte as f32 / 127.0);
         }
         // Mod-wheel depth (CC 1 scaled by RPN 5) carries to a fresh
-        // voice the same way bend does.
+        // voice the same way bend does. Rhythm Channels don't respond
+        // (GM2 RP-024 §3.3.2 [recommended]).
         let depth_cents = (st.mod_wheel as i32) * (st.mod_depth_range_cents as i32) / 127;
-        if depth_cents != 0 {
+        if depth_cents != 0 && !is_drum {
             voice.set_mod_depth_cents(depth_cents);
         }
         // CA-031 CC 88 High-Resolution Velocity Prefix: consume a pending
@@ -2856,6 +2916,112 @@ mod tests {
             last_timbre: timbre.clone(),
         });
         (v, bend, press, depth, timbre)
+    }
+
+    type ScCell = std::sync::Arc<std::sync::Mutex<Option<SoundControls>>>;
+
+    /// Minimal probe voice recording the Sound Controller snapshot the
+    /// mixer captures at note-on (GM2 RP-024 §3.3.11–§3.3.18).
+    struct ScProbeVoice {
+        captured: ScCell,
+    }
+    impl Voice for ScProbeVoice {
+        fn render(&mut self, out: &mut [f32]) -> usize {
+            out.len()
+        }
+        fn release(&mut self) {}
+        fn done(&self) -> bool {
+            false
+        }
+        fn apply_sound_controls(&mut self, controls: &SoundControls) {
+            *self.captured.lock().unwrap() = Some(*controls);
+        }
+    }
+
+    fn sc_probe_voice() -> (Box<dyn Voice>, ScCell) {
+        let cell: ScCell = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (
+            Box::new(ScProbeVoice {
+                captured: cell.clone(),
+            }),
+            cell,
+        )
+    }
+
+    #[test]
+    fn sound_controllers_are_captured_at_note_on() {
+        let mut m = Mixer::new();
+        m.set_sound_controller(0, 72, 96); // Release Time
+        m.set_sound_controller(0, 77, 32); // Vibrato Depth
+        let (v, cell) = sc_probe_voice();
+        m.note_on(0, 60, 100, v);
+        let got = cell.lock().unwrap().expect("snapshot must be captured");
+        assert_eq!(got.release_time, 96);
+        assert_eq!(got.vibrato_depth, 32);
+        assert_eq!(got.attack_time, 64, "untouched controllers stay centred");
+    }
+
+    #[test]
+    fn neutral_sound_controllers_are_not_delivered() {
+        // All-64 snapshot → the mixer must skip the call entirely so
+        // unmodified scores render through the exact legacy path.
+        let mut m = Mixer::new();
+        let (v, cell) = sc_probe_voice();
+        m.note_on(0, 60, 100, v);
+        assert!(cell.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn rhythm_channel_ignores_sound_controllers() {
+        // GM2 RP-024 §3.3.11–§3.3.18 [recommended]: Rhythm Channels
+        // shall not respond. Channel 10 (index 9) boots as rhythm.
+        let mut m = Mixer::new();
+        m.set_sound_controller(9, 73, 127);
+        let (v, cell) = sc_probe_voice();
+        m.note_on(9, 36, 100, v);
+        assert!(cell.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn cc74_brightness_routes_live_and_is_recorded_for_new_notes() {
+        let mut m = Mixer::new();
+        let (v, _, _, _, timbre) = instrumented_voice_full(0.5, 64);
+        m.note_on(0, 60, 100, v);
+        m.set_sound_controller(0, 74, 100);
+        assert_eq!(*timbre.lock().unwrap(), 100, "CC 74 routes live");
+        assert_eq!(m.channel_state(0).sound_controls.brightness, 100);
+        // A fresh note captures the stored brightness.
+        let (v2, cell) = sc_probe_voice();
+        m.note_on(0, 62, 100, v2);
+        assert_eq!(cell.lock().unwrap().unwrap().brightness, 100);
+    }
+
+    #[test]
+    fn rhythm_channel_ignores_mod_wheel() {
+        // GM2 RP-024 §3.3.2 [recommended]: Rhythm Channels shall not
+        // respond to Modulation Depth.
+        let mut m = Mixer::new();
+        let (v, _, _, depth, _) = instrumented_voice_full(0.5, 64);
+        m.note_on(9, 36, 100, v);
+        m.set_mod_wheel(9, 127);
+        assert_eq!(*depth.lock().unwrap(), 0, "drum voice must see no mod");
+        // Melody channel still routes.
+        let (v2, _, _, depth2, _) = instrumented_voice_full(0.5, 64);
+        m.note_on(0, 60, 100, v2);
+        m.set_mod_wheel(0, 127);
+        assert_eq!(*depth2.lock().unwrap(), 50, "127/127 × 50-cent range");
+    }
+
+    #[test]
+    fn reset_all_controllers_preserves_sound_controllers() {
+        // RP-015: the Sound Controllers (CC 70–79) are in the
+        // do-NOT-reset set.
+        let mut m = Mixer::new();
+        m.set_sound_controller(0, 72, 96);
+        m.set_sound_controller(0, 74, 20);
+        m.reset_all_controllers(0);
+        assert_eq!(m.channel_state(0).sound_controls.release_time, 96);
+        assert_eq!(m.channel_state(0).sound_controls.brightness, 20);
     }
 
     #[test]

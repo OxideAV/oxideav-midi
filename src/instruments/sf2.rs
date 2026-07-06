@@ -1598,6 +1598,11 @@ pub struct Sf2Voice {
     /// cutoff is at the spec default and no mod-env routing is active
     /// (we skip the per-sample work in that case).
     filter: Option<BiquadState>,
+    /// CC 74 Brightness offset (GM2 RP-024 §3.3.14), in cents, summed
+    /// with the initial cutoff. 0 = centre. Set via
+    /// [`Voice::set_timbre`]; a negative offset on an "open" filter
+    /// instantiates the biquad on demand.
+    timbre_cutoff_offset_cents: i32,
     /// Exclusive-class id (gen 57). Read by the mixer at `note_on` time.
     exclusive_class: u16,
     /// Output sample rate, hertz. Stashed at construction so the filter
@@ -1739,6 +1744,7 @@ impl Sf2Voice {
             initial_filter_fc_cents: plan.initial_filter_fc_cents,
             initial_filter_q_cb: plan.initial_filter_q_cb,
             filter,
+            timbre_cutoff_offset_cents: 0,
             exclusive_class: plan.exclusive_class,
             output_rate: sr,
         }
@@ -2086,6 +2092,7 @@ impl Voice for Sf2Voice {
                 // computed value (cheap perceptual gate).
                 if self.filter.is_some() {
                     let target = self.initial_filter_fc_cents
+                        + self.timbre_cutoff_offset_cents
                         + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32;
                     let last = self
                         .filter
@@ -2167,6 +2174,45 @@ impl Voice for Sf2Voice {
         self.pressure_gain = 1.0 + 0.5 * p; // 1.0 at rest, 1.5 at full
     }
 
+    fn set_timbre(&mut self, value_0_127: u8) {
+        // CC 74 Brightness (GM2 RP-024 §3.3.14): relative cutoff
+        // change, centre 64 = no change; the response matches
+        // [`super::sample_voice::SamplePlayer`]
+        // (±BRIGHTNESS_CENTS_PER_STEP cents per step) so SF2 and
+        // SFZ/DLS voices brighten identically.
+        let offset = (value_0_127.min(127) as i32 - 64)
+            * crate::instruments::sample_voice::BRIGHTNESS_CENTS_PER_STEP;
+        self.timbre_cutoff_offset_cents = offset;
+        if self.filter.is_none() && offset < 0 {
+            self.filter = Some(BiquadState::new());
+        }
+    }
+
+    fn apply_sound_controls(&mut self, controls: &super::SoundControls) {
+        // GM2 RP-024 §3.3.11–§3.3.18, captured once at note-on (see
+        // the trait doc). Same discretionary response curves as
+        // [`super::sample_voice::SamplePlayer`].
+        use super::SoundControls;
+        let scale_u32 = |samples: u32, v: u8| -> u32 {
+            if v == 64 {
+                return samples;
+            }
+            (samples as f64 * SoundControls::scale(v) as f64).round() as u32
+        };
+        self.attack_samples = scale_u32(self.attack_samples, controls.attack_time).max(1);
+        self.decay_samples = scale_u32(self.decay_samples, controls.decay_time).max(1);
+        self.release_samples = scale_u32(self.release_samples, controls.release_time).max(1);
+        // No preset vibrato LFO on the SF2 voice (the mod-wheel path
+        // owns pitch sway) — CC 76/77/78 have nothing to scale here.
+        if controls.resonance != 64 {
+            self.initial_filter_q_cb =
+                (self.initial_filter_q_cb + (controls.resonance as i32 - 64) * 3).max(0);
+        }
+        if controls.brightness != 64 {
+            self.set_timbre(controls.brightness);
+        }
+    }
+
     fn is_stereo(&self) -> bool {
         self.stereo.is_some()
     }
@@ -2203,6 +2249,7 @@ impl Voice for Sf2Voice {
             }
             if self.filter.is_some() {
                 let target = self.initial_filter_fc_cents
+                    + self.timbre_cutoff_offset_cents
                     + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32;
                 let last = self
                     .filter
