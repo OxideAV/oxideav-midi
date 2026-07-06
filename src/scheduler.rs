@@ -247,15 +247,24 @@ impl Scheduler {
                 mixer.note_off(channel, key);
             }
             ChannelBody::NoteOn { key, velocity } => {
-                let program = mixer.channel_state(channel).program;
-                // Channel 10 (index 9) is the GM percussion bus — the
-                // "key" is the drum kit slot, not a pitch. We pass it
-                // through as program=0 and let the SF2 lookup find the
-                // right sample by the key range. (Real GM banks
-                // expose the drum kit as bank=128 program=0; round-3
-                // doesn't yet ask for bank 128.)
-                let _drum = ch == 9;
-                if let Ok(voice) = instrument.make_voice(program, key, velocity, self.sample_rate) {
+                let st = mixer.channel_state(channel);
+                let (program, bank_msb, bank_lsb) = (st.program, st.bank_msb, st.bank_lsb);
+                // The latched GM2 bank pair rides along so bank-aware
+                // backends (SF2 percussion bank 128, GM2 sound-set
+                // variation banks) can honour it; the default
+                // `make_voice_banked` falls back to the unbanked
+                // `make_voice` lookup. Rhythm channels (bank MSB 78H,
+                // Channel 10 by default) treat `key` as the drum-kit
+                // slot, not a pitch.
+                let _ = ch;
+                if let Ok(voice) = instrument.make_voice_banked(
+                    bank_msb,
+                    bank_lsb,
+                    program,
+                    key,
+                    velocity,
+                    self.sample_rate,
+                ) {
                     mixer.note_on(channel, key, velocity, voice);
                 }
                 // If the instrument refused (no preset, etc.) we drop
@@ -266,9 +275,15 @@ impl Scheduler {
                 mixer.note_off(channel, key);
             }
             ChannelBody::ProgramChange { program } => {
-                mixer.channel_state_mut(channel).program = program;
+                // Latches the pending Bank Select pair + switches the
+                // channel's Rhythm/Melody role per GM2 RP-024 §3.3.1.
+                mixer.set_program(channel, program);
             }
             ChannelBody::ControlChange { controller, value } => match controller {
+                // CC 0 / CC 32 — Bank Select MSB / LSB (GM2 RP-024
+                // §3.3.1). Pending until the next Program Change.
+                0 => mixer.set_bank_select(channel, value, true),
+                32 => mixer.set_bank_select(channel, value, false),
                 1 => mixer.set_mod_wheel(channel, value), // CC 1 — Modulation Wheel
                 5 => mixer.set_portamento_time(channel, value), // CC 5 — Portamento Time
                 6 => mixer.set_data_entry(channel, value, true), // RPN data MSB
@@ -433,6 +448,7 @@ fn dispatch_universal_non_real_time(payload: &[u8], mixer: &mut crate::mixer::Mi
         mixer.set_master_coarse_tuning(0, 0x40); // centre
         mixer.reset_tuning(); // back to equal temperament
         mixer.reset_gm_effects(); // GM2 reverb/chorus defaults (CA-024)
+        mixer.reset_gm_banks(); // GM2 bank/role defaults (RP-024 §3.3.1)
     } else if sub_id1 == 0x08 {
         // MIDI Tuning Standard. The non-real-time area carries the
         // single-note tuning bank form (07) and the non-real-time

@@ -391,6 +391,30 @@ impl Instrument for Sf2Instrument {
             Sf2Voice::from_plan(self.bank.sample_data.clone(), &plan, velocity, sample_rate);
         Ok(Box::new(voice))
     }
+
+    fn make_voice_banked(
+        &self,
+        bank_msb: u8,
+        bank_lsb: u8,
+        program: u8,
+        key: u8,
+        velocity: u8,
+        sample_rate: u32,
+    ) -> Result<Box<dyn Voice>> {
+        let plan = self
+            .bank
+            .resolve_banked(bank_msb, bank_lsb, program, key, velocity)
+            .ok_or_else(|| {
+                Error::unsupported(format!(
+                    "SF2 '{}': no preset matches bank {bank_msb:02X}H/{bank_lsb:02X}H \
+                     program {program} key {key} velocity {velocity}",
+                    self.name,
+                ))
+            })?;
+        let voice =
+            Sf2Voice::from_plan(self.bank.sample_data.clone(), &plan, velocity, sample_rate);
+        Ok(Box::new(voice))
+    }
 }
 
 /// Magic-bytes detector. Returns true if `bytes` looks like a SoundFont
@@ -653,8 +677,63 @@ impl Sf2Bank {
             } else {
                 Some(0)
             })?;
+        self.resolve_preset(preset_idx, key, velocity)
+    }
 
-        let preset = &self.presets[preset_idx];
+    /// Resolve `(GM2 bank, program, key, velocity)` to a concrete
+    /// sample plan, mapping the GM2 Bank Select pair (RP-024 §3.3.1)
+    /// onto the SF2 preset-bank convention:
+    ///
+    /// * bank MSB `78H` (Percussion Sound Set / a Rhythm Channel) →
+    ///   SF2 bank **128**, the GM SoundFont drum-kit bank. Per GM2
+    ///   §2.6 an undefined Program in the percussion bank falls back
+    ///   to Program 1 (`00H`, the GM1 drum set), then to the legacy
+    ///   unbanked chain so a kit-less bank still produces sound.
+    /// * bank MSB `79H` (Melody Sound Set) → SF2 bank = the bank LSB
+    ///   (the GM2 timbre-variation number; `79H/00H` = the GM1 set,
+    ///   which is SF2 bank 0). Per GM2 §2.6 an undefined variation
+    ///   Program falls back to the Bank `79H/00H` (GM1) Program.
+    /// * any other MSB: treated as the legacy unbanked lookup.
+    pub fn resolve_banked(
+        &self,
+        bank_msb: u8,
+        bank_lsb: u8,
+        program: u8,
+        key: u8,
+        velocity: u8,
+    ) -> Option<SamplePlan> {
+        let find = |bank: u16, prog: u8| {
+            self.presets
+                .iter()
+                .position(|p| p.bank == bank && p.program as u8 == prog)
+        };
+        let preset_idx = match bank_msb {
+            0x78 => find(128, program).or_else(|| find(128, 0)),
+            0x79 => {
+                let variation = bank_lsb as u16;
+                find(variation, program).or_else(|| {
+                    if variation != 0 {
+                        find(0, program)
+                    } else {
+                        None
+                    }
+                })
+            }
+            _ => None,
+        };
+        match preset_idx {
+            Some(idx) => self.resolve_preset(idx, key, velocity),
+            // Legacy chain (bank-0 → any-bank → first preset) keeps
+            // bank-less scores and sparse SoundFonts sounding.
+            None => self.resolve(program, key, velocity),
+        }
+    }
+
+    /// Walk one preset's zones (then the referenced instruments'
+    /// zones) for a `(key, velocity)` match — the shared back half of
+    /// [`Self::resolve`] / [`Self::resolve_banked`].
+    fn resolve_preset(&self, preset_idx: usize, key: u8, velocity: u8) -> Option<SamplePlan> {
+        let preset = self.presets.get(preset_idx)?;
         let next_pbag_end = self
             .presets
             .get(preset_idx + 1)
@@ -2441,6 +2520,36 @@ mod tests {
         assert!((plan.pitch_ratio - 1.0).abs() < 1e-12);
         // No loop generator set → loops = false.
         assert!(!plan.loops);
+    }
+
+    #[test]
+    fn resolve_banked_rhythm_maps_to_sf2_bank_128_with_gm1_kit_fallback() {
+        let blob = build_minimal_sf2();
+        let mut bank = Sf2Bank::parse(&blob).unwrap();
+        // Park the sole preset in the GM SoundFont drum-kit bank.
+        bank.presets[0].bank = 128;
+        // GM2 bank 78H/00H program 0 → SF2 (128, 0). Exact hit.
+        assert!(bank.resolve_banked(0x78, 0, 0, 60, 100).is_some());
+        // GM2 §2.6: an undefined Program in the percussion bank falls
+        // back to Program 1 (00H) — the GM1 drum set.
+        assert!(
+            bank.resolve_banked(0x78, 0, 25, 60, 100).is_some(),
+            "undefined drum-kit program must fall back to (128, 0)",
+        );
+    }
+
+    #[test]
+    fn resolve_banked_melody_variation_falls_back_to_gm1_set() {
+        let blob = build_minimal_sf2();
+        let bank = Sf2Bank::parse(&blob).unwrap();
+        // 79H/00H = GM1 sound set = SF2 bank 0. Exact hit.
+        assert!(bank.resolve_banked(0x79, 0, 0, 60, 100).is_some());
+        // GM2 §2.6: an undefined variation (79H/03H here — the fixture
+        // has no bank 3) plays the Bank 79H/00H program instead.
+        assert!(
+            bank.resolve_banked(0x79, 3, 0, 60, 100).is_some(),
+            "undefined variation bank must fall back to the GM1 set",
+        );
     }
 
     #[test]

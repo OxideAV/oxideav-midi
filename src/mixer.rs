@@ -164,6 +164,31 @@ pub struct ChannelState {
     /// MIDI program (0..=127). Set by `ProgramChange`. Defaults to 0
     /// (Acoustic Grand Piano in GM).
     pub program: u8,
+    /// Pending Bank Select MSB (CC 0). Per GM2 (RP-024 §3.3.1) "the
+    /// Bank Select message shall not affect any change in sound until
+    /// a subsequent Program Change message is received" — so CC 0/32
+    /// land here and are latched into [`Self::bank_msb`] /
+    /// [`Self::bank_lsb`] by [`Mixer::set_program`]. GM2 defaults:
+    /// `79H/00H` on every channel except Channel 10 (`78H/00H`).
+    pub bank_msb_pending: u8,
+    /// Pending Bank Select LSB (CC 32). See [`Self::bank_msb_pending`].
+    pub bank_lsb_pending: u8,
+    /// Latched Bank Select MSB — the bank the current [`Self::program`]
+    /// was selected in (updated at Program Change time per GM2 §3.3.1).
+    pub bank_msb: u8,
+    /// Latched Bank Select LSB. See [`Self::bank_msb`].
+    pub bank_lsb: u8,
+    /// `true` while this channel is a **Rhythm Channel** (GM2 RP-024
+    /// §2.4): it selects timbres from the GM2 Percussion Sound Set
+    /// (Bank `78H/xxH`) and is exempt from note-shifting (tuning RPNs,
+    /// master tuning, MTS key tuning, portamento glides — a different
+    /// key is a different drum sound, not a pitch). Channel 10
+    /// defaults to Rhythm, all others to Melody; a Bank Select
+    /// `78H/xxH` (→ Rhythm) or `79H/xxH` (→ Melody) followed by a
+    /// Program Change switches the role (required for Channels 10/11
+    /// per GM2 §3.3.1 and RP-035 §2.1; GM2 lists the same switch on
+    /// any other channel as [optional], which this synth honours).
+    pub rhythm: bool,
     /// CC 7 (Channel Volume), 0..=127. Default 100 per GM. Rendered
     /// through the GM2 square-law response curve (RP-024 §3.3.4):
     /// amplitude ∝ value², i.e. `gain[dB] = 40·log10(cc7/127)`.
@@ -289,6 +314,11 @@ impl Default for ChannelState {
     fn default() -> Self {
         Self {
             program: 0,
+            bank_msb_pending: 0x79,
+            bank_lsb_pending: 0x00,
+            bank_msb: 0x79,
+            bank_lsb: 0x00,
+            rhythm: false,
             volume: 100,
             expression: 127,
             pan: 64,
@@ -984,9 +1014,17 @@ impl Mixer {
         // `Copy` (the `Box<dyn Voice>` field). Build an array via
         // `from_fn` so each element is a fresh `empty()`.
         let slots = std::array::from_fn(|_| VoiceSlot::empty());
+        // GM2 (RP-024 §2.4 / §3.3.1): Channel 10 (index 9) defaults to
+        // a Rhythm Channel with Bank Select 78H/00H; every other
+        // channel defaults to Melody with 79H/00H (ChannelState's
+        // default). RP-035 §2.1 requires the same boot state.
+        let mut channels = [ChannelState::default(); NUM_CHANNELS];
+        channels[9].rhythm = true;
+        channels[9].bank_msb = 0x78;
+        channels[9].bank_msb_pending = 0x78;
         Self {
             slots,
-            channels: [ChannelState::default(); NUM_CHANNELS],
+            channels,
             next_age: 1,
             mix_gain: 0.5,
             master_volume_14: 0x3FFF,
@@ -1031,6 +1069,67 @@ impl Mixer {
         &mut self.channels[channel as usize % NUM_CHANNELS]
     }
 
+    // ─────────────────── GM2 bank select / channel roles ───────────────────
+
+    /// Apply a Bank Select byte (CC 0 = MSB, CC 32 = LSB). Per GM2
+    /// (RP-024 §3.3.1) the message is only *pending* until the next
+    /// Program Change: "The Bank Select message shall not affect any
+    /// change in sound until a subsequent Program Change message is
+    /// received." Notes struck in between keep sounding with — and new
+    /// notes keep selecting — the previously latched bank.
+    pub fn set_bank_select(&mut self, channel: u8, value: u8, is_msb: bool) {
+        let ch = channel as usize % NUM_CHANNELS;
+        if is_msb {
+            self.channels[ch].bank_msb_pending = value & 0x7F;
+        } else {
+            self.channels[ch].bank_lsb_pending = value & 0x7F;
+        }
+    }
+
+    /// Apply a Program Change: store the program and latch the pending
+    /// Bank Select pair (GM2 RP-024 §3.3.1). A latched bank MSB of
+    /// `78H` switches the channel to a **Rhythm Channel**, `79H` to a
+    /// **Melody Channel** (required behaviour on Channels 10/11,
+    /// honoured on every channel per the spec's [optional] clause);
+    /// any other MSB leaves the channel role unchanged (GM2 defines
+    /// only those two banks). Per §3.3.1's [recommended] paragraph,
+    /// currently-sounding notes are not released or muted — only new
+    /// note-ons pick up the new timbre / role.
+    pub fn set_program(&mut self, channel: u8, program: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let st = &mut self.channels[ch];
+        st.program = program & 0x7F;
+        st.bank_msb = st.bank_msb_pending;
+        st.bank_lsb = st.bank_lsb_pending;
+        match st.bank_msb {
+            0x78 => st.rhythm = true,
+            0x79 => st.rhythm = false,
+            _ => {}
+        }
+    }
+
+    /// `true` while `channel` is a Rhythm Channel (GM2 RP-024 §2.4).
+    /// Defaults: Channel 10 (index 9) rhythm, everything else melody.
+    pub fn is_rhythm_channel(&self, channel: u8) -> bool {
+        self.channels[channel as usize % NUM_CHANNELS].rhythm
+    }
+
+    /// Reset every channel's Bank Select + role state to the GM2
+    /// defaults (RP-024 §3.3.1: `79H/00H` everywhere except Channel 10
+    /// = `78H/00H`; §2.4: only Channel 10 boots as Rhythm). Called by
+    /// the GM1/GM2 System-On reset path.
+    pub fn reset_gm_banks(&mut self) {
+        for (idx, st) in self.channels.iter_mut().enumerate() {
+            let msb = if idx == 9 { 0x78 } else { 0x79 };
+            st.bank_msb = msb;
+            st.bank_msb_pending = msb;
+            st.bank_lsb = 0;
+            st.bank_lsb_pending = 0;
+            st.rhythm = idx == 9;
+            st.program = 0;
+        }
+    }
+
     /// Apply a pitch-bend event. `value` is the raw 14-bit MIDI scalar
     /// in `0..=16383` (centre = `0x2000`); the conversion to cents
     /// uses the channel's current `pitch_bend_range_cents` (default
@@ -1059,7 +1158,7 @@ impl Mixer {
         // per-note bend. Per Appendix C we sum the two values in
         // cents.
         let role = self.channels[ch].mpe_role;
-        let is_drum = ch == 9;
+        let is_drum = self.channels[ch].rhythm;
 
         if let MpeRole::Manager(zone_kind) = role {
             // Update every voice in the zone (Manager-held notes too).
@@ -1081,7 +1180,7 @@ impl Mixer {
                                 self.channels[ch].pitch_bend_range_cents,
                                 self.master_fine_tune_cents,
                                 self.master_coarse_tune_semitones,
-                                slot_ch == 9,
+                                self.channels[slot_ch].rhythm,
                             );
                             if slot_ch != 9 {
                                 total +=
@@ -2144,7 +2243,7 @@ impl Mixer {
         };
         let ch = channel as usize % NUM_CHANNELS;
         let st = self.channels[ch];
-        let is_drum = ch == 9;
+        let is_drum = st.rhythm;
         let mut cents = Self::compose_pitch_cents(
             &st,
             st.pitch_bend,
@@ -2226,7 +2325,7 @@ impl Mixer {
         }
         let ch = channel as usize % NUM_CHANNELS;
         let st = self.channels[ch];
-        let is_drum = ch == 9;
+        let is_drum = st.rhythm;
         // Compose pitch bend + per-channel fine/coarse + master
         // fine/coarse + (for MPE Members) the Manager Channel's bend
         // — picks up tuning on the new voice's very first sample so
@@ -3804,6 +3903,86 @@ mod tests {
         m.set_pitch_bend(9, 0x2000);
         let cents = *bend_cell.lock().unwrap();
         assert_eq!(cents, 0, "drum channel must not shift pitch, got {cents}");
+    }
+
+    #[test]
+    fn gm2_default_channel_roles_and_banks() {
+        // GM2 RP-024 §2.4 / §3.3.1: Channel 10 (index 9) boots as a
+        // Rhythm Channel in Bank 78H/00H; every other channel boots as
+        // Melody in 79H/00H.
+        let m = Mixer::new();
+        for ch in 0..NUM_CHANNELS as u8 {
+            let st = m.channel_state(ch);
+            if ch == 9 {
+                assert!(m.is_rhythm_channel(ch), "ch10 must default to rhythm");
+                assert_eq!((st.bank_msb, st.bank_lsb), (0x78, 0x00));
+            } else {
+                assert!(!m.is_rhythm_channel(ch), "ch{} must default melody", ch + 1);
+                assert_eq!((st.bank_msb, st.bank_lsb), (0x79, 0x00));
+            }
+        }
+    }
+
+    #[test]
+    fn bank_select_is_pending_until_program_change() {
+        // GM2 RP-024 §3.3.1: "The Bank Select message shall not affect
+        // any change in sound until a subsequent Program Change".
+        let mut m = Mixer::new();
+        m.set_bank_select(10, 0x78, true); // MIDI ch 11 → rhythm bank
+        assert!(
+            !m.is_rhythm_channel(10),
+            "bank select alone must not switch the channel role",
+        );
+        assert_eq!(m.channel_state(10).bank_msb, 0x79, "latched bank unchanged");
+        m.set_program(10, 8); // drum set 9
+        assert!(m.is_rhythm_channel(10), "78H + Program Change → rhythm");
+        assert_eq!(m.channel_state(10).bank_msb, 0x78);
+        assert_eq!(m.channel_state(10).program, 8);
+    }
+
+    #[test]
+    fn bank_79_plus_program_change_returns_channel_10_to_melody() {
+        let mut m = Mixer::new();
+        m.set_bank_select(9, 0x79, true);
+        m.set_program(9, 40); // Violin
+        assert!(!m.is_rhythm_channel(9), "79H + Program Change → melody");
+        // The lifted rhythm role also lifts the note-shifting
+        // exemption: channel coarse tune now reaches the voice.
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(9, 60, 100, v);
+        select_rpn(&mut m, 9, 0, 2);
+        m.set_data_entry(9, 0x4C, true); // +12 semitones
+        m.set_pitch_bend(9, 0x2000);
+        let cents = *bend_cell.lock().unwrap();
+        assert_eq!(cents, 1200, "melody-switched ch10 must shift pitch");
+    }
+
+    #[test]
+    fn non_gm2_bank_msb_leaves_channel_role_unchanged() {
+        // GM2 defines only 78H (rhythm) / 79H (melody); any other MSB
+        // must not flip the role.
+        let mut m = Mixer::new();
+        m.set_bank_select(9, 0x00, true);
+        m.set_program(9, 0);
+        assert!(m.is_rhythm_channel(9), "non-GM2 bank keeps ch10 rhythm");
+        m.set_bank_select(3, 0x00, true);
+        m.set_program(3, 0);
+        assert!(!m.is_rhythm_channel(3), "non-GM2 bank keeps ch4 melody");
+    }
+
+    #[test]
+    fn reset_gm_banks_restores_boot_state() {
+        let mut m = Mixer::new();
+        m.set_bank_select(9, 0x79, true);
+        m.set_program(9, 40); // ch10 → melody
+        m.set_bank_select(10, 0x78, true);
+        m.set_program(10, 0); // ch11 → rhythm
+        m.reset_gm_banks();
+        assert!(m.is_rhythm_channel(9));
+        assert!(!m.is_rhythm_channel(10));
+        assert_eq!(m.channel_state(9).bank_msb, 0x78);
+        assert_eq!(m.channel_state(10).bank_msb, 0x79);
+        assert_eq!(m.channel_state(9).program, 0);
     }
 
     #[test]

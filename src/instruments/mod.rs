@@ -166,4 +166,26 @@ pub trait Instrument: Send + Sync {
         velocity: u8,
         sample_rate: u32,
     ) -> Result<Box<dyn Voice>>;
+
+    /// Allocate a voice for `program` within a **GM2 bank** (RP-024
+    /// §3.3.1): `bank_msb`/`bank_lsb` are the latched CC 0 / CC 32
+    /// pair, `78H/xxH` selecting the Percussion Sound Set (a Rhythm
+    /// Channel's drum kit) and `79H/xxH` a Melody Sound Set variation
+    /// (`79H/00H` = the GM1 set). The default implementation ignores
+    /// the bank and delegates to [`Self::make_voice`], so bank-unaware
+    /// backends keep their exact previous behaviour; bank-aware
+    /// backends (SF2, whose presets carry a bank number and whose GM
+    /// convention parks drum kits in bank 128) override it.
+    fn make_voice_banked(
+        &self,
+        bank_msb: u8,
+        bank_lsb: u8,
+        program: u8,
+        key: u8,
+        velocity: u8,
+        sample_rate: u32,
+    ) -> Result<Box<dyn Voice>> {
+        let _ = (bank_msb, bank_lsb);
+        self.make_voice(program, key, velocity, sample_rate)
+    }
 }
