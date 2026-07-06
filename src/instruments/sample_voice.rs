@@ -66,6 +66,13 @@ use super::{SoundControls, Voice};
 /// types brighten identically.
 pub const BRIGHTNESS_CENTS_PER_STEP: i32 = 50;
 
+/// LFO rate used for mixer-driven modulation (CC 1 vibrato and the
+/// CA-022 LFO destinations) when the region defines **no preset
+/// vibrato LFO** of its own. GM2 (RP-024 §3.3.2) requires a triangle
+/// or sine LFO but leaves the rate to the implementation; 5 Hz is the
+/// classic vibrato rate.
+pub const DEFAULT_DEST_LFO_HZ: f32 = 5.0;
+
 /// Loop semantics for the sample-playback voice. Mirrors the SFZ
 /// `loop_mode` opcode + the DLS `WLOOP_TYPE_*` flags so both formats
 /// can share one render path.
@@ -422,6 +429,22 @@ pub struct SamplePlayer {
     /// [`Voice::set_timbre`]; a negative offset on an "open" filter
     /// instantiates the biquad on demand.
     timbre_cutoff_offset_cents: i32,
+    /// Extra pitch-LFO depth in cents from the mixer's modulation
+    /// routing — CC 1 Modulation Depth (GM2 RP-024 §3.3.2, scaled by
+    /// RPN 5) plus any CA-022 **LFO Pitch Depth** destination. Summed
+    /// with the preset vibrato depth; when the region has no preset
+    /// LFO the sway runs on [`DEFAULT_DEST_LFO_HZ`].
+    mod_depth_extra_cents: f32,
+    /// CA-022 / GM2 §4.6 **Filter Cutoff Control** destination offset,
+    /// in cents. Additive with the CC 74 Brightness offset. A negative
+    /// offset on an "open" filter instantiates the biquad on demand.
+    dest_cutoff_offset_cents: i32,
+    /// CA-022 / GM2 §4.6 **LFO Filter Depth** destination: peak
+    /// LFO-driven cutoff sway, cents.
+    lfo_filter_depth_cents: f32,
+    /// CA-022 / GM2 §4.6 **LFO Amplitude Depth** destination
+    /// (tremolo), `0.0..=1.0`.
+    lfo_amp_depth: f32,
 }
 
 /// Direct-form 1 biquad state for one channel. Coefficients are
@@ -559,6 +582,10 @@ impl SamplePlayer {
             filter_kind: cfg.filter.kind,
             filter,
             timbre_cutoff_offset_cents: 0,
+            mod_depth_extra_cents: 0.0,
+            dest_cutoff_offset_cents: 0,
+            lfo_filter_depth_cents: 0.0,
+            lfo_amp_depth: 0.0,
         }
     }
 
@@ -596,18 +623,50 @@ impl SamplePlayer {
         self.sustain_level
     }
 
-    /// Vibrato LFO output in cents at output frame `t`. Returns 0
-    /// during the start delay and when no LFO is configured.
+    /// Raw LFO waveform (`-1.0..=1.0` sine) at output frame `t`, or 0
+    /// during the start delay / when nothing needs an LFO. When the
+    /// region defines a preset vibrato LFO its rate + delay govern;
+    /// otherwise the mixer-driven modulation (CC 1 / CA-022 LFO
+    /// destinations) runs on [`DEFAULT_DEST_LFO_HZ`] with no delay.
+    fn lfo_raw_at(&self, t: u32) -> f32 {
+        let (freq, delay) = if self.lfo_freq_hz > 0.0 {
+            (self.lfo_freq_hz, self.lfo_delay_samples)
+        } else if self.mod_depth_extra_cents != 0.0
+            || self.lfo_filter_depth_cents != 0.0
+            || self.lfo_amp_depth != 0.0
+        {
+            (DEFAULT_DEST_LFO_HZ, 0)
+        } else {
+            return 0.0;
+        };
+        if t < delay {
+            return 0.0;
+        }
+        let t_active = (t - delay) as f32 / self.output_rate.max(1.0);
+        let phase = t_active * freq * std::f32::consts::TAU;
+        phase.sin()
+    }
+
+    /// Vibrato LFO output in cents at output frame `t` — the raw LFO
+    /// scaled by the preset depth plus the mixer-driven extra depth
+    /// (CC 1 Modulation Depth / CA-022 LFO Pitch Depth).
     fn lfo_cents_at(&self, t: u32) -> f32 {
-        if self.lfo_depth_cents == 0.0 || self.lfo_freq_hz == 0.0 {
+        let depth = self.lfo_depth_cents + self.mod_depth_extra_cents;
+        if depth == 0.0 {
             return 0.0;
         }
-        if t < self.lfo_delay_samples {
-            return 0.0;
+        self.lfo_raw_at(t) * depth
+    }
+
+    /// LFO amplitude factor (tremolo) at output frame `t`, per the
+    /// CA-022 / GM2 §4.6 LFO Amplitude Depth destination: a depth of
+    /// 1.0 (= 100 %) sways the gain over `0..=1`, centred so depth 0
+    /// is exactly unity.
+    fn lfo_amp_factor_at(&self, t: u32) -> f32 {
+        if self.lfo_amp_depth == 0.0 {
+            return 1.0;
         }
-        let t_active = (t - self.lfo_delay_samples) as f32 / self.output_rate.max(1.0);
-        let phase = t_active * self.lfo_freq_hz * std::f32::consts::TAU;
-        phase.sin() * self.lfo_depth_cents
+        1.0 - self.lfo_amp_depth.clamp(0.0, 1.0) * (0.5 + 0.5 * self.lfo_raw_at(t))
     }
 
     /// Modulation-envelope (EG2) value at output frame `t`, `0..=1`.
@@ -749,15 +808,22 @@ impl SamplePlayer {
     }
 
     /// Live filter cutoff at output frame `t`, in absolute cents.
-    /// Adds the mod-env contribution and the CC 74 Brightness offset
-    /// (GM2 RP-024 §3.3.14) to the initial cutoff.
+    /// Adds the mod-env contribution, the CC 74 Brightness offset (GM2
+    /// RP-024 §3.3.14), the CA-022 Filter Cutoff Control destination
+    /// offset, and the CA-022 LFO Filter Depth sway to the initial
+    /// cutoff.
     fn live_cutoff_cents(&self, t: u32) -> i32 {
-        let base = self.initial_filter_fc_cents + self.timbre_cutoff_offset_cents;
-        if self.mod_env_to_filter_cents == 0 {
-            return base;
+        let mut cutoff = self.initial_filter_fc_cents
+            + self.timbre_cutoff_offset_cents
+            + self.dest_cutoff_offset_cents;
+        if self.mod_env_to_filter_cents != 0 {
+            let lvl = self.mod_env_at(t);
+            cutoff += (lvl * self.mod_env_to_filter_cents as f32) as i32;
         }
-        let lvl = self.mod_env_at(t);
-        base + (lvl * self.mod_env_to_filter_cents as f32) as i32
+        if self.lfo_filter_depth_cents != 0.0 {
+            cutoff += (self.lfo_raw_at(t) * self.lfo_filter_depth_cents) as i32;
+        }
+        cutoff
     }
 
     /// Linear-interpolate one frame at fractional position `phase`.
@@ -846,7 +912,10 @@ impl Voice for SamplePlayer {
             if let Some(filter) = self.filter.as_mut() {
                 s = filter.tick(s);
             }
-            *slot = s * env * self.amplitude * self.pressure_gain;
+            // CA-022 LFO Amplitude Depth (tremolo) — unity when the
+            // destination is unset, so the legacy path is untouched.
+            let trem = self.lfo_amp_factor_at(self.elapsed);
+            *slot = s * env * self.amplitude * self.pressure_gain * trem;
             self.phase += self.phase_inc;
             self.elapsed = self.elapsed.wrapping_add(1);
         }
@@ -897,6 +966,37 @@ impl Voice for SamplePlayer {
         if self.filter.is_none() && offset < 0 {
             self.filter = Some(BiquadState::new());
         }
+    }
+
+    fn set_mod_depth_cents(&mut self, cents: i32) {
+        // CC 1 Modulation Depth (GM2 RP-024 §3.3.2, cent-linear,
+        // scaled by RPN 5) + CA-022 LFO Pitch Depth — extra vibrato
+        // depth summed with the preset LFO's. Absolute, so repeated
+        // controller moves don't accumulate.
+        self.mod_depth_extra_cents = cents as f32;
+    }
+
+    fn set_filter_cutoff_mod_cents(&mut self, cents: i32) {
+        // CA-022 / GM2 §4.6 Filter Cutoff Control destination. A
+        // lowering offset on an "open" voice instantiates the biquad.
+        self.dest_cutoff_offset_cents = cents;
+        if self.filter.is_none() && cents < 0 {
+            self.filter = Some(BiquadState::new());
+        }
+    }
+
+    fn set_lfo_filter_depth_cents(&mut self, cents: i32) {
+        // CA-022 / GM2 §4.6 LFO Filter Depth destination. The sway
+        // dips below the "open" cutoff, so it needs the biquad live.
+        self.lfo_filter_depth_cents = cents.max(0) as f32;
+        if self.filter.is_none() && cents > 0 {
+            self.filter = Some(BiquadState::new());
+        }
+    }
+
+    fn set_lfo_amp_depth(&mut self, depth: f32) {
+        // CA-022 / GM2 §4.6 LFO Amplitude Depth destination (tremolo).
+        self.lfo_amp_depth = depth.clamp(0.0, 1.0);
     }
 
     fn apply_sound_controls(&mut self, controls: &SoundControls) {
@@ -1057,6 +1157,64 @@ mod tests {
             ..SoundControls::default()
         });
         assert_eq!(v2.initial_filter_q_cb, 96, "+32 steps × 3 cb = +96 cb");
+    }
+
+    #[test]
+    fn lfo_amp_depth_destination_produces_tremolo() {
+        // CA-022 / GM2 §4.6 LFO Amplitude Depth: a full-depth (100 %)
+        // tremolo sways the gain over 0..=1 at the default 5 Hz LFO.
+        let mut cfg = basic_cfg(32, SampleLoopMode::LoopContinuous);
+        cfg.envelope = EnvelopeParams {
+            delay_s: 0.0,
+            attack_s: 0.0,
+            hold_s: 10.0, // stay at peak the whole test
+            decay_s: 0.0,
+            sustain_level: 1.0,
+            release_s: 0.1,
+        };
+        let mut v = SamplePlayer::new(cfg, 44_100);
+        v.set_lfo_amp_depth(1.0);
+        // One full 5 Hz period at 44.1 kHz = 8820 samples.
+        let mut out = vec![0.0f32; 8820];
+        let n = v.render(&mut out);
+        assert_eq!(n, 8820);
+        // At sin = −1 (t = 3/4 period) the factor is 1.0; at sin = +1
+        // (t = 1/4 period) it is 0.0 — the rendered magnitude at the
+        // trough must collapse relative to the crest.
+        let crest = out[6615].abs(); // 3/4 period → factor 1.0
+        let trough = out[2205].abs(); // 1/4 period → factor 0.0
+        assert!(
+            trough < 0.05 * crest.max(1e-6),
+            "tremolo trough {trough} not ≪ crest {crest}",
+        );
+    }
+
+    #[test]
+    fn mod_depth_runs_on_default_lfo_when_region_has_no_vibrato() {
+        // CC 1 / CA-022 LFO Pitch Depth must sway pitch even when the
+        // region defines no preset vibrato LFO — the voice falls back
+        // to DEFAULT_DEST_LFO_HZ with no start delay.
+        let cfg = basic_cfg(32, SampleLoopMode::LoopContinuous);
+        let mut v = SamplePlayer::new(cfg, 44_100);
+        assert_eq!(v.lfo_cents_at(2205), 0.0, "no depth → no sway");
+        v.set_mod_depth_cents(100);
+        // Quarter period of 5 Hz at 44.1 kHz = 2205 samples → sin = 1.
+        let peak = v.lfo_cents_at(2205);
+        assert!((peak - 100.0).abs() < 1.0, "peak sway {peak} ≉ 100 cents");
+    }
+
+    #[test]
+    fn filter_cutoff_destination_instantiates_biquad_and_shifts_cutoff() {
+        // CA-022 / GM2 §4.6 Filter Cutoff Control, full negative range.
+        let cfg = basic_cfg(32, SampleLoopMode::LoopContinuous);
+        let mut v = SamplePlayer::new(cfg, 44_100);
+        assert!(v.filter.is_none());
+        v.set_filter_cutoff_mod_cents(-9600);
+        assert!(v.filter.is_some(), "lowering cutoff needs the biquad");
+        assert_eq!(v.live_cutoff_cents(0), 13_500 - 9_600);
+        // Absolute semantics: a second call replaces, not accumulates.
+        v.set_filter_cutoff_mod_cents(-1200);
+        assert_eq!(v.live_cutoff_cents(0), 13_500 - 1_200);
     }
 
     #[test]

@@ -1603,6 +1603,10 @@ pub struct Sf2Voice {
     /// [`Voice::set_timbre`]; a negative offset on an "open" filter
     /// instantiates the biquad on demand.
     timbre_cutoff_offset_cents: i32,
+    /// CA-022 / GM2 §4.6 Filter Cutoff Control destination offset, in
+    /// cents. Additive with the Brightness offset; same on-demand
+    /// biquad rule.
+    dest_cutoff_offset_cents: i32,
     /// Exclusive-class id (gen 57). Read by the mixer at `note_on` time.
     exclusive_class: u16,
     /// Output sample rate, hertz. Stashed at construction so the filter
@@ -1745,6 +1749,7 @@ impl Sf2Voice {
             initial_filter_q_cb: plan.initial_filter_q_cb,
             filter,
             timbre_cutoff_offset_cents: 0,
+            dest_cutoff_offset_cents: 0,
             exclusive_class: plan.exclusive_class,
             output_rate: sr,
         }
@@ -2093,6 +2098,7 @@ impl Voice for Sf2Voice {
                 if self.filter.is_some() {
                     let target = self.initial_filter_fc_cents
                         + self.timbre_cutoff_offset_cents
+                        + self.dest_cutoff_offset_cents
                         + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32;
                     let last = self
                         .filter
@@ -2188,6 +2194,16 @@ impl Voice for Sf2Voice {
         }
     }
 
+    fn set_filter_cutoff_mod_cents(&mut self, cents: i32) {
+        // CA-022 / GM2 §4.6 Filter Cutoff Control destination — same
+        // on-demand-biquad rule as CC 74 Brightness. (The LFO
+        // destinations are no-ops on this voice: it has no LFO.)
+        self.dest_cutoff_offset_cents = cents;
+        if self.filter.is_none() && cents < 0 {
+            self.filter = Some(BiquadState::new());
+        }
+    }
+
     fn apply_sound_controls(&mut self, controls: &super::SoundControls) {
         // GM2 RP-024 §3.3.11–§3.3.18, captured once at note-on (see
         // the trait doc). Same discretionary response curves as
@@ -2250,6 +2266,7 @@ impl Voice for Sf2Voice {
             if self.filter.is_some() {
                 let target = self.initial_filter_fc_cents
                     + self.timbre_cutoff_offset_cents
+                    + self.dest_cutoff_offset_cents
                     + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32;
                 let last = self
                     .filter

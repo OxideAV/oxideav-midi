@@ -298,6 +298,25 @@ pub struct ChannelState {
     /// send level into the system Chorus effect (CA-024, CC #93). Default
     /// 0 (fully dry).
     pub chorus_send: u8,
+    /// CA-022 / GM2 RP-024 §4.6.1 **Controller Destination Setting**
+    /// table for **Channel Pressure**: the range byte `rr` per
+    /// controlled parameter `pp` (index = `pp`, `0..6`: Pitch, Filter
+    /// Cutoff, Amplitude, LFO Pitch Depth, LFO Filter Depth, LFO
+    /// Amplitude Depth). GM2 defaults `[40H, 40H, 40H, 0, 0, 0]` = no
+    /// modification. "Only the last complete Controller Destination
+    /// Setting message received for a Channel is active."
+    pub ctrl_dest_pressure: [u8; 6],
+    /// CA-022 / GM2 §4.6.2 Controller Destination Setting source for
+    /// the **Control Change** slot: the routed controller number
+    /// (`01H–1FH` / `40H–5FH`), or `None`. Only one CC routing is
+    /// active per channel at a time.
+    pub ctrl_dest_cc: Option<u8>,
+    /// Range table for the routed Control Change (same layout as
+    /// [`Self::ctrl_dest_pressure`]).
+    pub ctrl_dest_cc_table: [u8; 6],
+    /// Most recent value of the routed Control Change (0 until the
+    /// controller first moves).
+    pub ctrl_dest_cc_value: u8,
     /// Sound Controllers CC 71–78 (RP-021 defaults; GM2 RP-024
     /// §3.3.11–§3.3.18 response semantics). All default to 64 ("no
     /// change"); non-neutral values are captured into each new voice
@@ -349,13 +368,114 @@ impl Default for ChannelState {
             mpe_role: MpeRole::None,
             reverb_send: 0,
             chorus_send: 0,
+            ctrl_dest_pressure: CTRL_DEST_DEFAULT_TABLE,
+            ctrl_dest_cc: None,
+            ctrl_dest_cc_table: CTRL_DEST_DEFAULT_TABLE,
+            ctrl_dest_cc_value: 0,
             sound_controls: SoundControls::default(),
             high_res_velocity_prefix: None,
         }
     }
 }
 
+/// GM2 default Controller Destination Setting range table (RP-024
+/// §4.6.1): Pitch `40H` (0 semitones), Filter Cutoff `40H` (0 cents),
+/// Amplitude `40H` (100 %), LFO Pitch / Filter / Amplitude Depth `0` —
+/// i.e. controllers modify nothing until a CA-022 message routes them.
+pub const CTRL_DEST_DEFAULT_TABLE: [u8; 6] = [0x40, 0x40, 0x40, 0, 0, 0];
+
+/// The combined per-channel modifications the Controller Destination
+/// Setting routings currently ask for (CA-022 / GM2 RP-024 §4.6),
+/// computed from the channel's live Channel Pressure and routed-CC
+/// values against their range tables. Per §3.7 these **sum with** the
+/// timbre's own default response (the voices' built-in pressure
+/// handling), which stays untouched.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CtrlDestMods {
+    /// `pp = 00` Pitch Control, cents (GM2: rr `28H–58H` = ±24
+    /// semitones at full controller deflection).
+    pub pitch_cents: i32,
+    /// `pp = 01` Filter Cutoff Control, cents (GM2: −9600 to +9450,
+    /// i.e. 150 cents per rr step from the `40H` centre).
+    pub cutoff_cents: i32,
+    /// `pp = 02` Amplitude Control as a linear gain factor (GM2: 0 to
+    /// (127/64) × 100 %, `40H` = 100 % = factor 1.0).
+    pub amp_factor: f32,
+    /// `pp = 03` LFO Pitch Depth, cents (GM2: 0–600).
+    pub lfo_pitch_cents: i32,
+    /// `pp = 04` LFO Filter Depth, cents (GM2: 0–2400).
+    pub lfo_filter_cents: i32,
+    /// `pp = 05` LFO Amplitude Depth, `0.0..=1.0` (GM2: 0–100 %).
+    pub lfo_amp_depth: f32,
+}
+
+impl CtrlDestMods {
+    const NEUTRAL: Self = Self {
+        pitch_cents: 0,
+        cutoff_cents: 0,
+        amp_factor: 1.0,
+        lfo_pitch_cents: 0,
+        lfo_filter_cents: 0,
+        lfo_amp_depth: 0.0,
+    };
+
+    /// Evaluate one range table at controller deflection `value`
+    /// (`0..=127`). The range byte fixes the modification at full
+    /// deflection; the controller scales it linearly.
+    fn from_table(table: &[u8; 6], value: u8) -> Self {
+        if value == 0 || *table == CTRL_DEST_DEFAULT_TABLE {
+            return Self::NEUTRAL;
+        }
+        let x = (value.min(127) as f32) / 127.0;
+        // Pitch rr is constrained to 28H..58H (±24 semitones).
+        let pitch_rr = table[0].clamp(0x28, 0x58);
+        Self {
+            pitch_cents: (x * ((pitch_rr as i32 - 0x40) * 100) as f32) as i32,
+            cutoff_cents: (x * ((table[1] as i32 - 0x40) * 150) as f32) as i32,
+            amp_factor: 1.0 + x * (table[2].min(127) as f32 / 64.0 - 1.0),
+            lfo_pitch_cents: (x * (table[3].min(127) as f32 / 127.0) * 600.0) as i32,
+            lfo_filter_cents: (x * (table[4].min(127) as f32 / 127.0) * 2400.0) as i32,
+            lfo_amp_depth: x * (table[5].min(127) as f32 / 127.0),
+        }
+    }
+
+    /// Combine two sources: additive for the pitch / cutoff / LFO
+    /// depths, multiplicative for the amplitude factors.
+    fn combine(a: Self, b: Self) -> Self {
+        Self {
+            pitch_cents: a.pitch_cents + b.pitch_cents,
+            cutoff_cents: a.cutoff_cents + b.cutoff_cents,
+            amp_factor: a.amp_factor * b.amp_factor,
+            lfo_pitch_cents: a.lfo_pitch_cents + b.lfo_pitch_cents,
+            lfo_filter_cents: a.lfo_filter_cents + b.lfo_filter_cents,
+            lfo_amp_depth: (a.lfo_amp_depth + b.lfo_amp_depth).clamp(0.0, 1.0),
+        }
+    }
+
+    fn is_neutral(&self) -> bool {
+        *self == Self::NEUTRAL
+    }
+}
+
 impl ChannelState {
+    /// The channel's current combined Controller Destination
+    /// modifications (CA-022 / GM2 RP-024 §4.6): the Channel-Pressure
+    /// routing evaluated at the live pressure, combined with the
+    /// routed-CC slot evaluated at its last value. Rhythm Channels
+    /// return neutral (GM2 §4.6 [recommended] non-response).
+    pub fn ctrl_dest_mods(&self) -> CtrlDestMods {
+        if self.rhythm {
+            return CtrlDestMods::NEUTRAL;
+        }
+        let p = CtrlDestMods::from_table(&self.ctrl_dest_pressure, self.channel_pressure);
+        if self.ctrl_dest_cc.is_some() {
+            let c = CtrlDestMods::from_table(&self.ctrl_dest_cc_table, self.ctrl_dest_cc_value);
+            CtrlDestMods::combine(p, c)
+        } else {
+            p
+        }
+    }
+
     /// MPE-aware "does a CC/PB/pressure on `event_channel` reach the
     /// voice held on `slot_channel`?" — the test compiled into
     /// `reapply_mod_wheel_for_channel` / `set_timbre`. Returns `true`
@@ -1274,6 +1394,9 @@ impl Mixer {
             total += ch_state.channel_coarse_tune_semitones as i32 * 100;
             total += master_fine_cents as i32;
             total += master_coarse_semis as i32 * 100;
+            // CA-022 / GM2 §4.6 Pitch Control destination (Channel
+            // Pressure and/or routed CC → pitch, in cents).
+            total += ch_state.ctrl_dest_mods().pitch_cents;
         }
         total
     }
@@ -1328,6 +1451,14 @@ impl Mixer {
                     voice.set_pressure(combined);
                 }
             }
+        }
+        // CA-022 / GM2 §4.6.1: when a Channel-Pressure Controller
+        // Destination Setting is active, the pressure move also drives
+        // the routed pitch / filter / LFO / amplitude modifications
+        // (they SUM with the timbre-default set_pressure response per
+        // §3.7). Skipped entirely on the default table.
+        if self.channels[ch].ctrl_dest_pressure != CTRL_DEST_DEFAULT_TABLE {
+            self.reapply_controller_destinations(channel);
         }
     }
 
@@ -1647,7 +1778,10 @@ impl Mixer {
         // affect all Sounding Notes across the Manager Channel and
         // all Member Channels"). For non-MPE channels the depth
         // routes only to that channel's own voices.
-        let depth_cents = (st.mod_wheel as i32) * (st.mod_depth_range_cents as i32) / 127;
+        // CC 1 depth (scaled by RPN 5) plus the CA-022 LFO Pitch Depth
+        // destination (GM2 §4.6) — both are LFO pitch sway, so they sum.
+        let depth_cents = (st.mod_wheel as i32) * (st.mod_depth_range_cents as i32) / 127
+            + st.ctrl_dest_mods().lfo_pitch_cents;
         for slot in self.slots.iter_mut() {
             if self.channels[slot.channel as usize % NUM_CHANNELS].matches_for_zone_broadcast(
                 slot.channel,
@@ -1733,6 +1867,99 @@ impl Mixer {
             78 => self.channels[ch].sound_controls.vibrato_delay = v,
             _ => {}
         }
+    }
+
+    // ───────────── CA-022 Controller Destination Setting (GM2 §4.6) ─────────────
+
+    /// Install a **Channel Pressure** Controller Destination Setting
+    /// (CA-022 / GM2 RP-024 §4.6.1). `pairs` is the message's `[pp
+    /// rr]` list; per CA-022 "only the last complete Controller
+    /// Destination Setting message received for a Channel is active",
+    /// so the table resets to the GM2 defaults first — an empty list
+    /// therefore restores the defaults. Unknown `pp` values (≥ 6,
+    /// reserved) are ignored. Immediately re-applies to held voices.
+    pub fn set_pressure_controller_destinations(&mut self, channel: u8, pairs: &[(u8, u8)]) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let mut table = CTRL_DEST_DEFAULT_TABLE;
+        for &(pp, rr) in pairs {
+            if let Some(slot) = table.get_mut(pp as usize) {
+                *slot = rr & 0x7F;
+            }
+        }
+        self.channels[ch].ctrl_dest_pressure = table;
+        self.reapply_controller_destinations(channel);
+    }
+
+    /// Install a **Control Change** Controller Destination Setting
+    /// (CA-022 / GM2 RP-024 §4.6.2) routing controller `cc` on
+    /// `channel`. Per CA-022 the CC number must be `01H–1FH` or
+    /// `40H–5FH` ("Any other controller number must be ignored by the
+    /// receiver") — out-of-range numbers drop the whole message. Per
+    /// §4.6.2 "the Controller Destination Setting is only active for
+    /// one controller at a time on each Channel": a new routing
+    /// replaces the previous one (whose controller thereby resets to
+    /// its default behaviour), the Channel-Pressure routing excepted.
+    /// The routed controller's live value starts at 0 until it moves.
+    pub fn set_cc_controller_destination(&mut self, channel: u8, cc: u8, pairs: &[(u8, u8)]) {
+        if !matches!(cc, 0x01..=0x1F | 0x40..=0x5F) {
+            return;
+        }
+        let ch = channel as usize % NUM_CHANNELS;
+        let mut table = CTRL_DEST_DEFAULT_TABLE;
+        for &(pp, rr) in pairs {
+            if let Some(slot) = table.get_mut(pp as usize) {
+                *slot = rr & 0x7F;
+            }
+        }
+        let st = &mut self.channels[ch];
+        if st.ctrl_dest_cc != Some(cc) {
+            st.ctrl_dest_cc_value = 0;
+        }
+        st.ctrl_dest_cc = Some(cc);
+        st.ctrl_dest_cc_table = table;
+        self.reapply_controller_destinations(channel);
+    }
+
+    /// Feed a Control Change into the CA-022 routed-CC slot: when
+    /// `controller` matches the channel's routed CC, record the value
+    /// and re-apply the destination modifications to held voices.
+    /// Called by the scheduler for every CC before its normal
+    /// dispatch; a no-op when nothing is routed.
+    pub fn update_ctrl_dest_cc(&mut self, channel: u8, controller: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        if self.channels[ch].ctrl_dest_cc == Some(controller) {
+            self.channels[ch].ctrl_dest_cc_value = value & 0x7F;
+            self.reapply_controller_destinations(channel);
+        }
+    }
+
+    /// Push the channel's current combined Controller Destination
+    /// modifications (CA-022 / GM2 §4.6) to every voice held on it:
+    /// pitch via the composed bend path, filter cutoff + LFO depths
+    /// via the dedicated voice hooks, LFO pitch depth folded into the
+    /// mod-wheel depth. The Amplitude Control factor is applied at mix
+    /// time ([`Self::mix_stereo`]) and needs no push.
+    fn reapply_controller_destinations(&mut self, channel: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        if self.channels[ch].rhythm {
+            return; // GM2 §4.6 [recommended]: Rhythm Channels don't respond.
+        }
+        let mods = self.channels[ch].ctrl_dest_mods();
+        for idx in 0..self.slots.len() {
+            if self.slots[idx].channel != channel || self.slots[idx].voice.is_none() {
+                continue;
+            }
+            // Pitch: recompute the full composed bend (which now
+            // includes the destination's pitch cents).
+            self.reapply_pitch_for_slot(idx);
+            if let Some(v) = self.slots[idx].voice.as_mut() {
+                v.set_filter_cutoff_mod_cents(mods.cutoff_cents);
+                v.set_lfo_filter_depth_cents(mods.lfo_filter_cents);
+                v.set_lfo_amp_depth(mods.lfo_amp_depth);
+            }
+        }
+        // LFO Pitch Depth folds into the mod-wheel depth path.
+        self.reapply_mod_wheel_for_channel(channel);
     }
 
     // ─────────────────────────── master tuning ───────────────────────────
@@ -2449,12 +2676,29 @@ impl Mixer {
         if pressure_byte != 0 {
             voice.set_pressure(pressure_byte as f32 / 127.0);
         }
-        // Mod-wheel depth (CC 1 scaled by RPN 5) carries to a fresh
-        // voice the same way bend does. Rhythm Channels don't respond
-        // (GM2 RP-024 §3.3.2 [recommended]).
-        let depth_cents = (st.mod_wheel as i32) * (st.mod_depth_range_cents as i32) / 127;
+        // Mod-wheel depth (CC 1 scaled by RPN 5) + the CA-022 LFO
+        // Pitch Depth destination carry to a fresh voice the same way
+        // bend does. Rhythm Channels don't respond (GM2 RP-024 §3.3.2
+        // [recommended]; ctrl_dest_mods is neutral on rhythm).
+        let dest = st.ctrl_dest_mods();
+        let depth_cents =
+            (st.mod_wheel as i32) * (st.mod_depth_range_cents as i32) / 127 + dest.lfo_pitch_cents;
         if depth_cents != 0 && !is_drum {
             voice.set_mod_depth_cents(depth_cents);
+        }
+        // CA-022 / GM2 §4.6 filter + LFO destinations reach the fresh
+        // voice too (pitch is already inside the composed bend above;
+        // amplitude applies at mix time).
+        if !dest.is_neutral() {
+            if dest.cutoff_cents != 0 {
+                voice.set_filter_cutoff_mod_cents(dest.cutoff_cents);
+            }
+            if dest.lfo_filter_cents != 0 {
+                voice.set_lfo_filter_depth_cents(dest.lfo_filter_cents);
+            }
+            if dest.lfo_amp_depth != 0.0 {
+                voice.set_lfo_amp_depth(dest.lfo_amp_depth);
+            }
         }
         // CA-031 CC 88 High-Resolution Velocity Prefix: consume a pending
         // prefix and refine the note's gain by the ratio of the 14-bit
@@ -2686,7 +2930,13 @@ impl Mixer {
             // (cc7=127 → 0 dB, 96 → −4.9 dB, 64 → −11.9 dB, 32 →
             // −23.9 dB, 16 → −36.0 dB, 0 → −∞). The note gain is 1.0
             // unless the Soft Pedal was down at strike time.
-            let vol = gm2_cc_gain(st.volume) * gm2_cc_gain(st.expression) * slot.note_gain;
+            // CA-022 / GM2 §4.6 Amplitude Control destination: a
+            // channel-wide gain factor driven by Channel Pressure /
+            // the routed CC (1.0 while unrouted).
+            let vol = gm2_cc_gain(st.volume)
+                * gm2_cc_gain(st.expression)
+                * st.ctrl_dest_mods().amp_factor
+                * slot.note_gain;
             // Constant-power pan per RP-036 (Default Pan Formula):
             //   Left  gain = cos(π/2 · max(0, CC10 − 1) / 126)
             //   Right gain = sin(π/2 · max(0, CC10 − 1) / 126)
@@ -3022,6 +3272,139 @@ mod tests {
         m.reset_all_controllers(0);
         assert_eq!(m.channel_state(0).sound_controls.release_time, 96);
         assert_eq!(m.channel_state(0).sound_controls.brightness, 20);
+    }
+
+    #[test]
+    fn ctrl_dest_table_matches_gm2_worked_example_values() {
+        // GM2 RP-024 §4.6.1 example: pitch rr 42H = +2 semitones,
+        // filter cutoff rr 60H = +4800 cents, LFO amp rr 20H = 25 %.
+        let table = [0x42u8, 0x60, 0x40, 0, 0, 0x20];
+        let m = CtrlDestMods::from_table(&table, 127);
+        assert_eq!(m.pitch_cents, 200, "42H = +2 semitones at full deflection");
+        assert_eq!(m.cutoff_cents, 4800, "60H = +4800 cents");
+        assert!((m.amp_factor - 1.0).abs() < 1e-6, "40H amplitude = 100 %");
+        assert!(
+            (m.lfo_amp_depth - 32.0 / 127.0).abs() < 1e-6,
+            "20H ≈ 25 % tremolo",
+        );
+        // Controller value scales linearly; zero deflection is neutral.
+        let half = CtrlDestMods::from_table(&table, 64);
+        assert_eq!(half.pitch_cents, 100);
+        assert!(CtrlDestMods::from_table(&table, 0).is_neutral());
+        // Default table is neutral at any deflection.
+        assert!(CtrlDestMods::from_table(&CTRL_DEST_DEFAULT_TABLE, 127).is_neutral());
+    }
+
+    #[test]
+    fn pressure_destination_pitch_control_routes_to_bend() {
+        let mut m = Mixer::new();
+        m.set_pressure_controller_destinations(0, &[(0x00, 0x42)]); // +2 semis
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        m.set_channel_pressure(0, 127);
+        assert_eq!(
+            *bend_cell.lock().unwrap(),
+            200,
+            "full pressure = +200 cents"
+        );
+        m.set_channel_pressure(0, 0);
+        assert_eq!(*bend_cell.lock().unwrap(), 0, "pressure released = centre");
+    }
+
+    #[test]
+    fn pressure_destination_amplitude_zero_mutes_at_full_pressure() {
+        // rr = 0 for Amplitude Control: full pressure scales the
+        // channel gain to 0 (GM2 range "0 - (127/64)·100 %").
+        let mut m = Mixer::new();
+        m.set_pressure_controller_destinations(0, &[(0x02, 0x00)]);
+        m.note_on(0, 60, 100, voice(0.5, 64));
+        m.set_channel_pressure(0, 127);
+        let (mut l, mut r) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        m.mix_stereo(&mut l, &mut r);
+        assert!(
+            l[0].abs() < 1e-6 && r[0].abs() < 1e-6,
+            "amp destination rr=0 at full pressure must mute, got {} {}",
+            l[0],
+            r[0],
+        );
+    }
+
+    #[test]
+    fn pressure_destination_lfo_pitch_depth_folds_into_mod_depth() {
+        let mut m = Mixer::new();
+        m.set_pressure_controller_destinations(0, &[(0x03, 127)]); // 600 cents
+        let (v, _, _, depth, _) = instrumented_voice_full(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        m.set_channel_pressure(0, 127);
+        assert_eq!(
+            *depth.lock().unwrap(),
+            600,
+            "GM2 LFO Pitch Depth max = 600 cents"
+        );
+    }
+
+    #[test]
+    fn cc_destination_routes_and_is_single_slot() {
+        let mut m = Mixer::new();
+        // Route General Purpose Controller #1 (10H) → +8 semitones.
+        m.set_cc_controller_destination(0, 0x10, &[(0x00, 0x48)]);
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        m.update_ctrl_dest_cc(0, 0x10, 127);
+        assert_eq!(*bend_cell.lock().unwrap(), 800);
+        // §4.6.2: only one CC routing per channel — a new one replaces
+        // the old (which resets to default behaviour).
+        m.set_cc_controller_destination(0, 0x11, &[(0x00, 0x48)]);
+        assert_eq!(
+            *bend_cell.lock().unwrap(),
+            0,
+            "replaced routing must drop the old CC's modification",
+        );
+        assert_eq!(m.channel_state(0).ctrl_dest_cc, Some(0x11));
+        assert_eq!(m.channel_state(0).ctrl_dest_cc_value, 0);
+    }
+
+    #[test]
+    fn cc_destination_rejects_out_of_range_controller_numbers() {
+        // CA-022: cc must be 01H–1FH or 40H–5FH.
+        let mut m = Mixer::new();
+        m.set_cc_controller_destination(0, 0x20, &[(0x00, 0x48)]);
+        assert_eq!(m.channel_state(0).ctrl_dest_cc, None);
+        m.set_cc_controller_destination(0, 0x00, &[(0x00, 0x48)]);
+        assert_eq!(m.channel_state(0).ctrl_dest_cc, None, "Bank Select barred");
+    }
+
+    #[test]
+    fn last_pressure_destination_message_wins() {
+        // CA-022: "only the last complete Controller Destination
+        // Setting message received for a Channel is active" — the new
+        // table replaces (not merges with) the old.
+        let mut m = Mixer::new();
+        m.set_pressure_controller_destinations(0, &[(0x00, 0x42)]);
+        m.set_pressure_controller_destinations(0, &[(0x02, 0x7F)]);
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(0, 60, 100, v);
+        m.set_channel_pressure(0, 127);
+        assert_eq!(
+            *bend_cell.lock().unwrap(),
+            0,
+            "pitch routing from the first message must be gone",
+        );
+        assert_eq!(
+            m.channel_state(0).ctrl_dest_pressure,
+            [0x40, 0x40, 0x7F, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn rhythm_channel_ignores_controller_destinations() {
+        // GM2 §4.6 [recommended]: Rhythm Channels shall not respond.
+        let mut m = Mixer::new();
+        m.set_pressure_controller_destinations(9, &[(0x00, 0x58)]);
+        let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
+        m.note_on(9, 36, 100, v);
+        m.set_channel_pressure(9, 127);
+        assert_eq!(*bend_cell.lock().unwrap(), 0);
     }
 
     #[test]

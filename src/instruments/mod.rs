@@ -188,6 +188,24 @@ pub trait Voice: Send {
     /// voices with nothing to scale.
     fn apply_sound_controls(&mut self, _controls: &SoundControls) {}
 
+    /// CA-022 / GM2 RP-024 §4.6 **Filter Cutoff Control** destination:
+    /// an additive filter-cutoff offset in cents (GM2 range −9600 to
+    /// +9450), driven by Channel Pressure or the routed Control Change.
+    /// Absolute (not cumulative) — the mixer recomputes and re-sends
+    /// the full offset on every controller move. Default no-op for
+    /// voices without a filter.
+    fn set_filter_cutoff_mod_cents(&mut self, _cents: i32) {}
+
+    /// CA-022 / GM2 RP-024 §4.6 **LFO Filter Depth** destination: peak
+    /// LFO-driven filter-cutoff sway in cents (GM2 range 0–2400).
+    /// Absolute; default no-op for voices without an LFO or filter.
+    fn set_lfo_filter_depth_cents(&mut self, _cents: i32) {}
+
+    /// CA-022 / GM2 RP-024 §4.6 **LFO Amplitude Depth** destination
+    /// (tremolo): `0.0..=1.0` = 0–100 % amplitude sway. Absolute;
+    /// default no-op for voices without an LFO.
+    fn set_lfo_amp_depth(&mut self, _depth: f32) {}
+
     /// `true` when this voice produces native stereo output via
     /// [`render_stereo`](Voice::render_stereo) and should bypass the
     /// mixer's mono-pan law. Default `false` — the mixer renders the

@@ -279,60 +279,67 @@ impl Scheduler {
                 // channel's Rhythm/Melody role per GM2 RP-024 §3.3.1.
                 mixer.set_program(channel, program);
             }
-            ChannelBody::ControlChange { controller, value } => match controller {
-                // CC 0 / CC 32 — Bank Select MSB / LSB (GM2 RP-024
-                // §3.3.1). Pending until the next Program Change.
-                0 => mixer.set_bank_select(channel, value, true),
-                32 => mixer.set_bank_select(channel, value, false),
-                1 => mixer.set_mod_wheel(channel, value), // CC 1 — Modulation Wheel
-                5 => mixer.set_portamento_time(channel, value), // CC 5 — Portamento Time
-                6 => mixer.set_data_entry(channel, value, true), // RPN data MSB
-                7 => mixer.channel_state_mut(channel).volume = value,
-                10 => mixer.channel_state_mut(channel).pan = value,
-                11 => mixer.channel_state_mut(channel).expression = value, // CC 11 — Expression
+            ChannelBody::ControlChange { controller, value } => {
+                // CA-022 routed-CC slot: if a Controller Destination
+                // Setting routes this controller, feed it the value
+                // (no-op otherwise). The controller keeps its normal
+                // meaning below.
+                mixer.update_ctrl_dest_cc(channel, controller, value);
+                match controller {
+                    // CC 0 / CC 32 — Bank Select MSB / LSB (GM2 RP-024
+                    // §3.3.1). Pending until the next Program Change.
+                    0 => mixer.set_bank_select(channel, value, true),
+                    32 => mixer.set_bank_select(channel, value, false),
+                    1 => mixer.set_mod_wheel(channel, value), // CC 1 — Modulation Wheel
+                    5 => mixer.set_portamento_time(channel, value), // CC 5 — Portamento Time
+                    6 => mixer.set_data_entry(channel, value, true), // RPN data MSB
+                    7 => mixer.channel_state_mut(channel).volume = value,
+                    10 => mixer.channel_state_mut(channel).pan = value,
+                    11 => mixer.channel_state_mut(channel).expression = value, // CC 11 — Expression
 
-                38 => mixer.set_data_entry(channel, value, false), // RPN data LSB
-                64 => mixer.set_sustain(channel, value),
-                65 => mixer.set_portamento(channel, value), // CC 65 — Portamento On/Off
-                66 => mixer.set_sostenuto(channel, value),  // CC 66 — Sostenuto Pedal
-                67 => mixer.set_soft_pedal(channel, value), // CC 67 — Soft Pedal
-                84 => mixer.set_portamento_control(channel, value), // CC 84 — Portamento Control
+                    38 => mixer.set_data_entry(channel, value, false), // RPN data LSB
+                    64 => mixer.set_sustain(channel, value),
+                    65 => mixer.set_portamento(channel, value), // CC 65 — Portamento On/Off
+                    66 => mixer.set_sostenuto(channel, value),  // CC 66 — Sostenuto Pedal
+                    67 => mixer.set_soft_pedal(channel, value), // CC 67 — Soft Pedal
+                    84 => mixer.set_portamento_control(channel, value), // CC 84 — Portamento Control
 
-                // CC 71–78 — Sound Controllers (RP-021 defaults; GM2
-                // RP-024 §3.3.11–§3.3.18 response). CC 74 doubles as
-                // GM2 Brightness and the MPE "third dimension"; the
-                // mixer routes it live and captures the rest at
-                // note-on.
-                71..=78 => mixer.set_sound_controller(channel, controller, value),
-                // CC 88 — High-Resolution Velocity Prefix (CA-031): lower
-                // 7 bits affixed to the next Note On / Note Off velocity.
-                88 => mixer.set_high_res_velocity_prefix(channel, value),
-                91 => mixer.channel_state_mut(channel).reverb_send = value, // CC 91 — Reverb Send (CA-024)
-                93 => mixer.channel_state_mut(channel).chorus_send = value, // CC 93 — Chorus Send (CA-024)
-                96 => mixer.data_inc_dec(channel, 1), // Data Increment (RP-018; value ignored)
-                97 => mixer.data_inc_dec(channel, -1), // Data Decrement (RP-018; value ignored)
-                100 => mixer.set_rpn_byte(channel, value, false), // RPN LSB
-                101 => mixer.set_rpn_byte(channel, value, true), // RPN MSB
-                // CC 120 = All Sound Off — immediate hard cut, ignoring
-                // the pedals.
-                120 => mixer.all_sound_off(channel),
-                121 => mixer.reset_all_controllers(channel), // CC 121 — Reset All Controllers (RP-015)
-                // CC 122 = Local Control On/Off. It connects/disconnects a
-                // device's local keyboard from its tone generator; for an
-                // internal software synth there is no local keyboard, so we
-                // recognise it as a no-op (the SMF classifier still surfaces
-                // it for sequencers that care).
-                122 => { /* Local Control — no local keyboard to gate */ }
-                // CC 123 = All Notes Off; CC 124/125 = Omni Off/On (+ all
-                // notes off); CC 126/127 = Mono/Poly On (+ all notes off).
-                // Every one of these channel-mode messages turns the
-                // channel's notes off via the normal release path per the
-                // MIDI 1.0 Channel Mode table. Omni/Mono/Poly voice-mode
-                // selection beyond the implied All-Notes-Off is not modelled
-                // (the synth is always polyphonic + omni-off).
-                123..=127 => mixer.all_notes_off_channel(channel),
-                _ => { /* other CCs not modelled */ }
-            },
+                    // CC 71–78 — Sound Controllers (RP-021 defaults; GM2
+                    // RP-024 §3.3.11–§3.3.18 response). CC 74 doubles as
+                    // GM2 Brightness and the MPE "third dimension"; the
+                    // mixer routes it live and captures the rest at
+                    // note-on.
+                    71..=78 => mixer.set_sound_controller(channel, controller, value),
+                    // CC 88 — High-Resolution Velocity Prefix (CA-031): lower
+                    // 7 bits affixed to the next Note On / Note Off velocity.
+                    88 => mixer.set_high_res_velocity_prefix(channel, value),
+                    91 => mixer.channel_state_mut(channel).reverb_send = value, // CC 91 — Reverb Send (CA-024)
+                    93 => mixer.channel_state_mut(channel).chorus_send = value, // CC 93 — Chorus Send (CA-024)
+                    96 => mixer.data_inc_dec(channel, 1), // Data Increment (RP-018; value ignored)
+                    97 => mixer.data_inc_dec(channel, -1), // Data Decrement (RP-018; value ignored)
+                    100 => mixer.set_rpn_byte(channel, value, false), // RPN LSB
+                    101 => mixer.set_rpn_byte(channel, value, true), // RPN MSB
+                    // CC 120 = All Sound Off — immediate hard cut, ignoring
+                    // the pedals.
+                    120 => mixer.all_sound_off(channel),
+                    121 => mixer.reset_all_controllers(channel), // CC 121 — Reset All Controllers (RP-015)
+                    // CC 122 = Local Control On/Off. It connects/disconnects a
+                    // device's local keyboard from its tone generator; for an
+                    // internal software synth there is no local keyboard, so we
+                    // recognise it as a no-op (the SMF classifier still surfaces
+                    // it for sequencers that care).
+                    122 => { /* Local Control — no local keyboard to gate */ }
+                    // CC 123 = All Notes Off; CC 124/125 = Omni Off/On (+ all
+                    // notes off); CC 126/127 = Mono/Poly On (+ all notes off).
+                    // Every one of these channel-mode messages turns the
+                    // channel's notes off via the normal release path per the
+                    // MIDI 1.0 Channel Mode table. Omni/Mono/Poly voice-mode
+                    // selection beyond the implied All-Notes-Off is not modelled
+                    // (the synth is always polyphonic + omni-off).
+                    123..=127 => mixer.all_notes_off_channel(channel),
+                    _ => { /* other CCs not modelled */ }
+                }
+            }
             ChannelBody::PolyAftertouch { key, pressure } => {
                 mixer.set_poly_pressure(channel, key, pressure);
             }
@@ -477,6 +484,11 @@ fn dispatch_universal_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer)
         dispatch_mts(payload, mixer, true);
         return;
     }
+    if sub_id1 == 0x09 {
+        // Controller Destination Setting (CA-022 / GM2 RP-024 §4.6).
+        dispatch_controller_destination(payload, mixer);
+        return;
+    }
     let sub_id2 = payload[3];
     if sub_id1 != 0x04 || payload.len() < 6 {
         return;
@@ -514,6 +526,53 @@ fn dispatch_universal_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer)
             mixer.set_master_coarse_tuning(payload[4], payload[5]);
         }
         _ => {}
+    }
+}
+
+/// Parse a **Controller Destination Setting** Universal Real-Time
+/// SysEx body (CA-022 / GM2 RP-024 §4.6) and install the routing in
+/// the mixer. `payload` is `7F <dev> 09 <sub2> …` (trailing F7 already
+/// stripped).
+///
+/// Wire format:
+///
+/// ```text
+/// F0 7F <dev> 09 01 0n [pp rr] … F7        Channel Pressure  (§4.6.1)
+/// F0 7F <dev> 09 02 0n [pp rr] … F7        Poly Key Pressure (CA-022)
+/// F0 7F <dev> 09 03 0n cc [pp rr] … F7     Control Change    (§4.6.2)
+/// ```
+///
+/// `pp` selects the controlled parameter (00 Pitch, 01 Filter Cutoff,
+/// 02 Amplitude, 03/04/05 LFO Pitch/Filter/Amplitude Depth), `rr` its
+/// range. Sub-ID#2 `02` (Polyphonic Key Pressure) is recognised but
+/// not routed — GM2 §4.6.1 requires only Channel Pressure, and this
+/// synth models the destination modifications channel-wide.
+fn dispatch_controller_destination(payload: &[u8], mixer: &mut crate::mixer::Mixer) {
+    // payload: [0]=7F [1]=dev [2]=09 [3]=sub2 [4]=channel …
+    if payload.len() < 5 {
+        return;
+    }
+    let sub2 = payload[3];
+    let channel = payload[4] & 0x0F;
+    let pair_bytes = match sub2 {
+        0x01 => &payload[5..],
+        0x03 => {
+            if payload.len() < 6 {
+                return;
+            }
+            &payload[6..]
+        }
+        // 0x02 Poly Key Pressure — parsed, not routed (see above).
+        _ => return,
+    };
+    let pairs: Vec<(u8, u8)> = pair_bytes
+        .chunks_exact(2)
+        .map(|c| (c[0] & 0x7F, c[1] & 0x7F))
+        .collect();
+    match sub2 {
+        0x01 => mixer.set_pressure_controller_destinations(channel, &pairs),
+        0x03 => mixer.set_cc_controller_destination(channel, payload[5] & 0x7F, &pairs),
+        _ => unreachable!(),
     }
 }
 
@@ -1105,6 +1164,52 @@ mod tests {
         v.extend_from_slice(body);
         v.push(0xF7);
         v
+    }
+
+    #[test]
+    fn controller_destination_sysex_installs_pressure_routing() {
+        // GM2 RP-024 §4.6.1 worked example — Channel Pressure on
+        // channel 06 (one-based 7) → Pitch +2 semitones, Filter
+        // Cutoff +4800 cents, LFO Amplitude Depth 25 %:
+        //   F0 7F <dev> 09 01 06 00 42 01 60 05 20 F7
+        let mut mixer = Mixer::new();
+        let data = [
+            0x7F, 0x7F, 0x09, 0x01, 0x06, 0x00, 0x42, 0x01, 0x60, 0x05, 0x20, 0xF7,
+        ];
+        dispatch_universal_sysex(&data, &mut mixer);
+        assert_eq!(
+            mixer.channel_state(6).ctrl_dest_pressure,
+            [0x42, 0x60, 0x40, 0x00, 0x00, 0x20],
+        );
+    }
+
+    #[test]
+    fn controller_destination_sysex_cc_form_installs_routed_controller() {
+        // GM2 RP-024 §4.6.2 worked example — General Purpose
+        // Controller #1 (10H) on channel 06:
+        //   F0 7F <dev> 09 03 06 10 00 42 01 60 05 20 F7
+        let mut mixer = Mixer::new();
+        let data = [
+            0x7F, 0x7F, 0x09, 0x03, 0x06, 0x10, 0x00, 0x42, 0x01, 0x60, 0x05, 0x20, 0xF7,
+        ];
+        dispatch_universal_sysex(&data, &mut mixer);
+        let st = mixer.channel_state(6);
+        assert_eq!(st.ctrl_dest_cc, Some(0x10));
+        assert_eq!(st.ctrl_dest_cc_table, [0x42, 0x60, 0x40, 0x00, 0x00, 0x20]);
+    }
+
+    #[test]
+    fn controller_destination_poly_pressure_form_is_recognised_but_not_routed() {
+        // CA-022 sub-ID#2 = 02 (Poly Key Pressure) — GM2 §4.6.1
+        // requires only Channel Pressure; the synth parses and drops.
+        let mut mixer = Mixer::new();
+        let data = [0x7F, 0x7F, 0x09, 0x02, 0x06, 0x00, 0x42, 0xF7];
+        dispatch_universal_sysex(&data, &mut mixer);
+        assert_eq!(
+            mixer.channel_state(6).ctrl_dest_pressure,
+            crate::mixer::CTRL_DEST_DEFAULT_TABLE,
+        );
+        assert_eq!(mixer.channel_state(6).ctrl_dest_cc, None);
     }
 
     #[test]
