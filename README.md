@@ -354,9 +354,15 @@ the MIDI Association *UMP Format and MIDI 2.0 Protocol* spec
   the previously-played key (CC 65 on) or an explicit CC 84 source over a
   CC 5-controlled span, advanced per render block and summed with the live
   bend. **CC 120 All Sound Off** (immediate hard cut, ignoring pedals) and
-  **CC 123-127 All Notes Off / Omni / Mono / Poly** (normal release,
-  honouring pedals) are split per the Channel Mode table; **CC 122 Local
-  Control** is a recognised no-op.
+  **CC 123-125 All Notes Off / Omni Off / Omni On** (normal release,
+  honouring pedals; the mode itself never changes — GM2 doesn't support
+  Omni) are split per the Channel Mode table; **CC 126/127 Mono / Poly
+  Mode On** implement GM2 §2.5/§3.5.6/§3.5.7 **Mode 4**: a Melody
+  Channel switches to one-note-at-a-time on CC 126 with M = 1 (any
+  other M is invalid and the message is ignored; Rhythm Channels keep
+  polyphony), each note-on releasing the previous note, and CC 127 /
+  GM reset restore Mode 3; **CC 122 Local Control** is a recognised
+  no-op.
 - `mixer` **system effects bus** — the GM2 Reverb + Chorus parameters
   (CA-024) drive a real stereo DSP send, not just decoded state.
   Per-channel **CC 91** (Reverb Send) and **CC 93** (Chorus Send)

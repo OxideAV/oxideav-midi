@@ -52,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channels muted, invalid messages inert, GM/GM2 On restoring the
   §3.1.1 initialized state. Tests pin the §2.2.1 worked-example byte
   string and its Figure-3 SP4/SP12/SP16/SP24/SP32 renderings.
+- **GM2 Mode 4 (Mono) channel mode** (§2.5/§3.5.6/§3.5.7): CC 126
+  with M = 1 switches a Melody Channel to one-note-at-a-time (new
+  note-on releases the previous note); other M values are invalid and
+  ignored; Rhythm Channels keep polyphony; CC 127 / GM reset restore
+  Mode 3.
 - **CA-019 byte-order erratum confirmed** (docs midi-errata.md E1):
   the crate's LSB-first reading of the un-annotated `ss ss` Sample
   Number matches the parent SDS convention; CA-019's own MSB-first
