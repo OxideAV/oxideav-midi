@@ -53,6 +53,20 @@ pub fn pitch_bend_to_cents(value: u16, range_cents: u16) -> i32 {
 /// Number of MIDI channels — fixed by the spec, not configurable.
 pub const NUM_CHANNELS: usize = 16;
 
+/// GM2 volume-controller response curve (RP-024 §3.3.4 / §3.3.6 /
+/// §4.1): "the square of the value is proportional to the volume", so
+/// the amplitude gain for a 7-bit controller value is `(v/127)²` —
+/// equivalently `gain[dB] = 40·log10(v/127)`. Reference points from
+/// the RP-024 §3.3.4 table: 127 → 0 dB, 96 → −4.9 dB, 64 → −11.9 dB,
+/// 32 → −23.9 dB, 16 → −36.0 dB, 0 → −∞. Applied to cc#7 (Channel
+/// Volume) and cc#11 (Expression); Master Volume uses the same law on
+/// its 14-bit scalar.
+#[inline]
+pub fn gm2_cc_gain(value: u8) -> f32 {
+    let norm = (value.min(127) as f32) / 127.0;
+    norm * norm
+}
+
 /// Gain applied to a note struck while the Soft Pedal (CC 67) is down.
 /// The MIDI 1.0 spec describes CC 67 as a switch ("≤63 off, ≥64 on")
 /// without prescribing a depth; `0.667` (≈ −3.5 dB) is a moderate
@@ -150,14 +164,17 @@ pub struct ChannelState {
     /// MIDI program (0..=127). Set by `ProgramChange`. Defaults to 0
     /// (Acoustic Grand Piano in GM).
     pub program: u8,
-    /// CC 7 (Channel Volume), 0..=127. Default 100 per GM.
+    /// CC 7 (Channel Volume), 0..=127. Default 100 per GM. Rendered
+    /// through the GM2 square-law response curve (RP-024 §3.3.4):
+    /// amplitude ∝ value², i.e. `gain[dB] = 40·log10(cc7/127)`.
     pub volume: u8,
     /// CC 11 (Expression Controller), 0..=127. Default 127 (= full /
     /// "no attenuation"). The MIDI 1.0 spec defines Expression as a
     /// *percentage of Channel Volume*: the audible gain is
-    /// `volume × expression / 127²`, so Expression lets a sequence
-    /// shape dynamics inside the headroom Volume reserves. RP-015's
-    /// Reset All Controllers restores it to 127.
+    /// `(volume/127)² × (expression/127)²` per the GM2 square-law
+    /// curve (RP-024 §3.3.6), so Expression lets a sequence shape
+    /// dynamics inside the headroom Volume reserves. RP-015's Reset
+    /// All Controllers restores it to 127.
     pub expression: u8,
     /// CC 10 (Pan), 0..=127. 64 = centre. Default 64. Rendered with the
     /// RP-036 Default Pan Formula: gains `cos`/`sin` of
@@ -1570,11 +1587,11 @@ impl Mixer {
     // ─────────────────────────── master tuning ───────────────────────────
 
     /// Master Volume (Universal Real Time SysEx `7F 7F 04 01`). The
-    /// argument is the raw 14-bit MIDI scalar (`0..=0x3FFF`), centre =
-    /// max. Applied as a multiplicative gain on every voice at mix
-    /// time, mapped linearly (`master_volume_14 / 0x3FFF`); per the
-    /// spec a *fully* loud setting is the default. Round 75 doesn't
-    /// model the GS / GM2 "scribbled-curve" non-linearity.
+    /// argument is the raw 14-bit MIDI scalar (`0..=0x3FFF`), max is
+    /// the default. Applied as a multiplicative gain on every voice at
+    /// mix time through the GM2 square-law response curve (RP-024
+    /// §4.1: "As with cc#7 and cc#11, the square of the value is
+    /// proportional to the volume") — gain = `(v/0x3FFF)²`.
     pub fn set_master_volume_14(&mut self, value: u16) {
         self.master_volume_14 = value.min(0x3FFF);
     }
@@ -2430,8 +2447,14 @@ impl Mixer {
         let mut rscratch = vec![0.0f32; left.len()];
         // Master state is mix-wide; compute once per chunk and reuse
         // — also avoids re-borrowing `self` immutably inside the
-        // `iter_mut()` loop.
-        let master = self.master_volume_14 as f32 / 0x3FFF as f32;
+        // `iter_mut()` loop. Per GM2 (RP-024 §4.1) Master Volume follows
+        // the same square-law response curve as cc#7 / cc#11: "the
+        // square of the value is proportional to the volume", i.e.
+        // gain[dB] = 40·log10(v/vmax).
+        let master = {
+            let norm = self.master_volume_14 as f32 / 0x3FFF as f32;
+            norm * norm
+        };
         let (master_bal_l, master_bal_r) = self.master_balance_gains();
 
         // --- Effects-bus activation gate. ---
@@ -2496,9 +2519,15 @@ impl Mixer {
             // Soft-Pedal (CC 67) gain captured at note-on. Expression is a
             // percentage of Channel Volume (MIDI 1.0 Control Change table),
             // so the two multiply: a full-Volume channel still dips with
-            // Expression, and Expression at 127 is transparent. The note
-            // gain is 1.0 unless the Soft Pedal was down at strike time.
-            let vol = (st.volume as f32 / 127.0) * (st.expression as f32 / 127.0) * slot.note_gain;
+            // Expression, and Expression at 127 is transparent. Per GM2
+            // (RP-024 §3.3.4 / §3.3.6) both controllers follow the
+            // square-law response curve — "the square of the value is
+            // proportional to the volume":
+            //   Gain[dB] = 40·log10(cc7/127) + 40·log10(cc11/127)
+            // (cc7=127 → 0 dB, 96 → −4.9 dB, 64 → −11.9 dB, 32 →
+            // −23.9 dB, 16 → −36.0 dB, 0 → −∞). The note gain is 1.0
+            // unless the Soft Pedal was down at strike time.
+            let vol = gm2_cc_gain(st.volume) * gm2_cc_gain(st.expression) * slot.note_gain;
             // Constant-power pan per RP-036 (Default Pan Formula):
             //   Left  gain = cos(π/2 · max(0, CC10 − 1) / 126)
             //   Right gain = sin(π/2 · max(0, CC10 − 1) / 126)
@@ -2812,9 +2841,10 @@ mod tests {
     #[test]
     fn expression_scales_channel_volume_multiplicatively() {
         // Two channels, identical voice + volume; channel 1 at half
-        // Expression should render ~half the amplitude of channel 0 at
-        // full Expression. Expression is a percentage of Channel Volume,
-        // so the gains multiply.
+        // Expression renders `(64/127)²` of the amplitude of channel 0
+        // at full Expression — Expression is a percentage of Channel
+        // Volume, the gains multiply, and each follows the GM2 RP-024
+        // §3.3.6 square-law response curve.
         let mut m = Mixer::new();
         // Hard-left pan on both so we read the left channel cleanly
         // without the constant-power pan factor muddying the ratio.
@@ -2833,8 +2863,8 @@ mod tests {
         let mut l1 = vec![0.0f32; 16];
         let mut r1 = vec![0.0f32; 16];
         m2.mix_stereo(&mut l1, &mut r1);
-        // l1 should be (64/127) of l0.
-        let expected = l0[0] * (64.0 / 127.0);
+        // l1 should be (64/127)² of l0 per the GM2 square-law curve.
+        let expected = l0[0] * (64.0 / 127.0) * (64.0 / 127.0);
         assert!(
             (l1[0] - expected).abs() < 1e-5,
             "expression-scaled {} != expected {}",
@@ -3823,16 +3853,50 @@ mod tests {
         m.mix_stereo(&mut l1, &mut r1);
         // Half master.
         m.note_on(1, 60, 100, voice(0.5, 16));
-        m.set_master_volume_14(0x2000); // ~half
+        m.set_master_volume_14(0x2000); // ~half scalar
         let mut l2 = vec![0.0; 16];
         let mut r2 = vec![0.0; 16];
         m.mix_stereo(&mut l2, &mut r2);
-        // Ratio should be ~0.5.
+        // Ratio should be ~0.25: GM2 RP-024 §4.1 applies the cc#7
+        // square-law curve to Master Volume, so a half-scale scalar is
+        // (0x2000/0x3FFF)² ≈ −12 dB in amplitude.
         let ratio = l2[0] / l1[0];
         assert!(
-            (0.40..0.60).contains(&ratio),
-            "master-volume ratio {ratio} not in 0.4..0.6",
+            (0.20..0.30).contains(&ratio),
+            "master-volume ratio {ratio} not in 0.20..0.30",
         );
+    }
+
+    #[test]
+    fn gm2_volume_curve_matches_rp024_db_reference_table() {
+        // RP-024 §3.3.4 reference points: gain[dB] = 40·log10(v/127).
+        for (cc, db) in [
+            (127u8, 0.0f32),
+            (96, -4.9),
+            (64, -11.9),
+            (32, -23.9),
+            (16, -36.0),
+        ] {
+            let gain_db = 20.0 * gm2_cc_gain(cc).log10();
+            assert!(
+                (gain_db - db).abs() < 0.05,
+                "cc7={cc}: gain {gain_db:.2} dB != RP-024 table {db} dB",
+            );
+        }
+        assert_eq!(gm2_cc_gain(0), 0.0, "cc7=0 → −∞ dB (silence)");
+    }
+
+    #[test]
+    fn gm2_volume_and_expression_curves_compose_per_rp024_table() {
+        // RP-024 §3.3.6 combined-curve rows: cc7=64 & cc11=64 →
+        // −23.8 dB; cc7=32 & cc11=96 → −28.8 dB.
+        for (cc7, cc11, db) in [(64u8, 64u8, -23.8f32), (32, 96, -28.8)] {
+            let gain_db = 20.0 * (gm2_cc_gain(cc7) * gm2_cc_gain(cc11)).log10();
+            assert!(
+                (gain_db - db).abs() < 0.05,
+                "cc7={cc7} cc11={cc11}: {gain_db:.2} dB != RP-024 table {db} dB",
+            );
+        }
     }
 
     #[test]
