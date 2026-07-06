@@ -4136,43 +4136,7 @@ impl UniversalSysExEvent {
             return None;
         }
         // <realm=7F> <device_id> <sub_id1=0B> <sub_id2=01> {cc vv}… [F7]
-        let mut entries: Vec<MipEntry> = Vec::new();
-        let mut seen = [false; 16];
-        let mut prev: Option<u8> = None;
-        let mut idx = 4;
-        while let Some(&cc) = self.data.get(idx) {
-            if cc == 0xF7 {
-                break; // end-of-exclusive terminates the pair list
-            }
-            let vv = *self.data.get(idx + 1)?; // dangling cc → None
-            if vv == 0xF7 {
-                return None; // pair truncated by EOX
-            }
-            // RP-034 §3.1.3 validity: ≤ 16 pairs, no repeated channel,
-            // non-decreasing MIP values; §3.3: MIP 0 is reserved. A
-            // channel byte above 0x0F addresses no supported channel.
-            if cc > 0x0F || entries.len() >= 16 {
-                return None;
-            }
-            if seen[cc as usize] {
-                return None;
-            }
-            let vv = vv & 0x7F;
-            if vv == 0 {
-                return None;
-            }
-            if prev.is_some_and(|p| vv < p) {
-                return None;
-            }
-            seen[cc as usize] = true;
-            prev = Some(vv);
-            entries.push(MipEntry {
-                channel: cc,
-                cumulative_polyphony: vv,
-            });
-            idx += 2;
-        }
-        Some(ScalablePolyphonyMip { entries })
+        ScalablePolyphonyMip::parse_pairs(self.data.get(4..)?)
     }
 
     /// Decode this packet as a **Sample Dump Extensions** message
@@ -5347,6 +5311,53 @@ pub struct ScalablePolyphonyMip {
 }
 
 impl ScalablePolyphonyMip {
+    /// Parse the `{cc vv}` pair region of a MIP message body (the
+    /// bytes after `F0 7F <dev> 0B 01`, with or without the trailing
+    /// `F7`), enforcing the RP-034 §3.1.3 / §3.3 validity rules: at
+    /// most 16 pairs, no repeated channel, non-decreasing MIP values,
+    /// channel bytes within `0x00..=0x0F`, no reserved MIP value 0,
+    /// and no dangling channel byte. Shared by the SMF decoder and the
+    /// synth scheduler's live SysEx dispatch.
+    pub fn parse_pairs(bytes: &[u8]) -> Option<Self> {
+        let mut entries: Vec<MipEntry> = Vec::new();
+        let mut seen = [false; 16];
+        let mut prev: Option<u8> = None;
+        let mut idx = 0;
+        while let Some(&cc) = bytes.get(idx) {
+            if cc == 0xF7 {
+                break; // end-of-exclusive terminates the pair list
+            }
+            let vv = *bytes.get(idx + 1)?; // dangling cc → None
+            if vv == 0xF7 {
+                return None; // pair truncated by EOX
+            }
+            // RP-034 §3.1.3 validity: ≤ 16 pairs, no repeated channel,
+            // non-decreasing MIP values; §3.3: MIP 0 is reserved. A
+            // channel byte above 0x0F addresses no supported channel.
+            if cc > 0x0F || entries.len() >= 16 {
+                return None;
+            }
+            if seen[cc as usize] {
+                return None;
+            }
+            let vv = vv & 0x7F;
+            if vv == 0 {
+                return None;
+            }
+            if prev.is_some_and(|p| vv < p) {
+                return None;
+            }
+            seen[cc as usize] = true;
+            prev = Some(vv);
+            entries.push(MipEntry {
+                channel: cc,
+                cumulative_polyphony: vv,
+            });
+            idx += 2;
+        }
+        Some(Self { entries })
+    }
+
     /// The Channel Priority order (RP-034 §2.2): 0-based channel
     /// numbers, highest priority first.
     pub fn channel_priority(&self) -> Vec<u8> {

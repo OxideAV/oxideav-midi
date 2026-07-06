@@ -1091,6 +1091,21 @@ pub struct Mixer {
     /// 0..=0x3FFF). Default = 0x3FFF (= unity). Applied at mix time as
     /// an additional global gain factor on every voice.
     master_volume_14: u16,
+    /// SP-MIDI (RP-034 §3.3) device **Polyphony Level** — the "SPn"
+    /// note budget Channel Masking evaluates MIP tables against.
+    /// `None` (the default) means "not configured as an SP-MIDI
+    /// device": MIP messages are recorded but mask nothing, matching
+    /// RP-034 §3.1.1's initialized state where every MIP table entry
+    /// equals the device's maximum polyphony.
+    sp_midi_polyphony: Option<u8>,
+    /// The last **valid** MIP message received (RP-034 §3.1.3 — an
+    /// invalid message leaves the previous table in force). Kept so a
+    /// later [`Mixer::set_sp_midi_polyphony`] can re-evaluate the mask.
+    sp_midi_mip: Option<crate::smf::ScalablePolyphonyMip>,
+    /// Live channel mask per RP-034 §2.2 Figure 1: `true` = masked
+    /// (muted). All-false until both a Polyphony Level and a MIP
+    /// message are present.
+    channel_masked: [bool; NUM_CHANNELS],
     /// Master Balance (Universal Real Time SysEx `7F 7F 04 02`, 14-bit
     /// 0..=0x3FFF). Per the MIDI 1.0 Detailed Specification §"DEVICE
     /// CONTROL — MASTER VOLUME AND MASTER BALANCE" (M1 v4.2.1 p.57):
@@ -1157,6 +1172,9 @@ impl Mixer {
             next_age: 1,
             mix_gain: 0.5,
             master_volume_14: 0x3FFF,
+            sp_midi_polyphony: None,
+            sp_midi_mip: None,
+            channel_masked: [false; NUM_CHANNELS],
             master_balance_14: 0x2000,
             master_fine_tune_cents: 0,
             master_coarse_tune_semitones: 0,
@@ -1257,6 +1275,70 @@ impl Mixer {
             st.rhythm = idx == 9;
             st.program = 0;
         }
+    }
+
+    // ──────────────── SP-MIDI channel masking (RP-034 / RP-035) ────────────────
+
+    /// Configure the device's SP-MIDI **Polyphony Level** (RP-034
+    /// §3.3, the "SPn" note budget: 1–127) — or `None` to stop acting
+    /// as an SP-MIDI device. When a MIP table is already in force the
+    /// channel mask is re-evaluated against the new budget
+    /// immediately, muting the voices of any newly-masked channel.
+    pub fn set_sp_midi_polyphony(&mut self, level: Option<u8>) {
+        self.sp_midi_polyphony = level.map(|l| l.clamp(1, 127));
+        self.recompute_sp_midi_mask();
+    }
+
+    /// The configured SP-MIDI Polyphony Level, if any.
+    pub fn sp_midi_polyphony(&self) -> Option<u8> {
+        self.sp_midi_polyphony
+    }
+
+    /// Apply a decoded (and therefore RP-034 §3.1.3-valid) **MIP
+    /// message**. Recorded as the device's current MIP + Channel
+    /// Priority table and — when a Polyphony Level is configured —
+    /// evaluated through the §2.2 Figure 1 Channel Masking Algorithm
+    /// "each time the MIP message is received" (§3.1.3). Voices
+    /// sounding on a newly-masked channel are cut immediately (masked
+    /// = muted state, §2.2).
+    pub fn apply_mip_message(&mut self, mip: crate::smf::ScalablePolyphonyMip) {
+        self.sp_midi_mip = Some(mip);
+        self.recompute_sp_midi_mask();
+    }
+
+    /// `true` while `channel` is masked (muted) by SP-MIDI Channel
+    /// Masking — its note-ons are filtered out per RP-034 §2.3.
+    pub fn sp_midi_channel_masked(&self, channel: u8) -> bool {
+        self.channel_masked[channel as usize % NUM_CHANNELS]
+    }
+
+    /// Reset the SP-MIDI MIP / Channel tables to the initialized state
+    /// (RP-034 §3.1.1–§3.1.2: on device reset every channel plays; the
+    /// configured Polyphony Level itself is a device property and
+    /// survives). Called by the GM/GM2 System-On reset path.
+    pub fn reset_sp_midi_tables(&mut self) {
+        self.sp_midi_mip = None;
+        self.channel_masked = [false; NUM_CHANNELS];
+    }
+
+    /// Re-run the RP-034 §2.2 Figure 1 masking algorithm against the
+    /// stored MIP table + Polyphony Level, cutting voices on channels
+    /// that just became masked.
+    fn recompute_sp_midi_mask(&mut self) {
+        let new_mask = match (self.sp_midi_polyphony, &self.sp_midi_mip) {
+            (Some(poly), Some(mip)) => mip.masked_channels(poly),
+            // §3.1.1 initialized state / non-SP-MIDI device: nothing
+            // is masked.
+            _ => [false; NUM_CHANNELS],
+        };
+        for ch in 0..NUM_CHANNELS as u8 {
+            if new_mask[ch as usize] && !self.channel_masked[ch as usize] {
+                // Newly masked → the channel enters the muted state
+                // (RP-034 §2.2): cut its sounding voices outright.
+                self.all_sound_off(ch);
+            }
+        }
+        self.channel_masked = new_mask;
     }
 
     /// Apply a pitch-bend event. `value` is the raw 14-bit MIDI scalar
@@ -2585,6 +2667,12 @@ impl Mixer {
     /// inserted (SF2 generator 57 — drum kits use this for hi-hat
     /// open/closed pairs).
     pub fn note_on(&mut self, channel: u8, key: u8, velocity: u8, mut voice: Box<dyn Voice>) {
+        // SP-MIDI Channel Masking (RP-034 §2.2 / §2.3): a masked
+        // channel is muted — its note-ons are filtered out before they
+        // reach the sound module.
+        if self.channel_masked[channel as usize % NUM_CHANNELS] {
+            return;
+        }
         // Exclusive-class cut: drop every prior voice on this channel
         // with the same non-zero class id. Done before allocating the
         // new slot so the freed slot is preferred by `pick_slot`.
@@ -3405,6 +3493,99 @@ mod tests {
         m.note_on(9, 36, 100, v);
         m.set_channel_pressure(9, 127);
         assert_eq!(*bend_cell.lock().unwrap(), 0);
+    }
+
+    /// RP-034 §2.2.1 worked-example pair bytes (after `F0 7F 7F 0B 01`,
+    /// before `F7`).
+    const RP034_PAIRS: [u8; 32] = [
+        0x00, 0x04, 0x09, 0x09, 0x01, 0x0A, 0x02, 0x0C, 0x03, 0x0C, 0x0A, 0x10, 0x04, 0x11, 0x08,
+        0x14, 0x05, 0x1A, 0x07, 0x1A, 0x06, 0x1A, 0x0B, 0x1A, 0x0C, 0x1A, 0x0D, 0x1A, 0x0E, 0x1A,
+        0x0F, 0x1A,
+    ];
+
+    fn rp034_example_mip() -> crate::smf::ScalablePolyphonyMip {
+        crate::smf::ScalablePolyphonyMip::parse_pairs(&RP034_PAIRS).unwrap()
+    }
+
+    #[test]
+    fn sp_midi_masking_filters_note_ons_per_polyphony_level() {
+        // RP-034 §2.2.1 / Figure 3: an SP16 device plays only channels
+        // 1–4 and 10–11 (0-based 0–3, 9–10) of the worked example.
+        let mut m = Mixer::new();
+        m.set_sp_midi_polyphony(Some(16));
+        m.apply_mip_message(rp034_example_mip());
+        assert!(!m.sp_midi_channel_masked(0));
+        assert!(m.sp_midi_channel_masked(4), "ch5 (MIP 17) > SP16");
+        m.note_on(4, 60, 100, voice(0.5, 64));
+        assert_eq!(m.live_voice_count(), 0, "masked channel filters note-ons");
+        m.note_on(0, 60, 100, voice(0.5, 64));
+        assert_eq!(m.live_voice_count(), 1, "unmasked channel still plays");
+    }
+
+    #[test]
+    fn sp_midi_mip_arrival_cuts_sounding_voices_on_masked_channels() {
+        let mut m = Mixer::new();
+        m.set_sp_midi_polyphony(Some(4));
+        m.note_on(4, 60, 100, voice(0.5, 4096));
+        assert_eq!(m.live_voice_count(), 1);
+        // The MIP arrives mid-note: SP4 keeps only channel 1 → the
+        // channel-5 voice enters the muted state (RP-034 §2.2).
+        m.apply_mip_message(rp034_example_mip());
+        assert_eq!(m.live_voice_count(), 0, "newly-masked channel must mute");
+    }
+
+    #[test]
+    fn sp_midi_mip_without_polyphony_level_masks_nothing() {
+        // RP-034 §3.1.1: a device not constrained by a Polyphony Level
+        // behaves as if every MIP entry equalled its maximum.
+        let mut m = Mixer::new();
+        m.apply_mip_message(rp034_example_mip());
+        for ch in 0..NUM_CHANNELS as u8 {
+            assert!(!m.sp_midi_channel_masked(ch));
+        }
+        m.note_on(4, 60, 100, voice(0.5, 64));
+        assert_eq!(m.live_voice_count(), 1);
+    }
+
+    #[test]
+    fn sp_midi_polyphony_change_reevaluates_stored_mip() {
+        let mut m = Mixer::new();
+        m.apply_mip_message(rp034_example_mip());
+        m.set_sp_midi_polyphony(Some(12));
+        // §2.2: a 12-note device plays channels 1–4 and 10 (0-based
+        // 0–3 and 9).
+        let unmasked: Vec<u8> = (0..16).filter(|&c| !m.sp_midi_channel_masked(c)).collect();
+        assert_eq!(unmasked, vec![0, 1, 2, 3, 9]);
+        // Widening the budget un-mutes.
+        m.set_sp_midi_polyphony(Some(32));
+        assert!((0..16).all(|c| !m.sp_midi_channel_masked(c)));
+    }
+
+    #[test]
+    fn sp_midi_unlisted_channels_are_masked() {
+        // RP-034 §2.2: channels absent from the MIP message are muted.
+        let mut m = Mixer::new();
+        m.set_sp_midi_polyphony(Some(8));
+        let mip = crate::smf::ScalablePolyphonyMip::parse_pairs(&[0x00, 0x04]).unwrap();
+        m.apply_mip_message(mip);
+        assert!(!m.sp_midi_channel_masked(0));
+        for ch in 1..NUM_CHANNELS as u8 {
+            assert!(m.sp_midi_channel_masked(ch), "ch{} must be masked", ch + 1);
+        }
+    }
+
+    #[test]
+    fn sp_midi_reset_tables_restores_initialized_state() {
+        // RP-034 §3.1.2: device reset → §3.1.1 initialized state (all
+        // channels play); the Polyphony Level is a device property and
+        // survives.
+        let mut m = Mixer::new();
+        m.set_sp_midi_polyphony(Some(4));
+        m.apply_mip_message(rp034_example_mip());
+        assert!(m.sp_midi_channel_masked(4));
+        m.reset_sp_midi_tables();
+        assert!((0..16).all(|c| !m.sp_midi_channel_masked(c)));
+        assert_eq!(m.sp_midi_polyphony(), Some(4));
     }
 
     #[test]

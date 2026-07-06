@@ -461,6 +461,7 @@ fn dispatch_universal_non_real_time(payload: &[u8], mixer: &mut crate::mixer::Mi
         mixer.reset_tuning(); // back to equal temperament
         mixer.reset_gm_effects(); // GM2 reverb/chorus defaults (CA-024)
         mixer.reset_gm_banks(); // GM2 bank/role defaults (RP-024 §3.3.1)
+        mixer.reset_sp_midi_tables(); // SP-MIDI initialized state (RP-034 §3.1.2)
     } else if sub_id1 == 0x08 {
         // MIDI Tuning Standard. The non-real-time area carries the
         // single-note tuning bank form (07) and the non-real-time
@@ -487,6 +488,20 @@ fn dispatch_universal_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer)
     if sub_id1 == 0x09 {
         // Controller Destination Setting (CA-022 / GM2 RP-024 §4.6).
         dispatch_controller_destination(payload, mixer);
+        return;
+    }
+    if sub_id1 == 0x0B {
+        // Scalable Polyphony MIDI MIP message (RP-034 §2.1): F0 7F
+        // <dev> 0B 01 {cc vv}… F7. The shared parser enforces the
+        // §3.1.3 validity rules; an invalid message is discarded and
+        // the previous MIP table stays in force.
+        if payload.get(3) == Some(&0x01) {
+            if let Some(mip) =
+                crate::smf::ScalablePolyphonyMip::parse_pairs(payload.get(4..).unwrap_or(&[]))
+            {
+                mixer.apply_mip_message(mip);
+            }
+        }
         return;
     }
     let sub_id2 = payload[3];
@@ -1210,6 +1225,68 @@ mod tests {
             crate::mixer::CTRL_DEST_DEFAULT_TABLE,
         );
         assert_eq!(mixer.channel_state(6).ctrl_dest_cc, None);
+    }
+
+    #[test]
+    fn mip_sysex_routes_into_channel_masking() {
+        // RP-034 §2.2.1 worked-example message on an SP4 device: only
+        // channel 1 (0-based 0) survives.
+        let mut mixer = Mixer::new();
+        mixer.set_sp_midi_polyphony(Some(4));
+        let mut data = vec![0x7F, 0x7F, 0x0B, 0x01];
+        data.extend_from_slice(&[
+            0x00, 0x04, 0x09, 0x09, 0x01, 0x0A, 0x02, 0x0C, 0x03, 0x0C, 0x0A, 0x10, 0x04, 0x11,
+            0x08, 0x14, 0x05, 0x1A, 0x07, 0x1A, 0x06, 0x1A, 0x0B, 0x1A, 0x0C, 0x1A, 0x0D, 0x1A,
+            0x0E, 0x1A, 0x0F, 0x1A,
+        ]);
+        data.push(0xF7);
+        dispatch_universal_sysex(&data, &mut mixer);
+        assert!(!mixer.sp_midi_channel_masked(0));
+        for ch in 1..16 {
+            assert!(mixer.sp_midi_channel_masked(ch), "ch{} vs SP4", ch + 1);
+        }
+    }
+
+    #[test]
+    fn invalid_mip_sysex_keeps_previous_table() {
+        // RP-034 §3.1.3: an invalid message (here: decreasing MIP
+        // values) is discarded — the previous mask stays in force.
+        let mut mixer = Mixer::new();
+        mixer.set_sp_midi_polyphony(Some(8));
+        dispatch_universal_sysex(
+            &[0x7F, 0x7F, 0x0B, 0x01, 0x00, 0x04, 0x01, 0x08, 0xF7],
+            &mut mixer,
+        );
+        assert!(!mixer.sp_midi_channel_masked(1), "ch2 fits SP8");
+        dispatch_universal_sysex(
+            &[0x7F, 0x7F, 0x0B, 0x01, 0x00, 0x08, 0x01, 0x04, 0xF7],
+            &mut mixer,
+        );
+        assert!(
+            !mixer.sp_midi_channel_masked(1),
+            "invalid MIP must not disturb the mask",
+        );
+        assert!(
+            mixer.sp_midi_channel_masked(2),
+            "previous table still masks ch3"
+        );
+    }
+
+    #[test]
+    fn gm_system_on_resets_sp_midi_tables() {
+        // RP-034 §3.1.2: the profile's reset message (GM2 System On
+        // for a GM2-based profile, RP-035 §3.2) restores the
+        // initialized state.
+        let mut mixer = Mixer::new();
+        mixer.set_sp_midi_polyphony(Some(4));
+        dispatch_universal_sysex(
+            &[0x7F, 0x7F, 0x0B, 0x01, 0x00, 0x04, 0x01, 0x08, 0xF7],
+            &mut mixer,
+        );
+        assert!(mixer.sp_midi_channel_masked(1));
+        dispatch_universal_sysex(&[0x7E, 0x7F, 0x09, 0x03, 0xF7], &mut mixer); // GM2 System On
+        assert!(!mixer.sp_midi_channel_masked(1));
+        assert_eq!(mixer.sp_midi_polyphony(), Some(4), "SPn survives reset");
     }
 
     #[test]
