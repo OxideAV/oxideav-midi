@@ -1324,6 +1324,25 @@ impl Mixer {
         self.channels[channel as usize % NUM_CHANNELS].rhythm
     }
 
+    /// The active GM2 drum set on `channel`, or `None` when the channel
+    /// is a Melody Channel. A Rhythm Channel selects one of the nine
+    /// GM2 Percussion Sound Sets (Bank 78H/00H) by its current Program
+    /// Change; an undefined program resolves to the STANDARD Set (§2.5).
+    pub fn active_drum_set(&self, channel: u8) -> Option<crate::instruments::percussion::DrumSet> {
+        let st = &self.channels[channel as usize % NUM_CHANNELS];
+        st.rhythm
+            .then(|| crate::instruments::percussion::DrumSet::from_program(st.program))
+    }
+
+    /// Resolve `key` to its Appendix-B percussion instrument name in the
+    /// drum set active on `channel`. `None` when `channel` is a Melody
+    /// Channel or the key does not sound in the active set.
+    pub fn drum_key_name(&self, channel: u8, key: u8) -> Option<&'static str> {
+        self.active_drum_set(channel)
+            .and_then(|set| set.key(key))
+            .map(|k| k.name)
+    }
+
     /// Reset every channel's Bank Select + role state to the GM2
     /// defaults (RP-024 §3.3.1: `79H/00H` everywhere except Channel 10
     /// = `78H/00H`; §2.4: only Channel 10 boots as Rhythm). Called by
@@ -4379,6 +4398,26 @@ mod tests {
         let mut r = vec![0.0f32; 16];
         m.mix_stereo(&mut l, &mut r);
         assert_eq!(m.live_voice_count(), 1);
+    }
+
+    #[test]
+    fn active_drum_set_reflects_program_and_role() {
+        use crate::instruments::percussion::DrumSet;
+        let mut m = Mixer::new();
+        // Channel 10 boots as a Rhythm Channel in the STANDARD Set.
+        assert_eq!(m.active_drum_set(9), Some(DrumSet::Standard));
+        assert_eq!(m.drum_key_name(9, 42), Some("Closed Hi-hat"));
+        // Melody Channels report no drum set.
+        assert_eq!(m.active_drum_set(0), None);
+        assert_eq!(m.drum_key_name(0, 42), None);
+        // Select the ORCHESTRA Set via Bank 78H/00H + Program.
+        m.set_bank_select(9, 0x78, true);
+        m.set_bank_select(9, 0x00, false);
+        m.set_program(9, 0x30);
+        assert_eq!(m.active_drum_set(9), Some(DrumSet::Orchestra));
+        assert_eq!(m.drum_key_name(9, 41), Some("Timpani F"));
+        // A key that does not sound resolves to no name.
+        assert_eq!(m.drum_key_name(9, 0), None);
     }
 
     #[test]
