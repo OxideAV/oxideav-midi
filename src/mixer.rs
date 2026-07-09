@@ -2847,6 +2847,29 @@ impl Mixer {
         let ch = channel as usize % NUM_CHANNELS;
         let st = self.channels[ch];
         let is_drum = st.rhythm;
+        // GM2 §2.8.1 Rhythm-Channel mutually-exclusive Note groups: on a
+        // Rhythm Channel the active drum set (Bank 78H/00H → Program)
+        // may place this key in an EXC group (e.g. the open/closed/pedal
+        // hi-hats). Striking a member promptly mutes any sounding member
+        // of the *same* group before the new note sounds — the classic
+        // hi-hat "choke". This is data-driven from the GM2 Percussion
+        // Sound Set by note number, independent of (and in addition to)
+        // any SF2 exclusive-class the loaded voice may declare.
+        if is_drum {
+            let set = crate::instruments::percussion::DrumSet::from_program(st.program);
+            if let Some(group) = set.exc_group(key) {
+                for slot in self.slots.iter_mut() {
+                    if slot.channel == channel
+                        && slot.voice.is_some()
+                        && set.exc_group(slot.key) == Some(group)
+                    {
+                        slot.voice = None;
+                        slot.sustained = false;
+                        slot.glide_remaining_samples = 0;
+                    }
+                }
+            }
+        }
         // Key-Based Instrument Controllers (CA-023 / GM2 §4.8) apply
         // to Rhythm-Channel notes only (GM2 recommends Melody Channels
         // not respond).
@@ -3954,6 +3977,54 @@ mod tests {
         m.note_on(9, 38, 100, voice(0.5, 4096));
         let (mut l, mut r) = (vec![0.0f32; 16], vec![0.0f32; 16]);
         assert_eq!(m.mix_stereo(&mut l, &mut r), 2, "drums stay polyphonic");
+    }
+
+    #[test]
+    fn rhythm_exc_group_hi_hat_choke() {
+        // GM2 §2.8.1: a Note On for a member of an EXC group promptly
+        // mutes any sounding member of the same group. Channel 10
+        // (index 9) boots as a Rhythm Channel in the STANDARD Set, where
+        // Notes 42/44/46 (Closed/Pedal/Open Hi-hat) share EXC1.
+        let mut m = Mixer::new();
+        assert!(m.is_rhythm_channel(9));
+        // Open Hi-hat rings on a long voice.
+        m.note_on(9, 46, 100, voice(0.5, 4096));
+        assert_eq!(m.live_voice_count(), 1);
+        // Closed Hi-hat in the same group must choke the open one.
+        m.note_on(9, 42, 100, voice(0.5, 4096));
+        assert_eq!(
+            m.live_voice_count(),
+            1,
+            "closed hi-hat must mute the sounding open hi-hat",
+        );
+    }
+
+    #[test]
+    fn rhythm_exc_group_spares_other_groups() {
+        // A note outside the incoming note's EXC group is untouched: the
+        // hi-hat choke must not silence an unrelated drum.
+        let mut m = Mixer::new();
+        m.note_on(9, 46, 100, voice(0.5, 4096)); // Open Hi-hat (EXC1)
+        m.note_on(9, 36, 100, voice(0.5, 4096)); // Bass Drum 1 (no group)
+        assert_eq!(m.live_voice_count(), 2);
+        // Closed Hi-hat chokes only the open hi-hat, leaving the kick.
+        m.note_on(9, 42, 100, voice(0.5, 4096));
+        assert_eq!(
+            m.live_voice_count(),
+            2,
+            "kick survives; only the open hi-hat is choked",
+        );
+    }
+
+    #[test]
+    fn rhythm_exc_group_absent_on_melody_channel() {
+        // The EXC choke is a Rhythm-Channel behaviour; a Melody Channel
+        // sounding the same note numbers keeps both voices.
+        let mut m = Mixer::new();
+        assert!(!m.is_rhythm_channel(0));
+        m.note_on(0, 46, 100, voice(0.5, 4096));
+        m.note_on(0, 42, 100, voice(0.5, 4096));
+        assert_eq!(m.live_voice_count(), 2, "melody channel: no drum choke");
     }
 
     #[test]
