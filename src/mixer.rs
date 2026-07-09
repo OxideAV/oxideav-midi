@@ -3048,8 +3048,21 @@ impl Mixer {
         // channel's pending High-Resolution Velocity Prefix (the release
         // velocity is not modelled as a gain, so the prefix simply
         // expires here, matching the "no effect on 9n kk 00" rule).
-        self.channels[channel as usize % NUM_CHANNELS].high_res_velocity_prefix = None;
-        let sustain = self.channels[channel as usize % NUM_CHANNELS].sustain;
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].high_res_velocity_prefix = None;
+        // GM2 §2.8.1: on a Rhythm Channel a Note Off is *ignored* — the
+        // percussion sound is a one-shot that rings out on its own —
+        // except the ORCHESTRA Set's Note 88 (Applause) and the SFX
+        // Set's Notes 47–84, which do honour Note Off. The still-received
+        // Note Off byte already cleared the CA-031 prefix above.
+        if self.channels[ch].rhythm {
+            let set =
+                crate::instruments::percussion::DrumSet::from_program(self.channels[ch].program);
+            if !set.honors_note_off(key) {
+                return;
+            }
+        }
+        let sustain = self.channels[ch].sustain;
         for slot in self.slots.iter_mut() {
             if slot.channel == channel && slot.key == key {
                 if let Some(v) = slot.voice.as_mut() {
@@ -4354,6 +4367,73 @@ mod tests {
         let mut r = vec![0.0f32; 16];
         m.mix_stereo(&mut l, &mut r);
         assert_eq!(m.live_voice_count(), 1);
+    }
+
+    #[test]
+    fn rhythm_channel_ignores_note_off() {
+        // GM2 §2.8.1: a Note Off on a Rhythm Channel is ignored — the
+        // drum voice rings out on its own. The ConstVoice double would
+        // finish immediately on release(), so if the release were
+        // honoured the voice would vanish; it must survive.
+        let mut m = Mixer::new();
+        assert!(m.is_rhythm_channel(9)); // STANDARD Set default
+        m.note_on(9, 38, 100, voice(0.5, 1024)); // Acoustic Snare
+        m.note_off(9, 38);
+        let mut l = vec![0.0f32; 16];
+        let mut r = vec![0.0f32; 16];
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(
+            m.live_voice_count(),
+            1,
+            "rhythm-channel note-off must not release the drum voice",
+        );
+    }
+
+    #[test]
+    fn sfx_set_honors_note_off_in_range() {
+        // §2.8.1: the SFX Set (PC #57) honours Note Off on Notes 47–84.
+        let mut m = Mixer::new();
+        m.set_bank_select(9, 0x78, true);
+        m.set_bank_select(9, 0x00, false);
+        m.set_program(9, 0x38); // SFX Set
+        assert!(m.is_rhythm_channel(9));
+        // Note 68 (Train) is in 47–84 → Note Off releases.
+        m.note_on(9, 68, 100, voice(0.5, 1024));
+        m.note_off(9, 68);
+        let mut l = vec![0.0f32; 16];
+        let mut r = vec![0.0f32; 16];
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 0, "SFX 47–84 honour Note Off");
+        // Note 41 (Scratch Push) is below the range → Note Off ignored.
+        m.note_on(9, 41, 100, voice(0.5, 1024));
+        m.note_off(9, 41);
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 1, "SFX 39–46 ignore Note Off");
+    }
+
+    #[test]
+    fn orchestra_set_honors_note_off_only_on_88() {
+        // §2.8.1: the ORCHESTRA Set (PC #49) honours Note Off on Note 88
+        // (Applause) only.
+        let mut m = Mixer::new();
+        m.set_bank_select(9, 0x78, true);
+        m.set_bank_select(9, 0x00, false);
+        m.set_program(9, 0x30); // ORCHESTRA Set
+        m.note_on(9, 88, 100, voice(0.5, 1024)); // Applause
+        m.note_off(9, 88);
+        let mut l = vec![0.0f32; 16];
+        let mut r = vec![0.0f32; 16];
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 0, "ORCHESTRA 88 honours Note Off");
+        // A Timpani key ignores Note Off.
+        m.note_on(9, 41, 100, voice(0.5, 1024)); // Timpani F
+        m.note_off(9, 41);
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(
+            m.live_voice_count(),
+            1,
+            "ORCHESTRA timpani ignores Note Off"
+        );
     }
 
     #[test]
