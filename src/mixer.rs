@@ -2878,6 +2878,18 @@ impl Mixer {
         } else {
             None
         };
+        // GM2 Percussion Sound Set recommended preset pan (Appendix B,
+        // §3.3.5): each percussion sound has a per-key base pan position
+        // that the channel's CC 10 then *offsets*. Used as the note's
+        // base pan on a Rhythm Channel when no CA-023 Key-Based Pan
+        // overrides it; Melody Channels keep the plain channel pan.
+        let drum_preset_pan = if is_drum {
+            crate::instruments::percussion::DrumSet::from_program(st.program)
+                .key(key)
+                .map(|k| k.pan)
+        } else {
+            None
+        };
         // Compose pitch bend + per-channel fine/coarse + master
         // fine/coarse + (for MPE Members) the Manager Channel's bend
         // — picks up tuning on the new voice's very first sample so
@@ -3029,7 +3041,7 @@ impl Mixer {
             glide_offset_cents,
             glide_step_cents_per_sample: glide_step,
             glide_remaining_samples: glide_remaining,
-            pan_override: kb.and_then(|k| k.pan),
+            pan_override: kb.and_then(|k| k.pan).or(drum_preset_pan),
             reverb_send_override: kb.and_then(|k| k.reverb_send),
             chorus_send_override: kb.and_then(|k| k.chorus_send),
         };
@@ -4367,6 +4379,59 @@ mod tests {
         let mut r = vec![0.0f32; 16];
         m.mix_stereo(&mut l, &mut r);
         assert_eq!(m.live_voice_count(), 1);
+    }
+
+    #[test]
+    fn rhythm_channel_applies_drum_preset_pan() {
+        // GM2 Appendix B / §3.3.5: an Open Hi-hat (Note 46) has a preset
+        // pan of 84 (right of centre). With CC 10 at its default centre
+        // (64), the note should render louder on the right than the left.
+        let mut m = Mixer::new();
+        assert!(m.is_rhythm_channel(9));
+        m.note_on(9, 46, 100, voice(0.5, 32));
+        let (mut l, mut r) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        m.mix_stereo(&mut l, &mut r);
+        assert!(r[0] > l[0], "Open Hi-hat preset pan should sit right");
+        // A centre-panned drum (Bass Drum 1, preset 64) stays centred.
+        let mut m2 = Mixer::new();
+        m2.note_on(9, 36, 100, voice(0.5, 32));
+        let (mut l2, mut r2) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        m2.mix_stereo(&mut l2, &mut r2);
+        assert!((r2[0] - l2[0]).abs() < 1e-6, "Bass Drum stays centred");
+    }
+
+    #[test]
+    fn melody_channel_ignores_drum_preset_pan() {
+        // The preset-pan default is Rhythm-Channel only; the same note on
+        // a Melody Channel renders at the plain centred channel pan.
+        let mut m = Mixer::new();
+        assert!(!m.is_rhythm_channel(0));
+        m.note_on(0, 46, 100, voice(0.5, 32));
+        let (mut l, mut r) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        m.mix_stereo(&mut l, &mut r);
+        assert!((r[0] - l[0]).abs() < 1e-6, "melody note stays centred");
+    }
+
+    #[test]
+    fn drum_preset_pan_offset_by_cc10() {
+        // §3.3.5: CC 10 *offsets* the per-instrument preset rather than
+        // replacing it. Panning the channel hard left must pull an
+        // otherwise-right-of-centre preset back toward / past centre.
+        let mut m = Mixer::new();
+        m.note_on(9, 46, 100, voice(0.5, 32)); // preset pan 84 (right)
+        let (mut l0, mut r0) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        m.mix_stereo(&mut l0, &mut r0);
+        let right_bias = r0[0] - l0[0];
+        // Now shift CC 10 well left (offset −44) and restrike.
+        let mut m2 = Mixer::new();
+        m2.channel_state_mut(9).pan = 20;
+        m2.note_on(9, 46, 100, voice(0.5, 32));
+        let (mut l1, mut r1) = (vec![0.0f32; 16], vec![0.0f32; 16]);
+        m2.mix_stereo(&mut l1, &mut r1);
+        assert!(
+            (r1[0] - l1[0]) < right_bias,
+            "CC 10 left must offset the preset toward the left",
+        );
     }
 
     #[test]
