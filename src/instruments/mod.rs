@@ -56,6 +56,7 @@ use oxideav_core::Result;
 
 pub mod articulation;
 pub mod dls;
+pub mod percussion;
 pub mod sample_voice;
 pub mod sf2;
 pub mod sfz;
