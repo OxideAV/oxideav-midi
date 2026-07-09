@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 403 — GM2 Percussion Sound Set (Appendix B / §2.8.1)
+
+- **GM2 drum-set data** (`instruments::percussion`): new module encoding
+  the nine Bank 78H/00H drum sets (STANDARD/ROOM/POWER/ELECTRONIC/ANALOG/
+  JAZZ/BRUSH/ORCHESTRA/SFX). `DrumSet::from_program` maps the Program
+  Change wire byte with the §2.5 undefined-program → STANDARD fallback;
+  `key()` resolves a note to its Appendix-B instrument name, recommended
+  preset pan and EXC group, following `@` inheritance to STANDARD (SFX
+  is self-contained). `exc_group` / `honors_note_off` / `sounds` expose
+  the §2.8.1 rules.
+- **§2.8.1 mutually-exclusive Note choke**: `Mixer::note_on` on a Rhythm
+  Channel mutes any sounding member of the incoming key's EXC group
+  before the new note sounds (open/closed/pedal hi-hats, whistles,
+  guiros, cuicas, triangles, surdos, scratches) — data-driven by note
+  number, in addition to any SF2 exclusive-class the voice declares.
+- **§2.8.1 Note-Off-ignored on Rhythm Channels**: `Mixer::note_off`
+  lets percussion one-shots ring out, except the ORCHESTRA Set's Note 88
+  (Applause) and the SFX Set's Notes 47–84. The Note Off still clears
+  the CA-031 High-Resolution Velocity Prefix; Melody Channels unchanged.
+- **GM2 preset-pan defaults**: a Rhythm-Channel note's base pan now seeds
+  from the drum set's per-key preset (Appendix B), with CC 10 *offsetting*
+  it per §3.3.5, unless a CA-023 Key-Based Pan overrides it.
+- **Introspection**: `Mixer::active_drum_set` / `drum_key_name` report
+  the resolved set and instrument name for a channel/key.
+
 ### Round 392 — GM2 synth semantics + SP-MIDI channel masking
 
 - **GM2 square-law volume curves** (RP-024 §3.3.4/§3.3.6/§4.1): CC 7

@@ -330,6 +330,21 @@ the MIDI Association *UMP Format and MIDI 2.0 Protocol* spec
   apply at the key's next note-on; a Program Change on a Rhythm
   Channel adopts the new set's presets (clears the table); Melody
   Channels don't respond.
+- `instruments::percussion` + `mixer` **GM2 Percussion Sound Set**
+  (RP-024 Appendix B / §2.8.1) — `DrumSet::from_program` resolves the
+  Bank 78H/00H Program Change to one of the nine drum sets (STANDARD,
+  ROOM, POWER, ELECTRONIC, ANALOG, JAZZ, BRUSH, ORCHESTRA, SFX) with the
+  §2.5 undefined-program → STANDARD fallback; each key resolves to its
+  Appendix-B instrument name, recommended preset pan, and EXC group,
+  following the `@` inheritance to STANDARD (SFX is self-contained).
+  The mixer wires three §2.8.1 behaviours on Rhythm Channels: the
+  **mutually-exclusive Note choke** (a Note On for a member of an EXC
+  group — hi-hats, whistles, guiros, cuicas, triangles, surdos,
+  scratches — mutes the sounding member of the same group), **Note Off
+  ignored** so drum one-shots ring out (except ORCHESTRA Note 88 and
+  SFX Notes 47–84), and the **per-key preset pan** default (offset by
+  CC 10 per §3.3.5). `Mixer::active_drum_set` / `drum_key_name` expose
+  the resolved set + instrument name.
 - `mixer` **SP-MIDI Channel Masking** (RP-034/RP-035) — the mixer
   accepts a device Polyphony Level (`set_sp_midi_polyphony`, the §3.3
   "SPn" budget) and evaluates each received MIP message through the
