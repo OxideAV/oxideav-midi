@@ -22,11 +22,11 @@
 //! - **`<control>`**: only `default_path=` is honoured today; sample
 //!   paths are resolved against `default_path` (relative to the SFZ
 //!   file's directory). Other `<control>` opcodes are stored as raw
-//!   strings on the [`SfzPatch::control`] map (accessible via
+//!   strings on the `SfzPatch::control` map (accessible via
 //!   [`SfzInstrument::patch`]) for round-2 use.
 //! - **Sample loader**: [`SfzInstrument::open`] resolves every
 //!   `sample=` path against (SFZ dir / default_path) and reads the
-//!   bytes off disk into [`SfzRegion::sample_bytes`]. Unreadable files
+//!   bytes off disk into `SfzRegion::sample_bytes`. Unreadable files
 //!   become a hard parse error so the caller learns about typos at
 //!   load-time rather than note-on-time. Pass-through callers that
 //!   want to keep paths unresolved use [`SfzInstrument::parse_str`].
@@ -39,10 +39,10 @@
 //!
 //! Voice generation: [`SfzInstrument::make_voice`] decodes the WAV
 //! sample bytes (8/16/24/32-bit PCM and IEEE_FLOAT — see
-//! [`super::wav_pcm`]), picks the highest-priority region matching
+//! `super::wav_pcm`), picks the highest-priority region matching
 //! `(key, velocity)`, shifts pitch off `pitch_keycenter` + `tune` +
 //! `transpose`, and instantiates a
-//! [`super::sample_voice::SamplePlayer`] with a DAHDSR amplitude
+//! `super::sample_voice::SamplePlayer` with a DAHDSR amplitude
 //! envelope from `ampeg_*` opcodes plus a vibrato LFO from
 //! `lfo01_freq` / `lfo01_pitch` / `lfo01_delay`. Patches loaded via
 //! [`SfzInstrument::parse_str`] (no filesystem) report
@@ -64,6 +64,7 @@ use super::{Instrument, Voice};
 
 /// Loop-mode opcode values (`loop_mode=...`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[doc(hidden)] // internal: SFZ loop_mode opcode plumbing (maps into the hidden sample_voice types)
 pub enum LoopMode {
     /// `no_loop` — sample plays once and stops at sample end.
     #[default]
@@ -108,6 +109,7 @@ impl LoopMode {
 /// `<global>` / `<master>` / `<group>` sections are flattened in;
 /// per-region opcodes override.
 #[derive(Clone, Debug, Default)]
+#[doc(hidden)] // internal: resolved SFZ opcode-map plumbing exposed for tests
 pub struct SfzRegion {
     /// Path to the sample file, resolved against the SFZ file's
     /// directory + the active `default_path` from the most recent
@@ -186,6 +188,7 @@ impl SfzRegion {
 /// Parsed SFZ instrument: a flat list of regions plus the `<control>`
 /// block as a raw opcode map. Held by [`SfzInstrument`].
 #[derive(Clone, Debug, Default)]
+#[doc(hidden)] // internal: resolved SFZ opcode-map plumbing exposed for tests
 pub struct SfzPatch {
     /// Flattened region list (`<global>` + `<master>` + `<group>` opcodes
     /// merged into each `<region>`).
@@ -268,12 +271,14 @@ impl SfzInstrument {
     /// Borrow the parsed patch (regions + control opcodes). Useful for
     /// diagnostics — voice generation goes through
     /// [`Instrument::make_voice`] (round 2).
+    #[doc(hidden)] // internal: accessor onto the hidden SfzPatch plumbing
     pub fn patch(&self) -> &SfzPatch {
         &self.patch
     }
 
     /// Borrow the flattened region table directly. Equivalent to
     /// `self.patch().regions.as_slice()`.
+    #[doc(hidden)] // internal: accessor onto the hidden SfzRegion plumbing
     pub fn regions(&self) -> &[SfzRegion] {
         &self.patch.regions
     }
@@ -638,6 +643,7 @@ pub fn looks_like_sfz(path: &Path, bytes: &[u8]) -> bool {
 /// Parse an SFZ patch from text. The result has `<global>` / `<master>`
 /// / `<group>` opcodes flattened into each `<region>` so callers see
 /// one fully-resolved opcode map per region.
+#[doc(hidden)] // internal: low-level patch parse (use SfzInstrument::parse_str)
 pub fn parse_str(text: &str) -> Result<SfzPatch> {
     let stripped = strip_comments(text);
     let tokens = tokenize(&stripped)?;

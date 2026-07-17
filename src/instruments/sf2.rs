@@ -67,18 +67,22 @@ use oxideav_core::{Error, Result};
 use super::{Instrument, Voice};
 
 /// Magic bytes at offset 0/8 of every SoundFont 2 file.
+#[doc(hidden)] // internal: SF2 RIFF parsing bound/magic
 pub const RIFF_MAGIC: &[u8; 4] = b"RIFF";
+#[doc(hidden)] // internal: SF2 RIFF parsing bound/magic
 pub const SFBK_MAGIC: &[u8; 4] = b"sfbk";
 
 /// Hard cap on total i16 sample frames we will load. 256 Mi frames =
 /// ~512 MB of memory. The largest GM banks in the wild ("Fluid R3",
 /// "Arachno") are ~140 MB, so this is generous but bounded.
+#[doc(hidden)] // internal: SF2 RIFF parsing bound/magic
 pub const MAX_SAMPLE_FRAMES: usize = 256 * 1024 * 1024;
 
 /// Hard cap on records in any one pdta sub-chunk. 16 Mi entries × 46 B
 /// (the largest record, `shdr`) ≈ 750 MB if a malicious header claimed
 /// the absolute maximum — we reject anything past this before we
 /// allocate.
+#[doc(hidden)] // internal: SF2 RIFF parsing bound/magic
 pub const MAX_PDTA_RECORDS: usize = 16 * 1024 * 1024;
 
 // -------------------------------------------------------------------------
@@ -88,87 +92,117 @@ pub const MAX_PDTA_RECORDS: usize = 16 * 1024 * 1024;
 // -------------------------------------------------------------------------
 
 /// `keyRange` (gen 43): two bytes = lo / hi inclusive MIDI key.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_KEY_RANGE: u16 = 43;
 /// `velRange` (gen 44): two bytes = lo / hi inclusive velocity.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_VEL_RANGE: u16 = 44;
 /// `startloopAddrsOffset` (gen 2): signed 16-bit, added to `startLoop`.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_STARTLOOP_OFFSET: u16 = 2;
 /// `endloopAddrsOffset` (gen 3): signed 16-bit, added to `endLoop`.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_ENDLOOP_OFFSET: u16 = 3;
 /// `startAddrsOffset` (gen 0): signed 16-bit, added to `start`.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_START_OFFSET: u16 = 0;
 /// `endAddrsOffset` (gen 1): signed 16-bit, added to `end`.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_END_OFFSET: u16 = 1;
 /// `instrument` (gen 41): preset zone target — index into `inst[]`.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_INSTRUMENT: u16 = 41;
 /// `sampleID` (gen 53): instrument zone target — index into `shdr[]`.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_SAMPLE_ID: u16 = 53;
 /// `sampleModes` (gen 54): 0 = no loop, 1 = loop, 3 = loop + finish.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_SAMPLE_MODES: u16 = 54;
 /// `coarseTune` (gen 51): signed semitone offset.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_COARSE_TUNE: u16 = 51;
 /// `fineTune` (gen 52): signed cents (×1/100 semitone) offset.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_FINE_TUNE: u16 = 52;
 /// `overridingRootKey` (gen 58): MIDI key, replaces sample's own root.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_OVERRIDING_ROOT_KEY: u16 = 58;
 
 // ---- volume envelope (DAHDSR) generators ----
 /// `delayVolEnv` (gen 33): signed timecents until the envelope starts.
 /// `time_seconds = 2^(timecents/1200)`. Spec default: -12000 (= ~1 ms,
 /// effectively no delay).
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_DELAY_VOL_ENV: u16 = 33;
 /// `attackVolEnv` (gen 34): linear ramp from 0 to peak in timecents.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_ATTACK_VOL_ENV: u16 = 34;
 /// `holdVolEnv` (gen 35): hold at peak before decay begins, timecents.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_HOLD_VOL_ENV: u16 = 35;
 /// `decayVolEnv` (gen 36): time (timecents) to exponentially decay from
 /// peak (1.0 linear / 0 dB) to the sustain level.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_DECAY_VOL_ENV: u16 = 36;
 /// `sustainVolEnv` (gen 37): sustain attenuation in centibels (10 cB =
 /// 1 dB). 0 = full peak, 1000 = -100 dB ≈ silence. The spec caps the
 /// sensible range at ~1440 cB.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_SUSTAIN_VOL_ENV: u16 = 37;
 /// `releaseVolEnv` (gen 38): exponential release from current level to
 /// silence in timecents.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_RELEASE_VOL_ENV: u16 = 38;
 /// `initialAttenuation` (gen 48): static attenuation in centibels
 /// applied to the whole voice. Default 0 (no attenuation).
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_INITIAL_ATTENUATION: u16 = 48;
 
 // ---- modulation envelope (DAHDSR) generators (round 6) ----
 /// `delayModEnv` (gen 25): timecents until the modulation envelope starts.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_DELAY_MOD_ENV: u16 = 25;
 /// `attackModEnv` (gen 26): linear attack ramp for the modulation envelope.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_ATTACK_MOD_ENV: u16 = 26;
 /// `holdModEnv` (gen 27): hold-at-peak time for the modulation envelope.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_HOLD_MOD_ENV: u16 = 27;
 /// `decayModEnv` (gen 28): decay-to-sustain time for the modulation envelope.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_DECAY_MOD_ENV: u16 = 28;
 /// `sustainModEnv` (gen 29): sustain level for the modulation envelope.
 /// Per spec this is a *fraction* of full-scale in 0.1 % units (i.e.
 /// 0 = peak, 1000 = silence). We normalise to `0.0..=1.0` at construction.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_SUSTAIN_MOD_ENV: u16 = 29;
 /// `releaseModEnv` (gen 30): release-to-zero time for the modulation envelope.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_RELEASE_MOD_ENV: u16 = 30;
 /// `modEnvToPitch` (gen 7): pitch modulation depth in cents. Applied
 /// multiplied by the live modulation-envelope level.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_MOD_ENV_TO_PITCH: u16 = 7;
 /// `modEnvToFilterFc` (gen 11): filter cutoff modulation in cents,
 /// scaled by the live modulation-envelope level.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_MOD_ENV_TO_FILTER_FC: u16 = 11;
 
 // ---- low-pass filter generators (round 6) ----
 /// `initialFilterFc` (gen 8): initial filter cutoff in absolute cents
 /// (re. 8.176 Hz). Default 13500 (≈ 19914 Hz, effectively no filter).
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_INITIAL_FILTER_FC: u16 = 8;
 /// `initialFilterQ` (gen 9): filter resonance in centibels (10 cB = 1 dB).
 /// Default 0 (no resonance peak).
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_INITIAL_FILTER_Q: u16 = 9;
 
 // ---- voice exclusivity (round 6) ----
 /// `exclusiveClass` (gen 57): non-zero value cuts every prior voice in
 /// the same class on the same channel. Used for hi-hat open / closed
 /// drum pairs.
+#[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_EXCLUSIVE_CLASS: u16 = 57;
 
 // -------------------------------------------------------------------------
@@ -179,6 +213,7 @@ pub const GEN_EXCLUSIVE_CLASS: u16 = 57;
 /// `Arc<[i32]>` so the (potentially large) PCM block isn't duplicated
 /// per voice.
 #[derive(Clone, Debug)]
+#[doc(hidden)] // internal: SF2 bank/voice plumbing exposed for tests
 pub struct Sf2Bank {
     /// Bank metadata (ifil version / INAM name) or `None` if the file
     /// omitted the INFO list (which would itself be a spec violation,
@@ -223,6 +258,7 @@ pub struct Sf2Bank {
 /// `LEFT` / `RIGHT` and cross-link via `sample_link`. ROM samples are
 /// from the bank ROM and should not contain PCM (we treat them as mono
 /// even when the high bit is set — round 6 ignores ROM samples).
+#[doc(hidden)] // internal: shdr sample-type bitfield values
 pub mod sample_type_bits {
     /// Bit 0: mono sample (no stereo link).
     pub const MONO: u16 = 0x0001;
@@ -239,6 +275,7 @@ pub mod sample_type_bits {
 
 /// INFO list metadata. Only the fields we surface today.
 #[derive(Clone, Debug, Default)]
+#[doc(hidden)] // internal: SF2 bank/voice plumbing exposed for tests
 pub struct Sf2Info {
     /// Bank name (`INAM`).
     pub name: Option<String>,
@@ -250,6 +287,7 @@ pub struct Sf2Info {
 
 /// One preset header (`phdr` record, 38 bytes on disk).
 #[derive(Clone, Debug)]
+#[doc(hidden)] // internal: SF2 bank/voice plumbing exposed for tests
 pub struct PresetHeader {
     pub name: String,
     pub program: u16,
@@ -261,6 +299,7 @@ pub struct PresetHeader {
 
 /// One instrument header (`inst` record, 22 bytes on disk).
 #[derive(Clone, Debug)]
+#[doc(hidden)] // internal: SF2 bank/voice plumbing exposed for tests
 pub struct InstrumentHeader {
     pub name: String,
     /// First entry in `ibags` belonging to this instrument.
@@ -269,6 +308,7 @@ pub struct InstrumentHeader {
 
 /// One sample header (`shdr` record, 46 bytes on disk).
 #[derive(Clone, Debug)]
+#[doc(hidden)] // internal: SF2 bank/voice plumbing exposed for tests
 pub struct SampleHeader {
     pub name: String,
     /// First sample frame in `sample_data` for this sample.
@@ -300,6 +340,7 @@ pub struct SampleHeader {
 /// Preset / instrument zone bag — pair of indices into the gens/mods
 /// arrays.
 #[derive(Clone, Copy, Debug)]
+#[doc(hidden)] // internal: SF2 bank/voice plumbing exposed for tests
 pub struct Bag {
     pub gen_start: u16,
     pub mod_start: u16,
@@ -309,6 +350,7 @@ pub struct Bag {
 /// of `amount`; consumers reinterpret as u16 / i16 / two-u8s depending
 /// on the opcode.
 #[derive(Clone, Copy, Debug)]
+#[doc(hidden)] // internal: SF2 bank/voice plumbing exposed for tests
 pub struct Generator {
     pub oper: u16,
     pub amount: u16,
@@ -364,6 +406,7 @@ impl Sf2Instrument {
 
     /// Borrow the parsed bank. Mostly useful for diagnostics — voice
     /// generation goes through [`Instrument::make_voice`].
+    #[doc(hidden)] // internal: accessor onto the hidden Sf2Bank plumbing
     pub fn bank(&self) -> &Sf2Bank {
         &self.bank
     }
@@ -835,6 +878,7 @@ impl Sf2Bank {
 /// loop bounds, sample rate, and the pitch ratio that turns the
 /// sample's native pitch into the requested MIDI key.
 #[derive(Clone, Debug)]
+#[doc(hidden)] // internal: SF2 bank/voice plumbing exposed for tests
 pub struct SamplePlan {
     pub start: u32,
     pub end: u32,
@@ -894,6 +938,7 @@ pub struct SamplePlan {
 /// usually identical to the primary but we carry it separately to
 /// tolerate banks where the two halves have minor differences.
 #[derive(Clone, Copy, Debug)]
+#[doc(hidden)] // internal: SF2 bank/voice plumbing exposed for tests
 pub struct StereoPair {
     pub start: u32,
     pub end: u32,
@@ -906,6 +951,7 @@ pub struct StereoPair {
 /// volume envelope but with the sustain field being a *fraction*
 /// (`0..=1`, peak..silence) rather than centibels.
 #[derive(Clone, Copy, Debug)]
+#[doc(hidden)] // internal: SF2 bank/voice plumbing exposed for tests
 pub struct ModEnvParams {
     pub delay_tc: i32,
     pub attack_tc: i32,
@@ -966,6 +1012,7 @@ impl ModEnvParams {
 /// centibels for sustain attenuation). Construction from raw generator
 /// values goes through [`EnvParams::from_generators`].
 #[derive(Clone, Copy, Debug)]
+#[doc(hidden)] // internal: SF2 bank/voice plumbing exposed for tests
 pub struct EnvParams {
     /// Delay before envelope start (timecents). `i32::MIN` is treated
     /// as the spec default ~ -12000 (≈ 1 ms, effectively zero).
@@ -1041,6 +1088,7 @@ impl EnvParams {
 
 /// Convert SF2 timecents to seconds. `2^(timecents/1200)`. The
 /// `i32::MIN` sentinel returns the round-4 musical default (`fallback`).
+#[doc(hidden)] // internal: SF2 unit-conversion helper
 pub fn timecents_to_seconds(tc: i32, fallback: f32) -> f32 {
     if tc == i32::MIN {
         return fallback;
@@ -1056,6 +1104,7 @@ pub fn timecents_to_seconds(tc: i32, fallback: f32) -> f32 {
 
 /// Convert SF2 sustain centibels to a linear gain. `cb = 10 * dB`. Spec
 /// caps at +1440 cB (≈ 0); we clamp at 1440 (≈ -144 dB).
+#[doc(hidden)] // internal: SF2 unit-conversion helper
 pub fn centibels_to_gain(cb: i32) -> f32 {
     let clamped = cb.clamp(0, 1440) as f32;
     (10.0f32).powf(-clamped / 200.0)
@@ -1512,6 +1561,7 @@ fn parse_shdr(body: &[u8]) -> Result<Vec<SampleHeader>> {
 /// channel/poly aftertouch is folded into the final amplitude via
 /// [`Sf2Voice::set_pressure`] (the SF2 default modulator chain routes
 /// pressure to volume — see `simplified default` row in §8.4.x).
+#[doc(hidden)] // internal: SF2 bank/voice plumbing exposed for tests
 pub struct Sf2Voice {
     sample_data: Arc<[i32]>,
     /// Absolute frame index into `sample_data` of the playback start.

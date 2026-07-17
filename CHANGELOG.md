@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Hygiene
+
+- **`#[doc(hidden)]` on internal surface**: the wholly-internal
+  `instruments::articulation` / `instruments::sample_voice` /
+  `instruments::wav_pcm` modules plus item-level internals (SF2
+  generator-table constants and bank/voice plumbing, SFZ opcode-map
+  types, DLS/SF2 RIFF parsing bounds, mixer `ChannelState` /
+  `KeyBasedControls` / `CtrlDestMods` / `GmEffects` plumbing and their
+  accessors, `scheduler::dispatch_universal_sysex`) are now hidden from
+  the documented public API so semver tooling tracks only the stable
+  surface. Attributes and doc text only — no signature or behaviour
+  changes; everything remains importable.
+
 ### Round 403 — GM2 Percussion Sound Set (Appendix B / §2.8.1)
 
 - **GM2 drum-set data** (`instruments::percussion`): new module encoding

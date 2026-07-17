@@ -31,7 +31,7 @@
 //! - **Articulation blocks**: `art1-ck` (DLS1) and `art2-ck` (DLS2)
 //!   are parsed into a flat `Vec<DlsArticulationBlock>` (5-field
 //!   records per the spec) and **interpreted** by
-//!   [`super::articulation::Articulation::evaluate`] at voice-build
+//!   `super::articulation::Articulation::evaluate` at voice-build
 //!   time (round 80). The interpreter honours `SRC_NONE → DST_x`
 //!   "absolute default override" connections for the Vol EG DAHDSR
 //!   (delay / attack / hold / decay / sustain / release), the
@@ -52,18 +52,18 @@
 //! Voice generation: [`DlsInstrument::make_voice`] picks the matching
 //! instrument by MIDI program, picks a region by `(key, velocity)`,
 //! resolves `wlnk.table_index` → `ptbl` cue → wave-pool entry,
-//! decodes the PCM via [`super::wav_pcm::decode_pcm_bytes`] (8/16-bit
+//! decodes the PCM via `super::wav_pcm::decode_pcm_bytes` (8/16-bit
 //! WAV-shaped), shifts pitch off `wsmp.unity_note`, and plays the
-//! sample through the shared [`super::sample_voice::SamplePlayer`].
+//! sample through the shared `super::sample_voice::SamplePlayer`.
 //! Loop modes from `wsmp.loops`: `WLOOP_TYPE_FORWARD` (DLS1) maps to
-//! [`super::sample_voice::SampleLoopMode::LoopContinuous`];
+//! `super::sample_voice::SampleLoopMode::LoopContinuous`;
 //! `WLOOP_TYPE_RELEASE` (DLS2) maps to
-//! [`super::sample_voice::SampleLoopMode::LoopSustain`].
+//! `super::sample_voice::SampleLoopMode::LoopSustain`.
 //!
 //! What's deferred to a later round (clear followups, no GitHub issues):
 //!
 //! - Mod-EG (EG2) routing into pitch + filter cutoff. The
-//!   [`super::articulation::Articulation`] evaluator extracts the EG2
+//!   `super::articulation::Articulation` evaluator extracts the EG2
 //!   parameters + the `SRC_EG2 → DST_PITCH` / `SRC_EG2 →
 //!   DST_FILTER_CUTOFF` scales but the SamplePlayer doesn't yet have a
 //!   mod-env or filter wired up, so those values are surfaced for
@@ -97,19 +97,23 @@ use super::{Instrument, Voice};
 
 /// Magic bytes at offset 0/8 of every DLS file. Note the trailing space
 /// in `DLS ` — the spec's chunk identifiers are 4-character ASCII.
+#[doc(hidden)] // internal: DLS RIFF parsing bound/magic
 pub const RIFF_MAGIC: &[u8; 4] = b"RIFF";
+#[doc(hidden)] // internal: DLS RIFF parsing bound/magic
 pub const DLS_MAGIC: &[u8; 4] = b"DLS ";
 
 /// Hard cap on total wave-sample bytes we will load. 256 MiB — large
 /// enough for the biggest DLS banks shipped with Windows / DirectMusic
 /// (gm.dls is ~3 MiB, the Roland DLS-2 banks ~50 MiB), small enough
 /// that a forged 4 GiB length field can't allocate.
+#[doc(hidden)] // internal: DLS RIFF parsing bound/magic
 pub const MAX_WAVE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Hard cap on instruments / regions / connection blocks per chunk.
 /// DLS2 minimum-device requires only 256 instruments / 1024 regions /
 /// 8192 explicit connections — anything past 1 Mi is a malformed or
 /// hostile header.
+#[doc(hidden)] // internal: DLS RIFF parsing bound/magic
 pub const MAX_RECORDS: usize = 1 << 20;
 
 // =========================================================================

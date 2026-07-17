@@ -31,22 +31,22 @@
 //!   blocks. `make_voice` picks the matching instrument by program,
 //!   picks a region by (key, velocity), resolves wlnk → ptbl →
 //!   wave-pool, decodes the PCM, evaluates the region + instrument
-//!   articulation through [`articulation::Articulation`] (round 80),
+//!   articulation through `articulation::Articulation` (round 80),
 //!   and plays the sample through the shared
-//!   [`sample_voice::SamplePlayer`] with the resolved DAHDSR envelope
+//!   `sample_voice::SamplePlayer` with the resolved DAHDSR envelope
 //!   + vibrato LFO + tuning + gain applied.
-//! - [`articulation`] is the DLS Level 1/2 connection-block evaluator
+//! - `articulation` is the DLS Level 1/2 connection-block evaluator
 //!   used by [`dls`] at voice-build time. Honours the `SRC_NONE →
 //!   DST_x` default-override connections for the Vol EG, the
 //!   modulator + vibrato LFO, tuning, gain and pan, plus a handful of
 //!   `SRC_x → DST_y` modulator routings — see the module's doc for
 //!   the supported subset.
-//! - [`sample_voice`] is the shared sample-playback voice both `sfz`
+//! - `sample_voice` is the shared sample-playback voice both `sfz`
 //!   and `dls` use. Mono in, mono out — the [`mixer`](crate::mixer)
 //!   handles stereo panning. Covers DAHDSR amplitude envelope, four
 //!   loop modes (no-loop / one-shot / continuous / sustain), pitch
 //!   bend, and a vibrato LFO (rate/depth/delay).
-//! - [`wav_pcm`] is a minimal RIFF/WAVE PCM decoder — 8-bit unsigned,
+//! - `wav_pcm` is a minimal RIFF/WAVE PCM decoder — 8-bit unsigned,
 //!   16-bit signed LE, 24-bit signed LE, 32-bit signed LE PCM, and
 //!   32-bit IEEE_FLOAT — used by the SFZ and DLS sample loaders.
 //! - [`tone::ToneInstrument`] is the canary: if no SoundFont is
@@ -54,13 +54,16 @@
 
 use oxideav_core::Result;
 
+#[doc(hidden)] // internal: DLS connection-block/modulator-table evaluator used at voice-build time
 pub mod articulation;
 pub mod dls;
 pub mod percussion;
+#[doc(hidden)] // internal: shared sample-playback voice guts (SFZ/DLS plumbing)
 pub mod sample_voice;
 pub mod sf2;
 pub mod sfz;
 pub mod tone;
+#[doc(hidden)] // internal: WAV PCM helper for the SFZ/DLS sample loaders
 pub mod wav_pcm;
 
 /// Snapshot of a channel's **Sound Controllers** (CC 71–78) at
@@ -244,7 +247,7 @@ pub trait Voice: Send {
 /// `MidiDecoder` (which itself must be `Send` per the `Decoder` trait).
 /// `make_voice` takes `&self` so concrete impls only need shared
 /// references to whatever cross-cutting state they hold (sample arena
-/// in [`sf2::Sf2Bank`] etc.).
+/// in `sf2::Sf2Bank` etc.).
 pub trait Instrument: Send + Sync {
     /// Human-readable name for diagnostics. Implementations should
     /// return something stable — a filename, a "TimGM6mb GM Set", or

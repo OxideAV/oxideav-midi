@@ -421,6 +421,7 @@ impl Scheduler {
 /// All other Universal SysEx messages (sample dumps, file refs, MTC
 /// cueing, MMC, …) are silently ignored — they carry no semantics for
 /// the round-3 renderer.
+#[doc(hidden)] // internal: scheduler-to-mixer SysEx routing plumbing
 pub fn dispatch_universal_sysex(data: &[u8], mixer: &mut crate::mixer::Mixer) {
     if data.len() < 3 {
         return;

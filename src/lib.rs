@@ -42,13 +42,13 @@
 //!       `wlnk` cue references, and `art1` / `art2` articulation
 //!       connection blocks. `make_voice` resolves the wlnk → ptbl →
 //!       wave-pool entry, decodes the PCM, and plays the sample
-//!       through [`SamplePlayer`](instruments::sample_voice::SamplePlayer).
+//!       through `instruments::sample_voice::SamplePlayer`.
 //!       `art1`/`art2` connection-block evaluation is round 2.
-//!     * **[`instruments::sample_voice`]** — shared sample-playback
+//!     * **`instruments::sample_voice`** — shared sample-playback
 //!       voice (mono in, mono out) used by both SFZ and DLS. Covers
 //!       DAHDSR amplitude envelope, four loop modes, pitch bend,
 //!       and a vibrato LFO.
-//!     * **[`instruments::wav_pcm`]** — minimal RIFF/WAVE PCM
+//!     * **`instruments::wav_pcm`** — minimal RIFF/WAVE PCM
 //!       decoder used by the SFZ and DLS sample loaders.
 //!     * **[`instruments::tone`]** — sine/triangle/saw/square
 //!       fallback so the synth produces *something* even when no

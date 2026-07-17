@@ -9,12 +9,12 @@
 //! sum a chunk of samples into a planar (left, right) buffer.
 //!
 //! Sustain (CC 64), per-channel volume (CC 7), and pan (CC 10) live on
-//! a small [`ChannelState`] table the mixer carries — they are consumed
+//! a small `ChannelState` table the mixer carries — they are consumed
 //! at mix time so a CC-change between two `mix_stereo` chunks takes
 //! effect on the very next chunk without any per-sample coordination.
 //!
 //! Stereo output is hard-coded for round-3. The voice generator
-//! ([`Sf2Voice`](crate::instruments::sf2::Sf2Voice)) renders mono today,
+//! (`crate::instruments::sf2::Sf2Voice`) renders mono today,
 //! so each voice's samples are panned into the left/right buses via the
 //! constant-power law (`cos(θ)` left, `sin(θ)` right with `θ` derived
 //! from the channel pan in `0..=127`). Real stereo SF2 zones (paired
@@ -44,6 +44,7 @@ pub const MAX_VOICES: usize = 32;
 /// Convert a raw 14-bit pitch-bend scalar (`0..=16383`, centre `0x2000`)
 /// to a signed cents offset using the per-channel bend range. Default
 /// range is 200 cents (= ±2 semitones, GM RP-018 recommended practice).
+#[doc(hidden)] // internal: voice-mixer conversion helper
 pub fn pitch_bend_to_cents(value: u16, range_cents: u16) -> i32 {
     let centred = value.min(0x3FFF) as i32 - 0x2000;
     // ±8192 maps to ±range_cents.
@@ -62,6 +63,7 @@ pub const NUM_CHANNELS: usize = 16;
 /// Volume) and cc#11 (Expression); Master Volume uses the same law on
 /// its 14-bit scalar.
 #[inline]
+#[doc(hidden)] // internal: voice-mixer conversion helper
 pub fn gm2_cc_gain(value: u8) -> f32 {
     let norm = (value.min(127) as f32) / 127.0;
     norm * norm
@@ -73,6 +75,7 @@ pub fn gm2_cc_gain(value: u8) -> f32 {
 /// *una corda* attenuation that audibly softens the note without
 /// muting it. Captured per-voice at note-on so already-sounding notes
 /// are unaffected.
+#[doc(hidden)] // internal: voice-mixer tuning constant
 pub const SOFT_PEDAL_GAIN: f32 = 0.667;
 
 /// Maximum portamento glide span, in milliseconds, mapped from CC 5 =
@@ -84,6 +87,7 @@ pub const SOFT_PEDAL_GAIN: f32 = 0.667;
 /// duration is independent of the interval — a per-semitone *rate*
 /// would also be spec-compliant, but a fixed span is the more common
 /// musical behaviour and keeps the mapping monotonic in CC 5.
+#[doc(hidden)] // internal: voice-mixer tuning constant
 pub const PORTAMENTO_MAX_MS: f32 = 1000.0;
 
 /// One slot in the voice pool.
@@ -173,6 +177,7 @@ impl VoiceSlot {
 /// CCs the mixer needs at mix time; `program` lives here so the
 /// scheduler can pick the right preset on the next `note_on`.
 #[derive(Clone, Copy, Debug)]
+#[doc(hidden)] // internal: voice-mixer plumbing exposed for tests
 pub struct ChannelState {
     /// MIDI program (0..=127). Set by `ProgramChange`. Defaults to 0
     /// (Acoustic Grand Piano in GM).
@@ -411,6 +416,7 @@ impl Default for ChannelState {
 /// cents (CA-023 leaves the response to the governing recommended
 /// practice).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[doc(hidden)] // internal: voice-mixer plumbing exposed for tests
 pub struct KeyBasedControls {
     /// `nn = 07H` — Note Volume, relative (`40H` = 100 %).
     pub volume: Option<u8>,
@@ -430,6 +436,7 @@ pub struct KeyBasedControls {
 /// §4.6.1): Pitch `40H` (0 semitones), Filter Cutoff `40H` (0 cents),
 /// Amplitude `40H` (100 %), LFO Pitch / Filter / Amplitude Depth `0` —
 /// i.e. controllers modify nothing until a CA-022 message routes them.
+#[doc(hidden)] // internal: voice-mixer tuning constant
 pub const CTRL_DEST_DEFAULT_TABLE: [u8; 6] = [0x40, 0x40, 0x40, 0, 0, 0];
 
 /// The combined per-channel modifications the Controller Destination
@@ -439,6 +446,7 @@ pub const CTRL_DEST_DEFAULT_TABLE: [u8; 6] = [0x40, 0x40, 0x40, 0, 0, 0];
 /// timbre's own default response (the voices' built-in pressure
 /// handling), which stays untouched.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[doc(hidden)] // internal: voice-mixer plumbing exposed for tests
 pub struct CtrlDestMods {
     /// `pp = 00` Pitch Control, cents (GM2: rr `28H–58H` = ±24
     /// semitones at full controller deflection).
@@ -648,6 +656,7 @@ impl MpeZone {
 /// Time / Chorus Mod-Rate / Mod-Depth / Feedback / Send-to-Reverb the
 /// CA-024 tables list for those types.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[doc(hidden)] // internal: voice-mixer plumbing exposed for tests
 pub struct GmEffects {
     /// Reverb Type select (CA-024 reverb `pp=0`): 0 Small Room, 1 Medium
     /// Room, 2 Large Room, 3 Medium Hall, 4 Large Hall, 8 Plate. Stored
@@ -1262,11 +1271,13 @@ impl Mixer {
 
     /// Borrow the per-channel state. Useful for the scheduler when it
     /// needs to read the current program before allocating a voice.
+    #[doc(hidden)] // internal: accessor onto the hidden ChannelState plumbing
     pub fn channel_state(&self, channel: u8) -> &ChannelState {
         &self.channels[channel as usize % NUM_CHANNELS]
     }
 
     /// Mutable borrow of the per-channel state, for control changes.
+    #[doc(hidden)] // internal: accessor onto the hidden ChannelState plumbing
     pub fn channel_state_mut(&mut self, channel: u8) -> &mut ChannelState {
         &mut self.channels[channel as usize % NUM_CHANNELS]
     }
@@ -1429,6 +1440,7 @@ impl Mixer {
 
     /// The Key-Based Instrument Controller state for `(channel, key)`,
     /// if any edits are stored.
+    #[doc(hidden)] // internal: accessor onto the hidden KeyBasedControls plumbing
     pub fn key_based_controls(&self, channel: u8, key: u8) -> Option<KeyBasedControls> {
         self.key_based[channel as usize % NUM_CHANNELS]
             .get(&(key & 0x7F))
@@ -2363,6 +2375,7 @@ impl Mixer {
 
     /// Borrow the GM2 Reverb + Chorus parameter state (CA-024). Exposed
     /// for tests / introspection.
+    #[doc(hidden)] // internal: accessor onto the hidden GmEffects plumbing
     pub fn gm_effects(&self) -> &GmEffects {
         &self.gm_effects
     }
@@ -2647,7 +2660,7 @@ impl Mixer {
     /// Apply CC 67 (Soft Pedal / *una corda*). Records the pedal position
     /// on the channel state; the attenuation is captured per-voice at
     /// note-on (a note struck while the pedal is down renders at
-    /// [`SOFT_PEDAL_GAIN`], one struck with it up at unity). Notes already
+    /// `SOFT_PEDAL_GAIN`, one struck with it up at unity). Notes already
     /// sounding when the pedal moves are unaffected — on a real piano the
     /// pedal shifts the action for the *next* strike, not the current
     /// vibration.
@@ -2666,7 +2679,7 @@ impl Mixer {
     }
 
     /// Apply CC 5 (Portamento Time). Stored raw on the channel; mapped to
-    /// a glide span at note-on via [`PORTAMENTO_MAX_MS`].
+    /// a glide span at note-on via `PORTAMENTO_MAX_MS`.
     pub fn set_portamento_time(&mut self, channel: u8, value: u8) {
         let ch = channel as usize % NUM_CHANNELS;
         self.channels[ch].portamento_time = value & 0x7F;
