@@ -67,6 +67,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `F0` events); `ClipFile::from_smf()` builds clips from SMF
   sequences. `MidiDecoder::send_packet` now accepts both `MThd` and
   `SMF2CLIP` payloads.
+- **MIDI-CI typed SysEx surface** (`ci`, M2-101 v1.2.1 + M2-102 +
+  M2-103): parse/emit of the §5.2.1 envelope (Device ID, Sub-ID#2,
+  Version/Format, LSB-first 28-bit MUIDs) over bracket-free SysEx
+  payloads (UMP SysEx7-ready), covering the Management category
+  (Discovery + reply with v2 Output Path / Function Block fields,
+  Endpoint inquiry/reply, Invalidate MUID, ACK, v1/v2 NAK), Profile
+  Configuration (inquiry/reply lists of 5-byte Profile IDs per the
+  M2-102 standard/manufacturer split, Set On/Off, Enabled/Disabled/
+  Added/Removed reports, Details inquiry/reply, Profile Specific
+  Data), the Property Exchange base messages (capabilities + the
+  chunked Get/Set/Subscribe/Notify family with M2-103 header/property
+  blobs carried as data), and Process Inquiry (capabilities + MIDI
+  Message Report bitmaps). Wire surface only — no session state
+  machine.
 
 ### Hygiene
 

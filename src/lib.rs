@@ -88,6 +88,7 @@
 //! to [`MidiDecoder::with_instrument`]; the decoder factory wired into
 //! the registry today does not yet plumb a bank-discovery hook.
 
+pub mod ci;
 pub mod clip;
 pub mod downloader;
 pub mod instruments;
