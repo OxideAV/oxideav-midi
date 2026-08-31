@@ -36,6 +36,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constants, 12-byte UMP chunks, ≤32 UMPs, melisma-preserving
   `FlexTextAssembler` + `flex_text_packets` builder). Channel/Group
   addressing via `FlexAddress`; `UmpMessage::decode` types MT 0xD.
+- **Stateful MIDI 1.0 ↔ 2.0 translation** (`ump::translator`): the
+  Appendix D compound sequences. `Midi1ToMidi2Translator` folds CC
+  98/99/100/101 + CC 6/38 into single MIDI 2.0 Registered/Assignable
+  Controller messages per the §D.3.3 triggers (CC 38; subsequent CC 6;
+  selector change flush) with Null-Function suppression, and folds
+  Bank Select CC 0/32 into Program Change Bank fields per §D.3.4.
+  `midi2_to_midi1_messages` performs the reverse §D.2.3/§D.2.4
+  expansions (RPN/NRPN → four CCs; Program Change + bank → CC0, CC32,
+  PC). 1.0→2.0→1.0 RPN round trip pinned.
+- **Conformance fix**: `Midi1ChannelVoice::to_midi2` now translates
+  Increment/Decrement (CC 96/97) as plain MIDI 2.0 Control Changes —
+  §D.3.3 states they translate as Control Change and never to the
+  Relative Controller messages; they were previously withheld.
 
 ### Hygiene
 

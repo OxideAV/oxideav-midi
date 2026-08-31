@@ -38,6 +38,7 @@ pub mod message;
 pub mod packet;
 pub mod scaling;
 pub mod stream;
+pub mod translator;
 
 pub use data::{
     sysex7_packets, sysex8_packets, Data128Message, DataFormat, Sysex7, Sysex7Assembler,
@@ -50,3 +51,4 @@ pub use message::{
 pub use packet::{MessageType, Ump, UmpStream};
 pub use scaling::{scale_down, scale_up};
 pub use stream::{StreamFormat, StreamTextAssembler, UmpStreamMessage};
+pub use translator::{midi2_to_midi1_messages, Midi1ToMidi2Translator};

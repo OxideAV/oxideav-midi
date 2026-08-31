@@ -28,8 +28,11 @@ impl Midi1ChannelVoice {
     ///   participate in compound sequences that fold into MIDI 2.0
     ///   Program Change or Registered/Assignable Controller messages
     ///   (§D.3.3, §D.3.4) and so are not translated in isolation.
-    /// * Increment / Decrement (CC 96 / 97) — translated only as part of
-    ///   an RPN/NRPN sequence (§D.3.3).
+    ///
+    /// Increment / Decrement (CC 96 / 97) DO translate — §D.3.3 sends
+    /// them as MIDI 2.0 Control Change messages (they have no RPN/NRPN
+    /// function in the MIDI 2.0 Protocol and are never translated to
+    /// the Relative Controller messages).
     #[must_use]
     pub fn to_midi2(&self) -> Option<Midi2ChannelVoice> {
         match *self {
@@ -87,7 +90,7 @@ impl Midi1ChannelVoice {
                 // §D.3.3 / §D.3.4 / "Bank Select Control Change": these
                 // controllers do not translate as standalone messages.
                 match index {
-                    0 | 6 | 32 | 38 | 96 | 97 | 98 | 99 | 100 | 101 => None,
+                    0 | 6 | 32 | 38 | 98 | 99 | 100 | 101 => None,
                     _ => Some(Midi2ChannelVoice::ControlChange {
                         channel,
                         index,
@@ -303,7 +306,7 @@ mod translate_tests {
 
     #[test]
     fn special_control_changes_do_not_translate_standalone() {
-        for index in [0u8, 6, 32, 38, 96, 97, 98, 99, 100, 101] {
+        for index in [0u8, 6, 32, 38, 98, 99, 100, 101] {
             let m1 = Midi1ChannelVoice::ControlChange {
                 channel: 0,
                 index,
