@@ -21,6 +21,9 @@
 //!   (Min-Center-Max upscaling, truncating downscaling) plus
 //!   default-mode translation between MIDI 1.0 and MIDI 2.0 channel
 //!   voice messages.
+//! * [`stream`] — the UMP Stream vocabulary (MT 0xF, §7.1): Endpoint /
+//!   Function Block discovery and notifications, Stream Configuration,
+//!   and the Start / End of Clip markers used by MIDI Clip Files.
 //!
 //! The word order follows the spec §2.1.1 convention: each diagram
 //! line is one 32-bit word, most-significant bit leftmost, and the
@@ -32,9 +35,11 @@
 pub mod message;
 pub mod packet;
 pub mod scaling;
+pub mod stream;
 
 pub use message::{
     Midi1ChannelVoice, Midi2ChannelVoice, SystemMessage, UmpMessage, UtilityMessage,
 };
 pub use packet::{MessageType, Ump, UmpStream};
 pub use scaling::{scale_down, scale_up};
+pub use stream::{StreamFormat, StreamTextAssembler, UmpStreamMessage};

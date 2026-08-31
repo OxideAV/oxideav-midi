@@ -290,8 +290,10 @@ pub enum UmpMessage {
     Midi1 { group: u8, msg: Midi1ChannelVoice },
     /// MT 0x4 MIDI 2.0 Channel Voice (with its Group).
     Midi2 { group: u8, msg: Midi2ChannelVoice },
+    /// MT 0xF UMP Stream (Groupless, addressed to the Endpoint).
+    Stream(super::stream::UmpStreamMessage),
     /// Any Message Type not modelled by this layer (Data, Flex Data,
-    /// UMP Stream, Reserved) — carries the raw packet for inspection.
+    /// Reserved) — carries the raw packet for inspection.
     Unhandled(Ump),
 }
 
@@ -309,6 +311,9 @@ impl UmpMessage {
                 group: p.group().unwrap_or(0),
                 msg: Midi2ChannelVoice::decode(p)?,
             }),
+            MessageType::UmpStream => Ok(UmpMessage::Stream(
+                super::stream::UmpStreamMessage::decode(p)?,
+            )),
             _ => Ok(UmpMessage::Unhandled(*p)),
         }
     }

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Round 454 — MIDI 2.0 axis (M2-104 / M2-116)
+
+- **UMP Stream messages** (`ump::stream`): typed decode + encode for the
+  full MT 0xF vocabulary of M2-104 §7.1 — Endpoint Discovery / Endpoint
+  Info / Device Identity / Endpoint Name / Product Instance Id
+  notifications, Stream Configuration Request + Notification, Function
+  Block Discovery / Info / Name, and the Start of Clip / End of Clip
+  markers (§7.1.10–11) used by the M2-116 MIDI Clip File. Multi-packet
+  text payloads (Endpoint Name ≤98 B, Product Instance Id ≤42 B ASCII,
+  Function Block Name ≤91 B) get spec-conformant packet-run builders
+  and a `StreamTextAssembler` for reassembly. `UmpMessage::decode` now
+  dispatches MT 0xF to the typed surface instead of `Unhandled`.
+
 ### Hygiene
 
 - **`#[doc(hidden)]` on internal surface**: the wholly-internal
