@@ -3,8 +3,9 @@
 [![CI](https://github.com/OxideAV/oxideav-midi/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-midi/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-midi.svg)](https://crates.io/crates/oxideav-midi) [![docs.rs](https://docs.rs/oxideav-midi/badge.svg)](https://docs.rs/oxideav-midi) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Pure-Rust **MIDI** — Standard MIDI File (`.mid` / SMF) parser + writer,
-transport metadata, and a soft-synth. Zero C dependencies, zero FFI,
-zero `*-sys`.
+the MIDI 2.0 axis (Universal MIDI Packet, `.midi2` MIDI Clip File,
+MIDI-CI), transport metadata, and a soft-synth. Zero C dependencies,
+zero FFI, zero `*-sys`.
 
 External instruments (SoundFont 2 `.sf2`, SFZ, DLS Level 1/2) are
 loaded from disk at runtime; nothing is bundled in the binary. A
@@ -220,18 +221,35 @@ the MIDI Association *UMP Format and MIDI 2.0 Protocol* spec
   Stream (MT 0xF) are Groupless. `UmpStream` walks a flat `&[u32]` into
   self-delimiting packets of mixed sizes, surfacing a trailing partial
   packet as a single `Err`.
-- **`ump::message`** — typed `decode` + `encode` for four Message Types:
-  Utility (NOOP, JR Clock, JR Timestamp, Delta Clockstamp TPQ, Delta
-  Clockstamp 20-bit); System Common / System Real Time (SPP LSB-first,
+- **`ump::message`** — typed `decode` + `encode` for the core Message
+  Types: Utility (NOOP, JR Clock, JR Timestamp, Delta Clockstamp TPQ,
+  Delta Clockstamp 20-bit — status nibble at bits 20..24 per Figure
+  26 / Table 26); System Common / System Real Time (SPP LSB-first,
   `0xF0`/`0xF7` rejected since SysEx rides MT 0x3); MIDI 1.0 Channel
   Voice (all 7 opcodes, 2-byte messages zero-fill); and the full MIDI
   2.0 Channel Voice set — registered/assignable per-note controllers,
   registered/assignable + relative controllers, per-note pitch bend,
   16-bit-velocity Note On/Off with attribute type/data, 32-bit poly /
   channel pressure, per-note management D/S flags, Program Change with
-  the Bank Valid flag, and 32-bit Pitch Bend. `UmpMessage::decode`
-  dispatches on MT; Data / Flex / Stream / Reserved surface as
-  `Unhandled`.
+  the Bank Valid flag, and 32-bit Pitch Bend. `UmpMessage::decode` +
+  `encode` dispatch every defined MT (Data / Flex / Stream included);
+  only Reserved Message Types surface as `Unhandled`.
+- **`ump::stream`** — the UMP Stream vocabulary (MT 0xF, §7.1):
+  Endpoint Discovery / Info / Device Identity / Name / Product
+  Instance Id notifications, Stream Configuration Request +
+  Notification, Function Block Discovery / Info / Name, and the Start
+  / End of Clip markers. Multi-packet text runs honour the spec byte
+  caps (98 / 42 ASCII / 91) with a `StreamTextAssembler` for
+  reassembly.
+- **`ump::data`** — System Exclusive (7-bit, MT 0x3, §7.7) and SysEx8
+  (MT 0x5, §7.8, Stream IDs + the §7.8.1 abort form), with payload
+  splitters / assemblers for both; Mixed Data Set Header + Payload
+  chunks (§7.9); the §7.10 16-bit Manufacturer ID translation.
+- **`ump::flex`** — Flex Data (MT 0xD, §7.5): Set Tempo (10 ns units),
+  Set Time Signature, Set Metronome, Set Key Signature, Set Chord Name
+  (full alteration surface), and the Status Bank 0x01/0x02 metadata +
+  performance text families (12-byte chunks, ≤32 UMPs, melisma
+  preserved) with Channel/Group addressing.
 - **`ump::scaling`** — the spec Appendix D bit-scaling primitives:
   Min-Center-Max upscaling (smooth shift below center, bit-repeat above)
   and truncating downscaling, with 7/14 ⇄ 16/32 helpers. Verified
@@ -241,9 +259,46 @@ the MIDI Association *UMP Format and MIDI 2.0 Protocol* spec
   to_midi1` implement the Default Translation Mode (§D.2/D.3): Note On
   velocity-0 ⇄ Note Off 0x8000, velocity floored to 1 on downscale,
   pitch-bend 14⇄32 with LSB-first packing, Program Change bank handling,
-  and `None` for the messages with no counterpart (special CCs that
-  belong to compound RPN/NRPN sequences; per-note / relative / per-note-
-  management on the way down).
+  CC 96/97 as plain Control Changes, and `None` for the messages with no
+  counterpart (special CCs that belong to compound RPN/NRPN sequences;
+  per-note / relative / per-note-management on the way down).
+  `ump::translator` adds the stateful compound layer:
+  `Midi1ToMidi2Translator` folds CC 98/99/100/101 + 6/38 into single
+  Registered/Assignable Controller messages on the §D.3.3 triggers and
+  Bank Select CC 0/32 into Program Change bank fields (§D.3.4);
+  `midi2_to_midi1_messages` performs the reverse §D.2.3/§D.2.4
+  expansions.
+
+## MIDI Clip File (`clip`)
+
+The `.midi2` SMF2 clip format (M2-116-U v1.0) — the MIDI 2.0
+counterpart of the SMF Type 0 file. Reader + writer for the full
+framing: `SMF2CLIP` File Header, leading Set Profile On SysEx (no
+Delta Clockstamp), `DCS(0)` + DCTPQ, Clip Configuration Header, Start
+/ End of Clip markers, per-message Delta Clockstamps with the §3.2.2
+`DCS + NOOP` restart for gaps beyond the 20-bit field, and the §7.3
+nothing-after-End rule. `ClipFile::to_smf()` renders a clip through
+the Appendix-D Default Translation into the existing scheduler +
+mixer pipeline (MIDI 2.0 Channel Voice via the compound expansions,
+Flex tempo / meter / key / text to SMF metas, SysEx7 reassembly to
+`F0` events); `ClipFile::from_smf()` covers the Appendix-A
+concordance direction. The registered decoder accepts both `MThd` and
+`SMF2CLIP` payloads.
+
+## MIDI-CI (`ci`)
+
+Typed MIDI Capability Inquiry SysEx surface (M2-101-UM v1.2.1, with
+the M2-102 Profile ID rules and M2-103 Property Exchange payloads
+carried as data). Parses and emits the bracket-free payload form that
+rides in a UMP SysEx7 run or an SMF `F0` event: the §5.2.1 envelope
+(Device ID, Sub-ID#2, Version/Format, LSB-first 28-bit MUIDs),
+Management (Discovery + reply, Endpoint inquiry/reply, Invalidate
+MUID, ACK, v1/v2 NAK), Profile Configuration (inquiry/reply lists,
+Set On/Off, Enabled / Disabled / Added / Removed reports, Details,
+Profile Specific Data), the Property Exchange base messages
+(capabilities + the chunked Get/Set/Subscribe/Notify family), and
+Process Inquiry (capabilities + MIDI Message Report). Wire surface
+only — no session state machine.
 
 ## Instruments
 
@@ -414,7 +469,8 @@ the MIDI Association *UMP Format and MIDI 2.0 Protocol* spec
   `Error::Unsupported`.
 
 The decoder factory registers under codec id `"midi"`: `send_packet`
-parses the SMF and primes the scheduler; `receive_frame` returns
+parses the SMF — or a `.midi2` MIDI Clip File, translated through
+Appendix D — and primes the scheduler; `receive_frame` returns
 interleaved S16 stereo PCM (1024 samples/channel at 44.1 kHz) until
 the event stream and voice pool run dry. Without an on-disk bank the
 registry-built decoder uses the pure-tone fallback; for SoundFont 2
@@ -426,6 +482,7 @@ A `cargo-fuzz` harness covers every attacker-facing parser:
 
 ```
 cargo +nightly fuzz run smf    # smf::parse + iterators
+cargo +nightly fuzz run clip   # clip::parse + to_smf + write round trip
 cargo +nightly fuzz run sf2    # instruments::sf2::Sf2Bank::parse
 cargo +nightly fuzz run dls    # instruments::dls::DlsBank::parse
 cargo +nightly fuzz run sfz    # instruments::sfz::parse_str
