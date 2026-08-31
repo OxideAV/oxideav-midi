@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "oxideav-midi"
-version = "0.0.2"
+version = "0.0.4"
 dependencies = [
  "oxideav-core",
 ]

@@ -7,9 +7,17 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
-# Four input surfaces in oxideav-midi take attacker-controlled bytes
+# Five input surfaces in oxideav-midi take attacker-controlled bytes
 # and walk variable-length structures end-to-end:
 #
+#   * `clip::parse`         — MIDI Clip File (`.midi2`, M2-116):
+#                             SMF2CLIP header, big-endian UMP word
+#                             stream with self-delimiting 1..4-word
+#                             packets, Delta Clockstamp timing, Set
+#                             Profile On SysEx runs, Start/End of Clip
+#                             framing; on success the Appendix-D
+#                             translation to SMF and the canonical
+#                             re-writer run too.
 #   * `smf::parse`          — Standard MIDI File (`.mid`): RIFF-style
 #                             MThd + MTrk chunks, per-event VLQ deltas,
 #                             running status, sysex (`F0`/`F7`) and
@@ -60,6 +68,12 @@ debug = 1
 [[bin]]
 name = "smf"
 path = "fuzz_targets/smf.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "clip"
+path = "fuzz_targets/clip.rs"
 test = false
 doc = false
 
