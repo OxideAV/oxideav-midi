@@ -46,9 +46,12 @@ impl UtilityMessage {
             return Err(Error::invalid("UMP: not a Utility message"));
         }
         let w = p.word0();
-        // Utility status is the low nibble of the status byte; the high
-        // nibble of the status byte is Reserved (§7.2 general format).
-        let status = (w >> 16) & 0x0F;
+        // Utility general format (Figure 26): mt(4) | reserved(4) |
+        // status(4) | 20 bits of data-or-reserved. The status nibble
+        // sits at bits 20..24; JR Clock / JR Timestamp / DCTPQ use the
+        // low 16 bits for data (bits 16..20 reserved), and the Delta
+        // Clockstamp's 20-bit tick count fills bits 0..20 (Figure 34).
+        let status = (w >> 20) & 0x0F;
         match status {
             0x0 => Ok(UtilityMessage::Noop),
             0x1 => Ok(UtilityMessage::JrClock {
@@ -77,17 +80,17 @@ impl UtilityMessage {
         let w = match *self {
             UtilityMessage::Noop => base,
             UtilityMessage::JrClock { sender_clock_time } => {
-                base | (0x1 << 16) | u32::from(sender_clock_time)
+                base | (0x1 << 20) | u32::from(sender_clock_time)
             }
             UtilityMessage::JrTimestamp {
                 sender_clock_timestamp,
-            } => base | (0x2 << 16) | u32::from(sender_clock_timestamp),
+            } => base | (0x2 << 20) | u32::from(sender_clock_timestamp),
             UtilityMessage::DeltaClockstampTpq {
                 ticks_per_quarter_note,
-            } => base | (0x3 << 16) | u32::from(ticks_per_quarter_note),
+            } => base | (0x3 << 20) | u32::from(ticks_per_quarter_note),
             UtilityMessage::DeltaClockstamp {
                 ticks_since_last_event,
-            } => base | (0x4 << 16) | (ticks_since_last_event & 0x000F_FFFF),
+            } => base | (0x4 << 20) | (ticks_since_last_event & 0x000F_FFFF),
         };
         Ump::from_parts([w, 0, 0, 0], 1)
     }
@@ -305,6 +308,24 @@ pub enum UmpMessage {
 }
 
 impl UmpMessage {
+    /// Encode this message back into its packet, dispatching to the
+    /// per-type encoder ([`Midi1ChannelVoice::encode`] and
+    /// [`Midi2ChannelVoice::encode`] take the carried Group).
+    #[must_use]
+    pub fn encode(&self) -> Ump {
+        match self {
+            UmpMessage::Utility(m) => m.encode(),
+            UmpMessage::System(m) => m.encode(),
+            UmpMessage::Midi1 { group, msg } => msg.encode(*group),
+            UmpMessage::Midi2 { group, msg } => msg.encode(*group),
+            UmpMessage::Sysex7(m) => m.encode(),
+            UmpMessage::Data128(m) => m.encode(),
+            UmpMessage::Flex(m) => m.encode(),
+            UmpMessage::Stream(m) => m.encode(),
+            UmpMessage::Unhandled(raw) => *raw,
+        }
+    }
+
     /// Decode any UMP packet, dispatching on its Message Type.
     pub fn decode(p: &Ump) -> Result<Self> {
         match p.message_type() {
@@ -349,26 +370,27 @@ mod tests {
     #[test]
     fn utility_jr_clock() {
         // status 0x1, time 0x1234.
-        let m = UtilityMessage::decode(&ump(&[0x0001_1234])).unwrap();
+        let m = UtilityMessage::decode(&ump(&[0x0010_1234])).unwrap();
         assert_eq!(
             m,
             UtilityMessage::JrClock {
                 sender_clock_time: 0x1234
             }
         );
-        assert_eq!(m.encode().word0(), 0x0001_1234);
+        assert_eq!(m.encode().word0(), 0x0010_1234);
     }
 
     #[test]
     fn utility_delta_clockstamp_20bit() {
         // status 0x4, ticks 0xABCDE (20-bit).
-        let m = UtilityMessage::decode(&ump(&[0x0004_BCDE])).unwrap();
+        let m = UtilityMessage::decode(&ump(&[0x004A_BCDE])).unwrap();
         assert_eq!(
             m,
             UtilityMessage::DeltaClockstamp {
-                ticks_since_last_event: 0x0004_BCDE & 0x000F_FFFF
+                ticks_since_last_event: 0xA_BCDE
             }
         );
+        assert_eq!(m.encode().word0(), 0x004A_BCDE);
     }
 
     #[test]

@@ -88,6 +88,7 @@
 //! to [`MidiDecoder::with_instrument`]; the decoder factory wired into
 //! the registry today does not yet plumb a bank-discovery hook.
 
+pub mod clip;
 pub mod downloader;
 pub mod instruments;
 pub mod mixer;
@@ -336,15 +337,25 @@ impl Decoder for MidiDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        // Confirm the packet at least *looks* like an SMF — saves the
-        // user from a "synthesis pending" misdiagnosis when the real
-        // issue is a mis-routed packet.
-        if packet.data.len() < 4 || &packet.data[0..4] != b"MThd" {
-            return Err(Error::invalid(
-                "MIDI: packet does not start with the 'MThd' header chunk",
-            ));
-        }
-        let smf = crate::smf::parse(&packet.data)?;
+        // Two container framings share the decoder: the MIDI 1.0
+        // Standard MIDI File ('MThd') and the M2-116 MIDI Clip File
+        // ('SMF2CLIP'). A clip is translated to an SMF sequence via
+        // the Appendix-D Default Translation and rendered through the
+        // same scheduler + mixer path.
+        let smf = if crate::clip::is_clip_file(&packet.data) {
+            crate::clip::parse(&packet.data)?.to_smf()?
+        } else {
+            // Confirm the packet at least *looks* like an SMF — saves
+            // the user from a "synthesis pending" misdiagnosis when
+            // the real issue is a mis-routed packet.
+            if packet.data.len() < 4 || &packet.data[0..4] != b"MThd" {
+                return Err(Error::invalid(
+                    "MIDI: packet starts with neither the 'MThd' header chunk \
+                     nor the 'SMF2CLIP' MIDI Clip File header",
+                ));
+            }
+            crate::smf::parse(&packet.data)?
+        };
         // Prime the scheduler. Dropping the previous one (if any)
         // discards any partially-played file — callers should call
         // `flush` first if that matters.

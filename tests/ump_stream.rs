@@ -18,7 +18,7 @@ use oxideav_midi::ump::{
 #[test]
 fn mixed_stream_decodes_to_typed_messages() {
     let words = [
-        0x0002_1000, // MT0 Utility: JR Timestamp = 0x1000
+        0x0020_1000, // MT0 Utility: JR Timestamp = 0x1000
         0x2491_3C64, // MT2 MIDI 1.0 Note On ch1 note 0x3C vel 0x64
         0x4190_3C00, // MT4 MIDI 2.0 Note On ch0 note 0x3C word0
         0xC000_0000, // ... word1: velocity 0xC000

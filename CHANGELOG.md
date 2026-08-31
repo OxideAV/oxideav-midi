@@ -49,6 +49,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Increment/Decrement (CC 96/97) as plain MIDI 2.0 Control Changes —
   §D.3.3 states they translate as Control Change and never to the
   Relative Controller messages; they were previously withheld.
+- **Conformance fix — Utility message layout**: the MT 0x0 status
+  nibble was decoded/encoded at bits 16..20; Figure 26 and Appendix F
+  Table 26 place it at bits 20..24 (`mt | reserved | status | 20-bit
+  data`), with the Delta Clockstamp's 20-bit tick count filling bits
+  0..20. Under the old layout every DCS decode inflated ticks by the
+  status bits and a full-range DCS was unrepresentable. All Utility
+  word pins updated to the spec layout.
+- **MIDI Clip File** (`clip`, M2-116): `.midi2` reader + writer —
+  `SMF2CLIP` File Header, leading Set Profile On SysEx (no DCS),
+  DCS(0)+DCTPQ, Clip Configuration Header, Start/End of Clip framing
+  with the §3.2.2 `DCS + NOOP` restart for >1,048,575-tick gaps, and
+  the §7.3 nothing-after-End-of-Clip rule. `ClipFile::to_smf()`
+  renders clips through the Appendix-D Default Translation into the
+  existing scheduler/mixer pipeline (MIDI 2.0 CV via the stateful
+  expansions, Flex tempo/meter/key/text → SMF metas, SysEx7 →
+  `F0` events); `ClipFile::from_smf()` builds clips from SMF
+  sequences. `MidiDecoder::send_packet` now accepts both `MThd` and
+  `SMF2CLIP` payloads.
 
 ### Hygiene
 
