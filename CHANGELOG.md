@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Function Block Name ≤91 B) get spec-conformant packet-run builders
   and a `StreamTextAssembler` for reassembly. `UmpMessage::decode` now
   dispatches MT 0xF to the typed surface instead of `Unhandled`.
+- **UMP Data messages** (`ump::data`): System Exclusive (7-bit, MT 0x3,
+  §7.7) and System Exclusive 8 (MT 0x5, §7.8) with Complete /
+  Start / Continue / End packet runs, payload splitters
+  (`sysex7_packets` / `sysex8_packets`) and assemblers honouring the
+  §7.7.1 interspersal-terminates rule and the §7.8.1 abort marker
+  (`# of bytes` 0xF); Mixed Data Set Header + Payload chunks (§7.9);
+  §7.10 16-bit Manufacturer ID translation (Table 20 pinned).
+  `UmpMessage::decode` dispatches MT 0x3 / 0x5 to the typed surface.
 
 ### Hygiene
 

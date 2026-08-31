@@ -32,11 +32,16 @@
 //! Byte, and Word Order Guidance"); this module operates purely on
 //! `u32` words.
 
+pub mod data;
 pub mod message;
 pub mod packet;
 pub mod scaling;
 pub mod stream;
 
+pub use data::{
+    sysex7_packets, sysex8_packets, Data128Message, DataFormat, Sysex7, Sysex7Assembler,
+    Sysex8Assembler,
+};
 pub use message::{
     Midi1ChannelVoice, Midi2ChannelVoice, SystemMessage, UmpMessage, UtilityMessage,
 };

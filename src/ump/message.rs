@@ -11,9 +11,11 @@
 //! Each typed message exposes a `decode` from an [`Ump`] and an `encode`
 //! back to one. The umbrella [`UmpMessage`] dispatches on Message Type
 //! so a [`UmpStream`](super::packet::UmpStream) of mixed packets can be
-//! decoded uniformly; Message Types this module does not yet model
-//! (Data, Flex Data, UMP Stream, Reserved) surface as
-//! [`UmpMessage::Unhandled`] carrying the raw packet.
+//! decoded uniformly — including the Data messages (MT 0x3 / 0x5, in
+//! [`super::data`]) and UMP Stream messages (MT 0xF, in
+//! [`super::stream`]); Message Types this dispatch does not yet model
+//! (Flex Data, Reserved) surface as [`UmpMessage::Unhandled`] carrying
+//! the raw packet.
 
 use oxideav_core::{Error, Result};
 
@@ -290,9 +292,13 @@ pub enum UmpMessage {
     Midi1 { group: u8, msg: Midi1ChannelVoice },
     /// MT 0x4 MIDI 2.0 Channel Voice (with its Group).
     Midi2 { group: u8, msg: Midi2ChannelVoice },
+    /// MT 0x3 Data 64: System Exclusive (7-bit).
+    Sysex7(super::data::Sysex7),
+    /// MT 0x5 Data 128: SysEx8 / Mixed Data Set.
+    Data128(super::data::Data128Message),
     /// MT 0xF UMP Stream (Groupless, addressed to the Endpoint).
     Stream(super::stream::UmpStreamMessage),
-    /// Any Message Type not modelled by this layer (Data, Flex Data,
+    /// Any Message Type not modelled by this layer (Flex Data,
     /// Reserved) — carries the raw packet for inspection.
     Unhandled(Ump),
 }
@@ -311,6 +317,10 @@ impl UmpMessage {
                 group: p.group().unwrap_or(0),
                 msg: Midi2ChannelVoice::decode(p)?,
             }),
+            MessageType::Data64 => Ok(UmpMessage::Sysex7(super::data::Sysex7::decode(p)?)),
+            MessageType::Data128 => {
+                Ok(UmpMessage::Data128(super::data::Data128Message::decode(p)?))
+            }
             MessageType::UmpStream => Ok(UmpMessage::Stream(
                 super::stream::UmpStreamMessage::decode(p)?,
             )),
@@ -413,11 +423,26 @@ mod tests {
 
     #[test]
     fn umpmessage_dispatch_unhandled() {
-        // MT5 Data128 — not modelled, surfaces as Unhandled.
-        let p = ump(&[0x5000_0000, 0, 0, 0]);
+        // MT 0xD Flex Data — not modelled by this dispatch layer yet,
+        // surfaces as Unhandled.
+        let p = ump(&[0xD010_0000, 0, 0, 0]);
         assert!(matches!(
             UmpMessage::decode(&p).unwrap(),
             UmpMessage::Unhandled(_)
+        ));
+    }
+
+    #[test]
+    fn umpmessage_dispatch_sysex7_and_data128() {
+        let p = ump(&[0x3001_7E00, 0, 0, 0]);
+        assert!(matches!(
+            UmpMessage::decode(&p).unwrap(),
+            UmpMessage::Sysex7(_)
+        ));
+        let p = ump(&[0x5002_0041, 0, 0, 0]);
+        assert!(matches!(
+            UmpMessage::decode(&p).unwrap(),
+            UmpMessage::Data128(super::super::data::Data128Message::Sysex8 { .. })
         ));
     }
 }
