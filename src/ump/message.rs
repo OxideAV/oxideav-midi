@@ -12,10 +12,9 @@
 //! back to one. The umbrella [`UmpMessage`] dispatches on Message Type
 //! so a [`UmpStream`](super::packet::UmpStream) of mixed packets can be
 //! decoded uniformly — including the Data messages (MT 0x3 / 0x5, in
-//! [`super::data`]) and UMP Stream messages (MT 0xF, in
-//! [`super::stream`]); Message Types this dispatch does not yet model
-//! (Flex Data, Reserved) surface as [`UmpMessage::Unhandled`] carrying
-//! the raw packet.
+//! [`super::data`]), Flex Data (MT 0xD, in [`super::flex`]) and UMP
+//! Stream messages (MT 0xF, in [`super::stream`]); Reserved Message
+//! Types surface as [`UmpMessage::Unhandled`] carrying the raw packet.
 
 use oxideav_core::{Error, Result};
 
@@ -296,10 +295,12 @@ pub enum UmpMessage {
     Sysex7(super::data::Sysex7),
     /// MT 0x5 Data 128: SysEx8 / Mixed Data Set.
     Data128(super::data::Data128Message),
+    /// MT 0xD Flex Data (tempo / meter / key / chord / text).
+    Flex(super::flex::FlexDataMessage),
     /// MT 0xF UMP Stream (Groupless, addressed to the Endpoint).
     Stream(super::stream::UmpStreamMessage),
-    /// Any Message Type not modelled by this layer (Flex Data,
-    /// Reserved) — carries the raw packet for inspection.
+    /// A Reserved Message Type — carries the raw packet for
+    /// inspection.
     Unhandled(Ump),
 }
 
@@ -318,6 +319,7 @@ impl UmpMessage {
                 msg: Midi2ChannelVoice::decode(p)?,
             }),
             MessageType::Data64 => Ok(UmpMessage::Sysex7(super::data::Sysex7::decode(p)?)),
+            MessageType::FlexData => Ok(UmpMessage::Flex(super::flex::FlexDataMessage::decode(p)?)),
             MessageType::Data128 => {
                 Ok(UmpMessage::Data128(super::data::Data128Message::decode(p)?))
             }
@@ -423,12 +425,21 @@ mod tests {
 
     #[test]
     fn umpmessage_dispatch_unhandled() {
-        // MT 0xD Flex Data — not modelled by this dispatch layer yet,
-        // surfaces as Unhandled.
-        let p = ump(&[0xD010_0000, 0, 0, 0]);
+        // MT 0x6 is Reserved in Table 4 — surfaces as Unhandled.
+        let p = ump(&[0x6000_0000]);
         assert!(matches!(
             UmpMessage::decode(&p).unwrap(),
             UmpMessage::Unhandled(_)
+        ));
+    }
+
+    #[test]
+    fn umpmessage_dispatch_flex() {
+        // MT 0xD Flex Data Set Tempo.
+        let p = ump(&[0xD010_0000, 50_000_000, 0, 0]);
+        assert!(matches!(
+            UmpMessage::decode(&p).unwrap(),
+            UmpMessage::Flex(super::super::flex::FlexDataMessage::SetTempo { .. })
         ));
     }
 

@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`# of bytes` 0xF); Mixed Data Set Header + Payload chunks (§7.9);
   §7.10 16-bit Manufacturer ID translation (Table 20 pinned).
   `UmpMessage::decode` dispatches MT 0x3 / 0x5 to the typed surface.
+- **Flex Data messages** (`ump::flex`): the full MT 0xD vocabulary of
+  §7.5 — Set Tempo (10 ns units, with SMF `FF 51` unit converters),
+  Set Time Signature, Set Metronome, Set Key Signature (4-bit
+  two's-complement sharps/flats + tonic), Set Chord Name (tonic/bass
+  chord types + up to 4+2 alterations, Figure 76 examples pinned), and
+  the Status Bank 0x01/0x02 text families (all Table 16 statuses as
+  constants, 12-byte UMP chunks, ≤32 UMPs, melisma-preserving
+  `FlexTextAssembler` + `flex_text_packets` builder). Channel/Group
+  addressing via `FlexAddress`; `UmpMessage::decode` types MT 0xD.
 
 ### Hygiene
 

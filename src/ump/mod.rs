@@ -33,6 +33,7 @@
 //! `u32` words.
 
 pub mod data;
+pub mod flex;
 pub mod message;
 pub mod packet;
 pub mod scaling;
@@ -42,6 +43,7 @@ pub use data::{
     sysex7_packets, sysex8_packets, Data128Message, DataFormat, Sysex7, Sysex7Assembler,
     Sysex8Assembler,
 };
+pub use flex::{flex_text_packets, FlexAddress, FlexDataMessage, FlexTextAssembler};
 pub use message::{
     Midi1ChannelVoice, Midi2ChannelVoice, SystemMessage, UmpMessage, UtilityMessage,
 };
