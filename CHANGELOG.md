@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-midi/compare/v0.0.4...v0.0.5) - 2026-08-31
+
+### Other
+
+- README MIDI 2.0 axis — UMP stream/data/flex, stateful translation, Clip File, MIDI-CI
+- MIDI-CI typed SysEx surface — envelope, discovery, profiles, property exchange, process inquiry
+- MIDI 2.0 clip playback leg and .midi2 fuzz target
+- MIDI Clip File (M2-116) reader/writer + playback via Appendix-D translation; fix Utility status-nibble layout
+- stateful Appendix-D translation — RPN/NRPN + Bank/Program compound sequences
+- Flex Data messages (MT 0xD) — tempo/meter/key/chord + metadata & performance text
+- Data messages — SysEx7 (MT 0x3), SysEx8 + Mixed Data Set (MT 0x5), 16-bit MfrID
+- UMP Stream messages (MT 0xF) — endpoint/function-block discovery, stream config, clip markers
+- doc(hidden) on the internal public surface
+- README + CHANGELOG for GM2 Percussion Sound Set (round 403)
+- Mixer introspection for the active GM2 drum set
+- GM2 percussion preset pan defaults on Rhythm Channels
+- GM2 §2.8.1 Rhythm-Channel Note-Off-ignored rule
+- GM2 §2.8.1 mutually-exclusive Note choke on Rhythm Channels
+- GM2 Percussion Sound Set data + §2.8.1 EXC groups (Appendix B)
+- README/CHANGELOG entries for GM2 Mode 4 (Mono) channel mode
+- GM2 §2.5/§3.5.6/§3.5.7 Mode 4 (Mono) channel mode
+- CA-023 Key-Based Instrument Controllers into the mixer (GM2 §4.8)
+- CA-019 erratum-E1 confirmation test + round-392 README/CHANGELOG
+- SP-MIDI channel-priority voice masking in the mixer (RP-034 §2.2/§3.1)
+- RP-034 §2.1 Scalable Polyphony MIDI MIP message decoder
+- CA-022 Controller Destination Setting → GM2 §4.6/§3.7 synthesis routing
+- RP-021 Sound Controllers (CC 71-78) wired into synthesis per GM2 §3.3.11-§3.3.18
+- GM2 RP-024 §2.4/§3.3.1 Bank Select + Rhythm/Melody channel roles
+- GM2 RP-024 §3.3.4/§3.3.6/§4.1 square-law volume response curves
+- add CI / crates.io / docs.rs / MIT-license badges
+- README — document round-389 RP/CA addenda coverage
+- RP-050 MIDI Visual Control decoder
+- CA-019 Sample Dump Extensions decoders
+- CA-018/CA-028 File Reference decoder
+- CA-023 Key-Based Instrument Control decoder
+- CA-022 Controller Destination Setting decoder
+- RP-021 Sound Controller classifier (CC 70-79)
+- route CC 88 high-resolution velocity (CA-031)
+- CA-031 CC 88 High-Resolution Velocity Prefix in notes()
+- RP-036 Default Pan Formula for CC 10
+- SF2 voice render fast path for the no-filter/no-mod-pitch case
+- skip Reverb+Chorus effects bus on the dry path (~24% faster)
+- sum portamento glide offset into live pitch-bend
+- README — document round-378 synth controllers + pedals + portamento
+- portamento glide (CC 5 / 65 / 84)
+- split All Sound Off (CC 120) from All Notes Off (CC 123)
+- Soft Pedal (CC 67) per-note una corda attenuation
+- Sostenuto Pedal (CC 66) with Sustain independence
+- Reset All Controllers (CC 121) per RP-015
+- CC 11 Expression Controller folded into mix-time gain
+- README — document round-374 transport / device-control SysEx decoders
+- MMC LOCATE [TARGET] Standard Time decoder (RP-013)
+- round-trip fidelity test for round-374 Universal SysEx families
+- General MIDI System On/Off typed decoder (RP-003 / GM2)
+- Sample Dump Standard header + request body decoders
+- General Information Identity Reply body decoder
+- MIDI Show Control body decoder (RP-002-014)
+- MIDI Machine Control command + response body decoders (RP-013)
+- Device Control GPC body variant + device_controls() iterator
+- Device Control decoder — Master Fine + Coarse Tuning (CA-025)
+- Device Control SysEx body decoder — Master Volume + Master Balance
+- neutralize residual third-party-impl name in r361 scrub entry
+- paraphrase reverb-tuning comment (drop named-impl reference)
+- Reverb/Chorus Type select loads CA-024 table defaults
+- typed Effects-Depth controller classifier + iterator (CC 91-95)
+- apply GM2 Reverb + Chorus as a real DSP send bus (CA-024)
+- end-to-end stream integration tests + README section
+- MIDI 1.0 <-> MIDI 2.0 Channel Voice default-mode translation
+- Universal MIDI Packet container + MIDI 1.0/2.0 message decode
+- typed Channel Mode Message classifier — channel_mode() + channel_mode_messages()
+- multi-packet SysEx reassembly — reassembled_sysex_messages()
+- SmfBuilder / TrackBuilder — assemble files from absolute-tick events
+- running-status writer — to_bytes_running_status() compresses consecutive same-status channel events
+- midi r337: Notation Information Bar Number + Time Signature SysEx body decoders
+- decode RT MTC User Bits Message body (MtcUserBits)
+- UniversalSysExEvent::mtc_full_message() — RT MTC Full Message body decoder
+- SmfFile tick → wall-clock-seconds conversion (TempoTimeline)
+- SmfFile::parameter_data_entries() — RPN / NRPN Data Entry pump decoder
+- refresh to current status, drop per-round changelog cruft
+
 ### Round 454 — MIDI 2.0 axis (M2-104 / M2-116)
 
 - **UMP Stream messages** (`ump::stream`): typed decode + encode for the
