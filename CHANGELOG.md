@@ -61,6 +61,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relative form (saturating). Assignable Controllers (NRPN) are
   recorded per channel with the relative form applied to them. The
   scheduler routes CC 7/10/11/91/93 through the new 7-bit setters.
+- **Native MIDI 2.0 Per-Note messages** (M2-104 §7.4.4/§7.4.5/§7.4.12/
+  §7.4.15.2, Appendix A/C): per-`(channel, note)` state
+  (`PerNoteState` — shared by every note on that number and
+  persistent, per Appendix C.1; untouched by Reset All Controllers per
+  Appendix B.2). `set_per_note_pitch_bend` scales by the RPN #00/07
+  sensitivity and sums with the channel bend on the attached voices;
+  `set_registered_per_note_controller` implements the Table 22 set —
+  #1 Modulation (fractional depth summed with CC 1), **#3 Pitch 7.25**
+  (persistent absolute pitch: sample selected at its integer part via
+  `Mixer::midi2_note_sample_key`, MTS overridden, re-pitched live
+  through the note's life, out-ranked by a Pitch 7.9 attribute), #7 /
+  #11 per-note square-law gains, #10 per-note RP-036 pan, #71–#78
+  captured at note-on with #74 Brightness live, #91 / #93 per-note
+  sends; Reserved numbers are ignored, the rest recorded.
+  `per_note_management` implements D (detach: sounding voices keep
+  their values) and S (reset to not-set / centre), D-then-S ordering.
+  Assignable Per-Note Controllers are recorded. The whole pitch
+  composition (channel bend + tuning + absolute / per-note pitch +
+  CA-023 key tuning + per-note bend + glide) now lives in one
+  `pitch_cents_for_slot`, used identically at note-on and on every
+  re-application — which also stops a channel-bend re-application
+  from dropping a 32-bit bend to 14-bit or an MPE Member's own bend.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-midi/compare/v0.0.4...v0.0.5) - 2026-08-31
 

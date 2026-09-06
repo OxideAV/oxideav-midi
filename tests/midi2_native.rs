@@ -218,3 +218,19 @@ fn cc7_32_on_grid_renders_bit_identically_and_off_grid_scales() {
     }
     assert!(max_abs_diff(&grid, &half) > 0.0);
 }
+
+// ── Per-Note Pitch Bend (M2-104 §7.4.12) ──
+
+#[test]
+fn per_note_pitch_bend_renders_exactly_like_the_same_channel_bend() {
+    // +50 c either way at the default ±200 c sensitivities: both reach
+    // the voice as the fractional value 50.0 → identical PCM.
+    let (channel, _) = render(|m| m.set_pitch_bend_32(0, 0xA000_0000));
+    let (per_note, _) = render(|m| m.set_per_note_pitch_bend(0, 69, 0xA000_0000));
+    assert_eq!(channel, per_note);
+    // A per-note bend on a different note number leaves this one alone.
+    let (other, _) = render(|m| m.set_per_note_pitch_bend(0, 60, 0xA000_0000));
+    let (plain, _) = render(|_| {});
+    assert_eq!(other, plain);
+    assert!(max_abs_diff(&plain, &per_note) > 0.0);
+}

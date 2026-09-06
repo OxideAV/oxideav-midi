@@ -106,6 +106,23 @@ fn hr_refine(value: u32) -> Option<f64> {
     }
 }
 
+/// A composed modulation depth: the MIDI 1.0 whole-cents value, or the
+/// fractional value a MIDI 2.0 32-bit / per-note modulation produces.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ModDepth {
+    Whole(i32),
+    Fine(f64),
+}
+
+/// Per-Note Pitch Bend (M2-104 §7.4.12) to cents at the channel's
+/// Sensitivity of Per-Note Pitch Bend (§7.4.13, in cents): centre
+/// `0x8000_0000` = 0.
+#[doc(hidden)] // internal: voice-mixer conversion helper
+pub fn per_note_bend_cents(value: u32, range_cents: f64) -> f64 {
+    const CENTRE: f64 = 2_147_483_648.0;
+    (f64::from(value) - CENTRE) * range_cents / CENTRE
+}
+
 /// GM2 square-law gain (RP-024 §3.3.4) for a MIDI 2.0 32-bit Volume /
 /// Expression value: the 7-bit curve on the fractional controller
 /// position, exactly [`gm2_cc_gain`] on the 7-bit grid.
@@ -269,6 +286,39 @@ struct VoiceSlot {
     reverb_send_override: Option<u8>,
     /// Key-Based Chorus Send (CC 93 per key, absolute).
     chorus_send_override: Option<u8>,
+    /// The key the voice was generated at (the note number, except
+    /// for a MIDI 2.0 absolute-pitch note where it is the pitch's
+    /// integer part) — the reference for [`Self::pitch_hcu`].
+    sample_key: u8,
+    /// MIDI 2.0 absolute pitch in HCUs (Pitch 7.9 attribute or the
+    /// Registered Per-Note Controller #3 Pitch 7.25), replacing the
+    /// MTS per-key offset for this voice (M2-104 §7.4.15).
+    pitch_hcu: Option<f64>,
+    /// `true` when [`Self::pitch_hcu`] came from the Note On's Pitch
+    /// 7.9 attribute: that pitch is valid for this one note only and
+    /// is not replaced by later Pitch 7.25 messages (§7.4.15.3).
+    attr_pitch: bool,
+    /// CA-023 Key-Based Fine/Coarse Tuning captured at note-on, cents.
+    kb_tune_cents: f64,
+    /// `false` once a Per-Note Management message with D = 1 detached
+    /// this voice from the Per-Note Controllers of its note number
+    /// (M2-104 §7.4.5): it keeps its current per-note values for the
+    /// rest of its life and ignores further per-note messages.
+    pn_attached: bool,
+    /// Per-Note Pitch Bend (§7.4.12) value for this voice (centre
+    /// `0x8000_0000`), scaled by the channel's current RPN #00/07
+    /// sensitivity when the pitch is composed.
+    pn_bend: u32,
+    /// Registered Per-Note Controllers with a live synth meaning,
+    /// captured from the note number's state and updated while
+    /// attached: Modulation (#1), Volume (#7), Pan (#10), Expression
+    /// (#11), Reverb Send (#91), Chorus Send (#93). 32-bit values.
+    pn_modulation: Option<u32>,
+    pn_volume: Option<u32>,
+    pn_pan: Option<u32>,
+    pn_expression: Option<u32>,
+    pn_reverb_send: Option<u32>,
+    pn_chorus_send: Option<u32>,
 }
 
 impl VoiceSlot {
@@ -289,7 +339,113 @@ impl VoiceSlot {
             pan_override: None,
             reverb_send_override: None,
             chorus_send_override: None,
+            sample_key: 0,
+            pitch_hcu: None,
+            attr_pitch: false,
+            kb_tune_cents: 0.0,
+            pn_attached: true,
+            pn_bend: 0x8000_0000,
+            pn_modulation: None,
+            pn_volume: None,
+            pn_pan: None,
+            pn_expression: None,
+            pn_reverb_send: None,
+            pn_chorus_send: None,
         }
+    }
+}
+
+/// Registered Per-Note Controller numbers with a defined function
+/// (M2-104 Appendix A, Table 22). Numbers not listed are Reserved.
+pub mod rpnc {
+    /// #1 Modulation.
+    pub const MODULATION: u8 = 1;
+    /// #2 Breath.
+    pub const BREATH: u8 = 2;
+    /// #3 Pitch 7.25 (§7.4.15.2) — Q7.25 absolute pitch in HCUs.
+    pub const PITCH_7_25: u8 = 3;
+    /// #7 Volume.
+    pub const VOLUME: u8 = 7;
+    /// #8 Balance.
+    pub const BALANCE: u8 = 8;
+    /// #10 Pan.
+    pub const PAN: u8 = 10;
+    /// #11 Expression.
+    pub const EXPRESSION: u8 = 11;
+    /// #70 Sound Controller 1 (Sound Variation) … #79 Sound Controller
+    /// 10 — the RP-021 set; #71–#78 carry the GM2 responses.
+    pub const SOUND_CONTROLLER_1: u8 = 70;
+    /// #74 Sound Controller 5 — Brightness.
+    pub const BRIGHTNESS: u8 = 74;
+    /// #91 Effects 1 Depth — Reverb Send Level (RP-023).
+    pub const REVERB_SEND: u8 = 91;
+    /// #92 Effects 2 Depth (formerly Tremolo Depth).
+    pub const EFFECTS_2: u8 = 92;
+    /// #93 Effects 3 Depth — Chorus Send Level (RP-023).
+    pub const CHORUS_SEND: u8 = 93;
+    /// #94 Effects 4 Depth (formerly Celeste Depth).
+    pub const EFFECTS_4: u8 = 94;
+    /// #95 Effects 5 Depth (formerly Phaser Depth).
+    pub const EFFECTS_5: u8 = 95;
+    /// Registered Per-Note Controller numbers `96..=255` are Reserved
+    /// (Table 22); the state array holds `0..96`.
+    pub const DEFINED_RANGE: usize = 96;
+
+    /// `true` for the Registered Per-Note Controller numbers Table 22
+    /// defines (Reserved numbers "shall not be used").
+    #[must_use]
+    pub fn is_defined(index: u8) -> bool {
+        matches!(index, 1..=3 | 7 | 8 | 10 | 11 | 70..=79 | 91..=95)
+    }
+}
+
+/// Per-Note Controller state of one `(channel, note number)` — MIDI
+/// 2.0 Per-Note Pitch Bend (M2-104 §7.4.12) plus the Registered and
+/// Assignable Per-Note Controllers (§7.4.4). Per Appendix C.1 the
+/// state is **shared** by every note sounding on that number and
+/// **persistent** (§7.4.15.2: "Controllers create persistent state"):
+/// a note struck later on the same number starts from these values,
+/// until a Per-Note Management message with S = 1 resets them
+/// (§7.4.5). Reset All Controllers leaves them alone (Appendix B.2).
+///
+/// A controller that has never been sent is `None` — "not set", so
+/// the channel-level controller governs. Table 22 lists no default
+/// values, so a reset (S = 1) returns every controller to `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)] // internal: voice-mixer plumbing exposed for tests
+pub struct PerNoteState {
+    /// Per-Note Pitch Bend, unsigned bipolar centred at `0x8000_0000`.
+    pub pitch_bend: u32,
+    /// Registered Per-Note Controllers `#0..#95` (Table 22); Reserved
+    /// numbers are recorded but have no function.
+    pub registered: [Option<u32>; rpnc::DEFINED_RANGE],
+    /// Assignable Per-Note Controllers (`#0..#255`), device-specific —
+    /// recorded only.
+    pub assignable: std::collections::HashMap<u8, u32>,
+}
+
+impl Default for PerNoteState {
+    fn default() -> Self {
+        Self {
+            pitch_bend: 0x8000_0000,
+            registered: [None; rpnc::DEFINED_RANGE],
+            assignable: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl PerNoteState {
+    /// A Registered Per-Note Controller's last value, if set.
+    #[must_use]
+    pub fn registered(&self, index: u8) -> Option<u32> {
+        self.registered.get(usize::from(index)).copied().flatten()
+    }
+
+    /// The Pitch 7.25 override (#3) in HCUs, if set.
+    #[must_use]
+    pub fn pitch_hcu(&self) -> Option<f64> {
+        self.registered(rpnc::PITCH_7_25)
+            .map(|v| f64::from(v) / HR_STEP)
     }
 }
 
@@ -1369,6 +1525,10 @@ pub struct Mixer {
     /// (muted). All-false until both a Polyphony Level and a MIP
     /// message are present.
     channel_masked: [bool; NUM_CHANNELS],
+    /// MIDI 2.0 Per-Note Controller state (§7.4.4 / §7.4.12) per
+    /// channel, keyed by note number. Entries appear on the first
+    /// per-note message for that number.
+    per_note: Vec<std::collections::HashMap<u8, PerNoteState>>,
     /// MIDI 2.0 Assignable Controllers (NRPN, M2-104 §7.4.7) per
     /// channel, keyed `bank << 7 | index`. They have no synth-defined
     /// function ("available for any device-specific function"), so the
@@ -1450,6 +1610,7 @@ impl Mixer {
             sp_midi_polyphony: None,
             sp_midi_mip: None,
             channel_masked: [false; NUM_CHANNELS],
+            per_note: vec![std::collections::HashMap::new(); NUM_CHANNELS],
             assignable: vec![std::collections::HashMap::new(); NUM_CHANNELS],
             key_based: vec![std::collections::HashMap::new(); NUM_CHANNELS],
             master_balance_14: 0x2000,
@@ -1769,97 +1930,30 @@ impl Mixer {
     }
 
     /// Push the channel's (possibly just-changed) bend to every voice
-    /// it governs, honouring the MPE Manager / Member routing.
+    /// it governs, honouring the MPE Manager / Member routing: a
+    /// Manager Channel's bend reaches every voice in its zone (whose
+    /// own Member bend still sums in), any other channel's bend only
+    /// its own voices. Each voice is re-composed through
+    /// [`Self::pitch_cents_for_slot`].
     fn reapply_channel_bend(&mut self, channel: u8) {
         let ch = channel as usize % NUM_CHANNELS;
-
-        // If this is an MPE Manager Channel, the bend reaches every
-        // voice in the zone *combined* with that member channel's own
-        // per-note bend. Per Appendix C we sum the two values in
-        // cents.
-        let role = self.channels[ch].mpe_role;
-        let is_drum = self.channels[ch].rhythm;
-
-        if let MpeRole::Manager(zone_kind) = role {
-            // Update every voice in the zone (Manager-held notes too).
-            let zone = match zone_kind {
-                MpeZoneKind::Lower => self.mpe_lower,
-                MpeZoneKind::Upper => self.mpe_upper,
+        let zone = match self.channels[ch].mpe_role {
+            MpeRole::Manager(MpeZoneKind::Lower) => self.mpe_lower,
+            MpeRole::Manager(MpeZoneKind::Upper) => self.mpe_upper,
+            _ => None,
+        };
+        for idx in 0..self.slots.len() {
+            let slot_ch = self.slots[idx].channel;
+            let affected = match zone {
+                Some(z) => {
+                    slot_ch == channel
+                        || slot_ch == z.manager_channel()
+                        || z.member_channels().contains(&slot_ch)
+                }
+                None => slot_ch == channel,
             };
-            if let Some(z) = zone {
-                for slot in self.slots.iter_mut() {
-                    let slot_ch = slot.channel as usize % NUM_CHANNELS;
-                    if slot.channel == channel
-                        || slot.channel == z.manager_channel()
-                        || z.member_channels().contains(&slot.channel)
-                    {
-                        if let Some(voice) = slot.voice.as_mut() {
-                            let mut total = Self::compose_pitch_cents(
-                                &self.channels[slot_ch],
-                                self.channels[ch].bend_cents(),
-                                self.master_fine_tune_cents,
-                                self.master_coarse_tune_semitones,
-                                self.channels[slot_ch].rhythm,
-                            );
-                            if slot_ch != 9 {
-                                total += f64::from(
-                                    self.tuning.offset_cents(slot.channel, slot.key).round() as i32,
-                                );
-                            }
-                            // Preserve an in-progress portamento glide on
-                            // this voice — a live bend sums with the glide.
-                            total += f64::from(slot.glide_offset_cents.round() as i32);
-                            voice.set_pitch_bend_fine_cents(total);
-                        }
-                    }
-                }
-            }
-        } else {
-            // Non-MPE or MPE Member: apply only to voices on this
-            // exact channel.
-            for slot in self.slots.iter_mut() {
-                if slot.channel == channel {
-                    if let Some(voice) = slot.voice.as_mut() {
-                        // For a Member channel, also fold in the
-                        // Manager's currently-held bend.
-                        let mut total = if let MpeRole::Member(zone_kind) = role {
-                            let mgr_ch = match zone_kind {
-                                MpeZoneKind::Lower => 0u8,
-                                MpeZoneKind::Upper => 15u8,
-                            };
-                            let mgr_state = &self.channels[mgr_ch as usize];
-                            let member_cents = self.channels[ch].bend_cents();
-                            let mgr_cents = mgr_state.bend_cents();
-                            let mut total = member_cents + mgr_cents;
-                            if !is_drum {
-                                total += f64::from(self.channels[ch].channel_fine_tune_cents);
-                                total += f64::from(
-                                    self.channels[ch].channel_coarse_tune_semitones as i32 * 100,
-                                );
-                                total += f64::from(self.master_fine_tune_cents);
-                                total += f64::from(self.master_coarse_tune_semitones as i32 * 100);
-                            }
-                            total
-                        } else {
-                            Self::compose_pitch_cents(
-                                &self.channels[ch],
-                                self.channels[ch].bend_cents(),
-                                self.master_fine_tune_cents,
-                                self.master_coarse_tune_semitones,
-                                is_drum,
-                            )
-                        };
-                        if !is_drum {
-                            total += f64::from(
-                                self.tuning.offset_cents(slot.channel, slot.key).round() as i32,
-                            );
-                        }
-                        // Preserve an in-progress portamento glide on this
-                        // voice — a live bend sums with the glide offset.
-                        total += f64::from(slot.glide_offset_cents.round() as i32);
-                        voice.set_pitch_bend_fine_cents(total);
-                    }
-                }
+            if affected && self.slots[idx].voice.is_some() {
+                self.reapply_pitch_for_slot(idx);
             }
         }
     }
@@ -2284,11 +2378,9 @@ impl Mixer {
     /// "MUST NOT result in MIDI note-shifting" rule — playing a
     /// drum-key at a different pitch picks a different sound.
     fn reapply_pitch_for_channel(&mut self, channel: u8) {
-        let ch = channel as usize % NUM_CHANNELS;
-        let bend = self.channels[ch].pitch_bend;
-        // set_pitch_bend already routes through the channel state into
-        // every held voice.
-        self.set_pitch_bend(channel, bend);
+        // Re-compose every governed voice from the channel state as it
+        // stands (a 32-bit bend in force stays at full resolution).
+        self.reapply_channel_bend(channel);
     }
 
     /// Re-evaluate the effective mod-wheel depth on every voice held on
@@ -2304,26 +2396,20 @@ impl Mixer {
         // routes only to that channel's own voices.
         // CC 1 depth (scaled by RPN 5) plus the CA-022 LFO Pitch Depth
         // destination (GM2 §4.6) — both are LFO pitch sway, so they sum.
-        let dest_cents = st.ctrl_dest_mods().lfo_pitch_cents;
-        // A native 32-bit CC 1 off the 7-bit grid keeps its fractional
-        // depth (`pos / 127 × range`); on the grid, or from a 7-bit CC
-        // 1, the integer-cents MIDI 1.0 computation is used verbatim.
-        let fine =
-            st.hr.mod_wheel.and_then(hr_refine).map(|pos| {
-                pos * f64::from(st.mod_depth_range_cents) / 127.0 + f64::from(dest_cents)
-            });
-        let depth_cents =
-            (st.mod_wheel as i32) * (st.mod_depth_range_cents as i32) / 127 + dest_cents;
+        // A native 32-bit CC 1 off the 7-bit grid, or a per-note
+        // modulation, keeps its fractional depth; otherwise the
+        // integer-cents MIDI 1.0 computation is used verbatim.
         for slot in self.slots.iter_mut() {
             if self.channels[slot.channel as usize % NUM_CHANNELS].matches_for_zone_broadcast(
                 slot.channel,
                 channel,
                 &st.mpe_role,
             ) {
+                let depth = Self::mod_depth_for(&st, slot.pn_modulation);
                 if let Some(v) = slot.voice.as_mut() {
-                    match fine {
-                        Some(f) => v.set_mod_depth_fine_cents(f),
-                        None => v.set_mod_depth_cents(depth_cents),
+                    match depth {
+                        ModDepth::Fine(f) => v.set_mod_depth_fine_cents(f),
+                        ModDepth::Whole(c) => v.set_mod_depth_cents(c),
                     }
                 }
             }
@@ -3315,10 +3401,23 @@ impl Mixer {
     /// this slot's glide offset) to one slot's voice. Mirrors the
     /// note-on composition so a gliding voice tracks live bend changes.
     fn reapply_pitch_for_slot(&mut self, idx: usize) {
-        let (channel, key, glide) = {
-            let s = &self.slots[idx];
-            (s.channel, s.key, s.glide_offset_cents)
-        };
+        let cents = self.pitch_cents_for_slot(idx);
+        if let Some(v) = self.slots[idx].voice.as_mut() {
+            v.set_pitch_bend_fine_cents(cents);
+        }
+    }
+
+    /// The complete pitch offset for one slot, in (fractional) cents:
+    /// channel bend + channel / master tuning + CA-022 pitch (+ the
+    /// MPE Manager's bend), then either the MIDI 2.0 absolute pitch
+    /// (Pitch 7.9 / Pitch 7.25, relative to the sample key) or the
+    /// MTS per-key offset, the CA-023 key-based drum tuning, the
+    /// Per-Note Pitch Bend, and the portamento glide. Used identically
+    /// at note-on and on every later re-application, so a voice never
+    /// drifts between the two compositions.
+    fn pitch_cents_for_slot(&self, idx: usize) -> f64 {
+        let s = &self.slots[idx];
+        let (channel, key) = (s.channel, s.key);
         let ch = channel as usize % NUM_CHANNELS;
         let st = self.channels[ch];
         let is_drum = st.rhythm;
@@ -3336,13 +3435,29 @@ impl Mixer {
             };
             cents += self.channels[mgr].bend_cents();
         }
-        if !is_drum {
-            cents += f64::from(self.tuning.offset_cents(channel, key).round() as i32);
+        // MTS per-key tuning (key-based table + channel scale/octave).
+        // Drum channels are exempt from note-shifting per CA-25's
+        // principle (a different pitch on a drum kit is a different
+        // sound). A MIDI 2.0 absolute pitch overrides MTS for the
+        // voice (M2-104 §7.4.15): it sounds at `pitch_hcu`, expressed
+        // as an exact fractional offset from the key it was generated
+        // at.
+        match s.pitch_hcu {
+            Some(p) => cents += (p - f64::from(s.sample_key)) * 100.0,
+            None => {
+                // The note number's own pitch, measured from the key
+                // the voice was generated at (equal for every note that
+                // never carried an absolute pitch — zero extra).
+                cents += f64::from((i32::from(key) - i32::from(s.sample_key)) * 100);
+                if !is_drum {
+                    cents += f64::from(self.tuning.offset_cents(channel, key).round() as i32);
+                }
+            }
         }
-        cents += f64::from(glide.round() as i32);
-        if let Some(v) = self.slots[idx].voice.as_mut() {
-            v.set_pitch_bend_fine_cents(cents);
-        }
+        cents += s.kb_tune_cents;
+        cents += per_note_bend_cents(s.pn_bend, st.per_note_bend_range_cents());
+        cents += f64::from(s.glide_offset_cents.round() as i32);
+        cents
     }
 
     /// Allocate a voice slot. If the pool is full, preempt the oldest
@@ -3447,7 +3562,7 @@ impl Mixer {
         self.channels[ch].high_res_velocity_prefix = None;
         let v7 = midi2_velocity_to_7(velocity);
         let gain = f32::from(velocity) / f32::from(u16::from(v7) << 9);
-        let sample_key = midi2_sample_key(note, attribute_type, attribute);
+        let sample_key = self.midi2_note_sample_key(channel, note, attribute_type, attribute);
         let pitch =
             (attribute_type == ATTRIBUTE_TYPE_PITCH_7_9).then(|| f64::from(attribute) / 512.0);
         self.note_on_inner(
@@ -3563,52 +3678,29 @@ impl Mixer {
         } else {
             None
         };
-        // Compose pitch bend + per-channel fine/coarse + master
-        // fine/coarse + (for MPE Members) the Manager Channel's bend
-        // — picks up tuning on the new voice's very first sample so
-        // a note triggered while the bend wheel is held doesn't pop.
-        let mut cents = Self::compose_pitch_cents(
-            &st,
-            st.bend_cents(),
-            self.master_fine_tune_cents,
-            self.master_coarse_tune_semitones,
-            is_drum,
-        );
-        if let MpeRole::Member(zone_kind) = st.mpe_role {
-            let mgr = match zone_kind {
-                MpeZoneKind::Lower => 0,
-                MpeZoneKind::Upper => 15,
-            };
-            cents += self.channels[mgr].bend_cents();
-        }
-        // Fold in the MTS per-key tuning offset (key-based table +
-        // channel scale/octave). Drum channels are exempt from
-        // note-shifting per CA-25's principle (a different pitch on a
-        // drum kit is a different sound), matching the master-tuning
-        // exemption above. A MIDI 2.0 absolute pitch (Pitch 7.9)
-        // overrides MTS for this note (M2-104 §7.4.15.3): the voice
-        // sounds at `pitch_hcu`, expressed as an exact fractional
-        // offset from the key it was generated at.
-        match pitch_hcu {
-            Some(p) => cents += (p - f64::from(sample_key)) * 100.0,
-            None if !is_drum => {
-                cents += f64::from(self.tuning.offset_cents(channel, key).round() as i32);
-            }
-            None => {}
-        }
         // Key-Based Fine / Coarse Tuning (CA-023 `nn = 78H/79H`): the
         // drum-channel note-shift exemption doesn't apply — this IS
         // the sanctioned per-key drum tuning mechanism. Mapped like
         // the channel-tuning RPN MSBs: coarse (v−64) semitones, fine
-        // (v−64)·100/64 cents.
+        // (v−64)·100/64 cents. Captured on the slot so a later bend
+        // re-application keeps it.
+        let mut kb_tune_cents = 0.0;
         if let Some(kb) = kb {
             if let Some(f) = kb.fine_tune {
-                cents += f64::from(((f as i32 - 64) * 100) / 64);
+                kb_tune_cents += f64::from(((f as i32 - 64) * 100) / 64);
             }
             if let Some(c) = kb.coarse_tune {
-                cents += f64::from((c as i32 - 64) * 100);
+                kb_tune_cents += f64::from((c as i32 - 64) * 100);
             }
         }
+        // MIDI 2.0 Per-Note state for this note number (§7.4.4 /
+        // §7.4.12, Appendix C.1: shared and persistent). A Pitch 7.9
+        // attribute wins over the persistent Pitch 7.25 (§7.4.15.3).
+        let pn = self.per_note[ch].get(&key).cloned();
+        let attr_pitch = pitch_hcu.is_some();
+        let pitch_hcu = pitch_hcu.or_else(|| pn.as_ref().and_then(PerNoteState::pitch_hcu));
+        let pn_bend = pn.as_ref().map_or(0x8000_0000, |p| p.pitch_bend);
+        let pn_reg = |i: u8| pn.as_ref().and_then(|p| p.registered(i));
         // Portamento (CC 5 / 65 / 84): compute the glide for this note-on
         // (also updates the channel's last-played key + consumes a pending
         // CC 84 source). Drum channels never glide — a drum key is a
@@ -3626,16 +3718,28 @@ impl Mixer {
             Some((offset, total)) => (offset, -offset / total as f32, total),
             None => (0.0, 0.0, 0),
         };
-        let initial_cents = cents + f64::from(glide_offset_cents.round() as i32);
-        if initial_cents != 0.0 {
-            voice.set_pitch_bend_fine_cents(initial_cents);
-        }
         // Sound Controllers CC 71–78 (GM2 RP-024 §3.3.11–§3.3.18):
-        // capture the channel's snapshot into the fresh voice. Skipped
-        // when neutral (all-64) so unmodified scores stay bit-identical,
-        // and on Rhythm Channels (GM2 [recommended] non-response).
-        if !is_drum && !st.sound_controls.is_neutral() {
-            voice.apply_sound_controls(&st.sound_controls);
+        // capture the channel's snapshot into the fresh voice — with
+        // the Registered Per-Note Controllers #71–#78 (Table 22: the
+        // same RP-021 set, per note) overriding the channel values for
+        // this note. Skipped when neutral (all-64) so unmodified scores
+        // stay bit-identical, and on Rhythm Channels (GM2 [recommended]
+        // non-response).
+        let mut sc = st.sound_controls;
+        if pn.is_some() {
+            use crate::ump::scaling::scale_32_to_7;
+            let pick = |i: u8, cur: u8| pn_reg(i).map_or(cur, scale_32_to_7);
+            sc.resonance = pick(71, sc.resonance);
+            sc.release_time = pick(72, sc.release_time);
+            sc.attack_time = pick(73, sc.attack_time);
+            sc.brightness = pick(74, sc.brightness);
+            sc.decay_time = pick(75, sc.decay_time);
+            sc.vibrato_rate = pick(76, sc.vibrato_rate);
+            sc.vibrato_depth = pick(77, sc.vibrato_depth);
+            sc.vibrato_delay = pick(78, sc.vibrato_delay);
+        }
+        if !is_drum && !sc.is_neutral() {
+            voice.apply_sound_controls(&sc);
         }
         // Compose Member + Manager channel pressure for MPE; otherwise
         // just hand the channel's value through.
@@ -3657,16 +3761,11 @@ impl Mixer {
         // bend does. Rhythm Channels don't respond (GM2 RP-024 §3.3.2
         // [recommended]; ctrl_dest_mods is neutral on rhythm).
         let dest = st.ctrl_dest_mods();
-        let depth_cents =
-            (st.mod_wheel as i32) * (st.mod_depth_range_cents as i32) / 127 + dest.lfo_pitch_cents;
         if !is_drum {
-            match st.hr.mod_wheel.and_then(hr_refine) {
-                Some(pos) => voice.set_mod_depth_fine_cents(
-                    pos * f64::from(st.mod_depth_range_cents) / 127.0
-                        + f64::from(dest.lfo_pitch_cents),
-                ),
-                None if depth_cents != 0 => voice.set_mod_depth_cents(depth_cents),
-                None => {}
+            match Self::mod_depth_for(&st, pn_reg(rpnc::MODULATION)) {
+                ModDepth::Fine(f) => voice.set_mod_depth_fine_cents(f),
+                ModDepth::Whole(c) if c != 0 => voice.set_mod_depth_cents(c),
+                ModDepth::Whole(_) => {}
             }
         }
         // CA-022 / GM2 §4.6 filter + LFO destinations reach the fresh
@@ -3715,7 +3814,260 @@ impl Mixer {
             pan_override: kb.and_then(|k| k.pan).or(drum_preset_pan),
             reverb_send_override: kb.and_then(|k| k.reverb_send),
             chorus_send_override: kb.and_then(|k| k.chorus_send),
+            sample_key,
+            pitch_hcu,
+            attr_pitch,
+            kb_tune_cents,
+            pn_attached: true,
+            pn_bend,
+            pn_modulation: pn_reg(rpnc::MODULATION),
+            pn_volume: pn_reg(rpnc::VOLUME),
+            pn_pan: pn_reg(rpnc::PAN),
+            pn_expression: pn_reg(rpnc::EXPRESSION),
+            pn_reverb_send: pn_reg(rpnc::REVERB_SEND),
+            pn_chorus_send: pn_reg(rpnc::CHORUS_SEND),
         };
+        // Compose the full pitch (channel bend + tuning + absolute /
+        // per-note pitch + glide start) — picks up tuning on the new
+        // voice's very first sample so a note triggered while the bend
+        // wheel is held doesn't pop.
+        let initial_cents = self.pitch_cents_for_slot(idx);
+        if initial_cents != 0.0 {
+            if let Some(v) = self.slots[idx].voice.as_mut() {
+                v.set_pitch_bend_fine_cents(initial_cents);
+            }
+        }
+        // Per-Note Brightness (#74) is also a live parameter on the
+        // voice (like CC 74); the snapshot above only sized the filter
+        // for strike time.
+        if let Some(b) = pn_reg(rpnc::BRIGHTNESS) {
+            if !is_drum {
+                if let Some(v) = self.slots[idx].voice.as_mut() {
+                    v.set_timbre(crate::ump::scaling::scale_32_to_7(b));
+                }
+            }
+        }
+    }
+
+    // ───────────── MIDI 2.0 Per-Note messages (§7.4.4 / §7.4.5 / §7.4.12) ─────────────
+
+    /// The Per-Note Controller state of `(channel, note)`, if any
+    /// per-note message has addressed that note number.
+    pub fn per_note_state(&self, channel: u8, note: u8) -> Option<&PerNoteState> {
+        self.per_note[channel as usize % NUM_CHANNELS].get(&(note & 0x7F))
+    }
+
+    /// The key an instrument should generate a MIDI 2.0 note's voice
+    /// at, taking the persistent Per-Note Pitch 7.25 into account
+    /// (M2-104 §7.4.15: "select samples based on the first 7 bits of
+    /// the pitch data"): the Pitch 7.9 attribute's integer part, else
+    /// the note number's Pitch 7.25 integer part, else the note number.
+    pub fn midi2_note_sample_key(
+        &self,
+        channel: u8,
+        note: u8,
+        attribute_type: u8,
+        attribute: u16,
+    ) -> u8 {
+        if attribute_type == ATTRIBUTE_TYPE_PITCH_7_9 {
+            return midi2_sample_key(note, attribute_type, attribute);
+        }
+        self.per_note_state(channel, note)
+            .and_then(|p| p.registered(rpnc::PITCH_7_25))
+            .map_or(note & 0x7F, |v| (v >> 25) as u8)
+    }
+
+    /// Apply a **MIDI 2.0 Per-Note Pitch Bend** (M2-104 §7.4.12): an
+    /// unsigned bipolar value centred at `0x8000_0000`, scaled by the
+    /// channel's Sensitivity of Per-Note Pitch Bend (RPN #00/07,
+    /// §7.4.13) and summed with the channel bend on every attached
+    /// voice sounding on `(channel, note)`. The value persists for
+    /// later notes on that number (Appendix C.1).
+    pub fn set_per_note_pitch_bend(&mut self, channel: u8, note: u8, value: u32) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let note = note & 0x7F;
+        self.per_note[ch].entry(note).or_default().pitch_bend = value;
+        for idx in 0..self.slots.len() {
+            let s = &self.slots[idx];
+            if s.channel == channel && s.key == note && s.pn_attached && s.voice.is_some() {
+                self.slots[idx].pn_bend = value;
+                self.reapply_pitch_for_slot(idx);
+            }
+        }
+    }
+
+    /// Apply a **MIDI 2.0 Registered Per-Note Controller** (M2-104
+    /// §7.4.4, Appendix A Table 22) to `(channel, note)`. The value is
+    /// recorded for the note number (persistent, shared by every note
+    /// on it) and applied live to the attached sounding voices:
+    ///
+    /// * **#1 Modulation** — per-note LFO pitch depth (CC 1 response
+    ///   through the channel's RPN 5 range), summed with the channel's.
+    /// * **#3 Pitch 7.25** (§7.4.15.2) — the note's absolute pitch;
+    ///   overrides MTS and re-pitches sounding notes in real time.
+    /// * **#7 Volume / #11 Expression** — per-note square-law gains
+    ///   multiplied with the channel's (GM2 RP-024 §3.3.4/§3.3.6).
+    /// * **#10 Pan** — per-note RP-036 pan position (a CA-023
+    ///   Key-Based Pan on a Rhythm Channel still takes precedence).
+    /// * **#71–#78 Sound Controllers** — captured at note-on like CC
+    ///   71–78; **#74 Brightness** also routes live.
+    /// * **#91 / #93 Reverb / Chorus Send** — per-note send levels.
+    ///
+    /// #2 Breath, #8 Balance, #70 / #79, #92 / #94 / #95 have no synth
+    /// response and are recorded only; Reserved numbers (Table 22:
+    /// "shall not be used") are ignored.
+    pub fn set_registered_per_note_controller(
+        &mut self,
+        channel: u8,
+        note: u8,
+        index: u8,
+        value: u32,
+    ) {
+        use crate::ump::scaling::scale_32_to_7;
+        if !rpnc::is_defined(index) {
+            return;
+        }
+        let ch = channel as usize % NUM_CHANNELS;
+        let note = note & 0x7F;
+        self.per_note[ch].entry(note).or_default().registered[usize::from(index)] = Some(value);
+        let is_drum = self.channels[ch].rhythm;
+        for idx in 0..self.slots.len() {
+            let s = &self.slots[idx];
+            if !(s.channel == channel && s.key == note && s.pn_attached && s.voice.is_some()) {
+                continue;
+            }
+            match index {
+                rpnc::MODULATION => {
+                    self.slots[idx].pn_modulation = Some(value);
+                    if !is_drum {
+                        self.reapply_mod_depth_for_slot(idx);
+                    }
+                }
+                rpnc::PITCH_7_25 => {
+                    // A Pitch 7.9 note keeps its own absolute pitch
+                    // (§7.4.15.3: it overrides Pitch 7.25); every other
+                    // voice re-pitches to the new value, measured from
+                    // the key it was generated at.
+                    if !self.slots[idx].attr_pitch {
+                        self.slots[idx].pitch_hcu = Some(f64::from(value) / HR_STEP);
+                        self.reapply_pitch_for_slot(idx);
+                    }
+                }
+                rpnc::VOLUME => self.slots[idx].pn_volume = Some(value),
+                rpnc::PAN => self.slots[idx].pn_pan = Some(value),
+                rpnc::EXPRESSION => self.slots[idx].pn_expression = Some(value),
+                rpnc::BRIGHTNESS => {
+                    if !is_drum {
+                        if let Some(v) = self.slots[idx].voice.as_mut() {
+                            v.set_timbre(scale_32_to_7(value));
+                        }
+                    }
+                }
+                rpnc::REVERB_SEND => self.slots[idx].pn_reverb_send = Some(value),
+                rpnc::CHORUS_SEND => self.slots[idx].pn_chorus_send = Some(value),
+                _ => {}
+            }
+        }
+    }
+
+    /// Record a **MIDI 2.0 Assignable Per-Note Controller** (M2-104
+    /// §7.4.4) — device-specific, no synth response.
+    pub fn set_assignable_per_note_controller(
+        &mut self,
+        channel: u8,
+        note: u8,
+        index: u8,
+        value: u32,
+    ) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.per_note[ch]
+            .entry(note & 0x7F)
+            .or_default()
+            .assignable
+            .insert(index, value);
+    }
+
+    /// Apply a **MIDI 2.0 Per-Note Management** message (M2-104
+    /// §7.4.5). `detach` (D): every voice currently sounding on
+    /// `(channel, note)` stops responding to Per-Note Controllers and
+    /// Per-Note Pitch Bend, keeping its current values for the rest of
+    /// its life. `reset` (S): the note number's Per-Note Controllers
+    /// and Per-Note Pitch Bend return to their defaults (not set /
+    /// centre) for future notes. With both set, Detach runs first, so
+    /// the sounding voices keep their values and only future notes see
+    /// the defaults. D = 0, S = 0 has no defined function.
+    pub fn per_note_management(&mut self, channel: u8, note: u8, detach: bool, reset: bool) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let note = note & 0x7F;
+        if detach {
+            for s in self.slots.iter_mut() {
+                if s.channel == channel && s.key == note && s.voice.is_some() {
+                    s.pn_attached = false;
+                }
+            }
+        }
+        if reset {
+            self.per_note[ch].remove(&note);
+            // Attached voices follow the reset (S without D: "all
+            // Per-Note Controllers on the referenced Note Number should
+            // be reset to their default values").
+            for idx in 0..self.slots.len() {
+                let s = &self.slots[idx];
+                if s.channel == channel && s.key == note && s.pn_attached && s.voice.is_some() {
+                    let s = &mut self.slots[idx];
+                    s.pn_bend = 0x8000_0000;
+                    s.pn_modulation = None;
+                    s.pn_volume = None;
+                    s.pn_pan = None;
+                    s.pn_expression = None;
+                    s.pn_reverb_send = None;
+                    s.pn_chorus_send = None;
+                    // A Pitch 7.9 note keeps its attribute pitch; a
+                    // Pitch 7.25-driven voice falls back to its key.
+                    if !s.attr_pitch {
+                        s.pitch_hcu = None;
+                    }
+                    self.reapply_pitch_for_slot(idx);
+                    if !self.channels[ch].rhythm {
+                        self.reapply_mod_depth_for_slot(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Modulation depth for a voice on channel state `st` with an
+    /// optional Registered Per-Note Controller #1 value: the MIDI 1.0
+    /// integer-cents computation (`mod_wheel × range / 127` + the
+    /// CA-022 LFO Pitch Depth) unless a 32-bit CC 1 off the 7-bit grid
+    /// or a per-note modulation asks for the fractional form.
+    fn mod_depth_for(st: &ChannelState, per_note: Option<u32>) -> ModDepth {
+        let dest = st.ctrl_dest_mods().lfo_pitch_cents;
+        let range = f64::from(st.mod_depth_range_cents);
+        let whole = (st.mod_wheel as i32) * (st.mod_depth_range_cents as i32) / 127 + dest;
+        let channel_fine = st
+            .hr
+            .mod_wheel
+            .and_then(hr_refine)
+            .map(|pos| pos * range / 127.0 + f64::from(dest));
+        let note_fine = per_note.map(|v| f64::from(v) / HR_STEP * range / 127.0);
+        match (channel_fine, note_fine) {
+            (None, None) => ModDepth::Whole(whole),
+            (cf, nf) => ModDepth::Fine(cf.unwrap_or(f64::from(whole)) + nf.unwrap_or(0.0)),
+        }
+    }
+
+    /// Push the composed (channel + per-note) modulation depth to one
+    /// slot's voice.
+    fn reapply_mod_depth_for_slot(&mut self, idx: usize) {
+        let st = self.channels[self.slots[idx].channel as usize % NUM_CHANNELS];
+        let depth = Self::mod_depth_for(&st, self.slots[idx].pn_modulation);
+        if let Some(v) = self.slots[idx].voice.as_mut() {
+            match depth {
+                ModDepth::Fine(f) => v.set_mod_depth_fine_cents(f),
+                ModDepth::Whole(c) => v.set_mod_depth_cents(c),
+            }
+        }
     }
 
     /// Trigger release on every slot matching `(channel, key)` that
@@ -3870,7 +4222,9 @@ impl Mixer {
             }) || self.slots.iter().any(|s| {
                 s.voice.is_some()
                     && (s.reverb_send_override.unwrap_or(0) > 0
-                        || s.chorus_send_override.unwrap_or(0) > 0)
+                        || s.chorus_send_override.unwrap_or(0) > 0
+                        || s.pn_reverb_send.unwrap_or(0) > 0
+                        || s.pn_chorus_send.unwrap_or(0) > 0)
             });
             self.fx.active |= sends_present;
         }
@@ -3940,7 +4294,12 @@ impl Mixer {
                     .expression
                     .map_or_else(|| gm2_cc_gain(st.expression), gm2_cc_gain_32)
                 * st.ctrl_dest_mods().amp_factor
-                * slot.note_gain;
+                * slot.note_gain
+                // Registered Per-Note Controllers #7 / #11 (M2-104
+                // Appendix A): per-note square-law gains, unity when
+                // not set.
+                * slot.pn_volume.map_or(1.0, gm2_cc_gain_32)
+                * slot.pn_expression.map_or(1.0, gm2_cc_gain_32);
             // Constant-power pan per RP-036 (Default Pan Formula):
             //   Left  gain = cos(π/2 · max(0, CC10 − 1) / 126)
             //   Right gain = sin(π/2 · max(0, CC10 − 1) / 126)
@@ -3960,8 +4319,18 @@ impl Mixer {
             // A native 32-bit CC 10 (no per-key override in play) walks
             // the RP-036 formula on its fractional position: centre
             // `0x8000_0000` = position 64.0 = the true centre.
-            let pan_norm = match (slot.pan_override, st.hr.pan.and_then(hr_refine)) {
-                (None, Some(pos)) => (((pos - 1.0).max(0.0)) / 126.0).min(1.0) as f32,
+            // Precedence: CA-023 Key-Based Pan (drums) > Registered
+            // Per-Note Controller #10 > 32-bit CC 10 > 7-bit CC 10. A
+            // per-note pan exactly on the 7-bit grid takes the 7-bit
+            // formula on its downscale.
+            let pan_norm = match (slot.pan_override, slot.pn_pan.or(st.hr.pan)) {
+                (None, Some(hr)) => match hr_refine(hr) {
+                    Some(pos) => (((pos - 1.0).max(0.0)) / 126.0).min(1.0) as f32,
+                    None => {
+                        let p7 = crate::ump::scaling::scale_32_to_7(hr);
+                        (p7.saturating_sub(1) as f32 / 126.0).clamp(0.0, 1.0)
+                    }
+                },
                 _ => (pan_value.saturating_sub(1) as f32 / 126.0).clamp(0.0, 1.0),
             };
             let theta = pan_norm * std::f32::consts::FRAC_PI_2;
@@ -3970,12 +4339,20 @@ impl Mixer {
             // overridden per voice by the Key-Based Reverb / Chorus
             // Send (GM2 §4.8, absolute). Zero when nothing touched the
             // controllers, so a dry score bypasses the bus entirely.
-            let reverb_send = match (slot.reverb_send_override, st.hr.reverb_send) {
+            // Precedence: CA-023 Key-Based send > Registered Per-Note
+            // Controller #91 / #93 > 32-bit CC > 7-bit CC.
+            let reverb_send = match (
+                slot.reverb_send_override,
+                slot.pn_reverb_send.or(st.hr.reverb_send),
+            ) {
                 (Some(kb), _) => kb as f32 / 127.0,
                 (None, Some(hr)) => unit_32(hr),
                 (None, None) => st.reverb_send as f32 / 127.0,
             };
-            let chorus_send = match (slot.chorus_send_override, st.hr.chorus_send) {
+            let chorus_send = match (
+                slot.chorus_send_override,
+                slot.pn_chorus_send.or(st.hr.chorus_send),
+            ) {
                 (Some(kb), _) => kb as f32 / 127.0,
                 (None, Some(hr)) => unit_32(hr),
                 (None, None) => st.chorus_send as f32 / 127.0,
@@ -5606,6 +5983,236 @@ mod tests {
         assert_eq!(m.live_voice_count(), 2);
         m.all_notes_off();
         assert_eq!(m.live_voice_count(), 0);
+    }
+
+    // ── MIDI 2.0 Per-Note messages (§7.4.4 / §7.4.5 / §7.4.12 / §7.4.15.2) ──
+
+    #[test]
+    fn per_note_pitch_bend_targets_one_note_number_sums_with_channel_and_persists() {
+        let mut m = Mixer::new();
+        let (a, fine_a, _) = fine_bend_voice(64);
+        let (b, fine_b, _) = fine_bend_voice(64);
+        m.note_on(0, 60, 100, a);
+        m.note_on(0, 64, 100, b);
+        // +½ range at the default 2.0 HCU sensitivity = +100 cents.
+        m.set_per_note_pitch_bend(0, 60, 0xC000_0000);
+        assert_eq!(*fine_a.lock().unwrap(), 100.0);
+        assert_eq!(*fine_b.lock().unwrap(), 0.0);
+        assert_eq!(
+            m.per_note_state(0, 60).map(|p| p.pitch_bend),
+            Some(0xC000_0000)
+        );
+        // Channel bend sums on top ("acts like Pitch Bend in every way").
+        m.set_pitch_bend_32(0, 0xC000_0000);
+        assert_eq!(*fine_a.lock().unwrap(), 200.0);
+        assert_eq!(*fine_b.lock().unwrap(), 100.0);
+        // Persistent: a later note on the same number starts bent.
+        let (c, fine_c, _) = fine_bend_voice(64);
+        m.note_on(0, 60, 100, c);
+        assert_eq!(*fine_c.lock().unwrap(), 200.0);
+        // Another channel is untouched.
+        let (d, fine_d, _) = fine_bend_voice(64);
+        m.note_on(1, 60, 100, d);
+        assert_eq!(*fine_d.lock().unwrap(), 0.0);
+        // Reset All Controllers leaves per-note state alone (App. B.2).
+        m.reset_all_controllers(0);
+        assert_eq!(
+            *fine_a.lock().unwrap(),
+            100.0,
+            "channel bend reset, per-note kept"
+        );
+        assert!(m.per_note_state(0, 60).is_some());
+    }
+
+    #[test]
+    fn per_note_pitch_bend_follows_rpn_00_07_sensitivity() {
+        let mut m = Mixer::new();
+        let (a, fine, _) = fine_bend_voice(64);
+        m.note_on(0, 60, 100, a);
+        m.set_registered_controller(0, 0, 7, 12 << 25); // ±12 HCU
+        m.set_per_note_pitch_bend(0, 60, 0xC000_0000);
+        assert_eq!(*fine.lock().unwrap(), 600.0);
+        // Changing the sensitivity re-scales the held per-note bend.
+        m.set_registered_controller(0, 0, 7, 1 << 25);
+        assert_eq!(*fine.lock().unwrap(), 50.0);
+        assert_eq!(per_note_bend_cents(0, 200.0), -200.0);
+        assert_eq!(per_note_bend_cents(0x8000_0000, 1200.0), 0.0);
+    }
+
+    #[test]
+    fn per_note_management_detach_keeps_values_and_reset_restores_defaults() {
+        let mut m = Mixer::new();
+        let (a, fine_a, _) = fine_bend_voice(64);
+        m.note_on(0, 60, 100, a);
+        m.set_per_note_pitch_bend(0, 60, 0xC000_0000);
+        assert_eq!(*fine_a.lock().unwrap(), 100.0);
+        // D = 1: A no longer follows per-note messages but keeps +100.
+        m.per_note_management(0, 60, true, false);
+        m.set_per_note_pitch_bend(0, 60, 0xE000_0000);
+        assert_eq!(*fine_a.lock().unwrap(), 100.0);
+        // The next note on #60 is attached and sees the new state.
+        let (b, fine_b, _) = fine_bend_voice(64);
+        m.note_on(0, 60, 100, b);
+        assert_eq!(*fine_b.lock().unwrap(), 150.0);
+        // S = 1 (no D): the note number resets; attached B follows,
+        // detached A still keeps its value.
+        m.per_note_management(0, 60, false, true);
+        assert!(m.per_note_state(0, 60).is_none());
+        assert_eq!(*fine_b.lock().unwrap(), 0.0);
+        assert_eq!(*fine_a.lock().unwrap(), 100.0);
+        // D + S: detach first, then reset — B keeps its current value
+        // and only future notes see the defaults.
+        m.set_per_note_pitch_bend(0, 60, 0x4000_0000);
+        assert_eq!(*fine_b.lock().unwrap(), -100.0);
+        m.per_note_management(0, 60, true, true);
+        assert_eq!(*fine_b.lock().unwrap(), -100.0);
+        let (c, fine_c, _) = fine_bend_voice(64);
+        m.note_on(0, 60, 100, c);
+        assert_eq!(*fine_c.lock().unwrap(), 0.0);
+        // D = 0, S = 0 has no defined function.
+        m.set_per_note_pitch_bend(0, 60, 0xC000_0000);
+        m.per_note_management(0, 60, false, false);
+        assert_eq!(*fine_c.lock().unwrap(), 100.0);
+    }
+
+    #[test]
+    fn pitch_7_25_per_note_controller_is_persistent_absolute_pitch_with_live_repitch() {
+        let mut m = Mixer::new();
+        m.set_scale_octave_tuning(0, [30.0; 12], false); // MTS, to be overridden
+                                                         // Note #60 sounds at 61.5 HCU: the sample is picked at 61 and
+                                                         // the voice sits +50 cents above it.
+        m.set_registered_per_note_controller(0, 60, rpnc::PITCH_7_25, (61 << 25) | (1 << 24));
+        assert_eq!(m.midi2_note_sample_key(0, 60, ATTRIBUTE_TYPE_NONE, 0), 61);
+        assert_eq!(m.midi2_note_sample_key(0, 62, ATTRIBUTE_TYPE_NONE, 0), 62);
+        assert_eq!(m.per_note_state(0, 60).unwrap().pitch_hcu(), Some(61.5));
+        let (a, fine_a, _) = fine_bend_voice(64);
+        m.note_on_midi2(0, 60, 100 << 9, ATTRIBUTE_TYPE_NONE, 0, a);
+        assert_eq!(
+            *fine_a.lock().unwrap(),
+            50.0,
+            "MTS overridden, +50 c from key 61"
+        );
+        // Real-time control through the note's life (§7.4.15.2).
+        m.set_registered_per_note_controller(0, 60, rpnc::PITCH_7_25, 62 << 25);
+        assert_eq!(*fine_a.lock().unwrap(), 100.0);
+        // Per-note bend and channel bend offset from the Pitch 7.25.
+        m.set_per_note_pitch_bend(0, 60, 0xC000_0000);
+        assert_eq!(*fine_a.lock().unwrap(), 200.0);
+        // A Pitch 7.9 note wins over the persistent Pitch 7.25 and
+        // ignores later Pitch 7.25 changes (§7.4.15.3).
+        let (b, fine_b, _) = fine_bend_voice(64);
+        m.note_on_midi2(
+            0,
+            60,
+            100 << 9,
+            ATTRIBUTE_TYPE_PITCH_7_9,
+            (60 << 9) | 128,
+            b,
+        );
+        assert_eq!(
+            *fine_b.lock().unwrap(),
+            25.0 + 100.0,
+            "7.9 pitch + per-note bend"
+        );
+        m.set_registered_per_note_controller(0, 60, rpnc::PITCH_7_25, 70 << 25);
+        assert_eq!(*fine_b.lock().unwrap(), 125.0);
+        assert_eq!(*fine_a.lock().unwrap(), 900.0 + 100.0);
+        // Reset (S = 1) drops the Pitch 7.25 → back to the key + MTS.
+        m.per_note_management(0, 60, false, true);
+        assert_eq!(*fine_b.lock().unwrap(), 25.0, "attribute pitch survives");
+        assert_eq!(
+            *fine_a.lock().unwrap(),
+            30.0 - 100.0,
+            "MTS +30 c; key 60 vs sample 61"
+        );
+    }
+
+    #[test]
+    fn per_note_volume_expression_pan_sends_apply_in_the_mix() {
+        let mut m = Mixer::new();
+        m.set_pan(0, 0); // hard left
+        m.note_on(0, 60, 100, voice(1.0, 64));
+        m.note_on(0, 62, 100, voice(1.0, 64));
+        let (l0, _) = one_sample_lr(&mut m);
+        m.set_registered_per_note_controller(0, 60, rpnc::VOLUME, 64 << 25);
+        let (l1, _) = one_sample_lr(&mut m);
+        let per_voice = l0 / 2.0;
+        assert!((l1 - (per_voice + per_voice * gm2_cc_gain(64))).abs() < 1e-6);
+        m.set_registered_per_note_controller(0, 60, rpnc::EXPRESSION, 0);
+        let (l2, _) = one_sample_lr(&mut m);
+        assert!(
+            (l2 - per_voice).abs() < 1e-6,
+            "note 60 silenced by per-note expression"
+        );
+        // Per-note pan beats the channel pan: note 62 hard right.
+        m.set_registered_per_note_controller(0, 62, rpnc::PAN, 0xFFFF_FFFF);
+        let (l3, r3) = one_sample_lr(&mut m);
+        assert!(l3.abs() < 1e-6 && r3 > 0.0, "{l3} {r3}");
+        // On-grid per-note pan 64 = true centre.
+        m.set_registered_per_note_controller(0, 62, rpnc::PAN, 64 << 25);
+        let (l4, r4) = one_sample_lr(&mut m);
+        assert_eq!(l4, r4);
+        // A per-note send latches the effects bus.
+        assert!(!m.fx.active);
+        m.set_registered_per_note_controller(0, 62, rpnc::REVERB_SEND, 1 << 20);
+        one_sample_lr(&mut m);
+        assert!(m.fx.active);
+        // Persistent: a new note on #60 starts with the per-note
+        // expression of 0.
+        m.note_on(0, 60, 100, voice(1.0, 64));
+        let (l5, _) = one_sample_lr(&mut m);
+        assert!((l5 - l4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn per_note_modulation_and_brightness_route_to_voices() {
+        let mut m = Mixer::new();
+        let (v, _b, _p, depth, timbre) = instrumented_voice_full(0.5, 64);
+        m.note_on(0, 60, 100, v);
+        m.set_mod_wheel(0, 100); // 100·50/127 = 39 whole cents
+        assert_eq!(*depth.lock().unwrap(), 39);
+        // Per-note #1 adds 64/127 × 50 c = 25.2 c → 64.2, rounded by
+        // the integer-only probe.
+        m.set_registered_per_note_controller(0, 60, rpnc::MODULATION, 64 << 25);
+        assert_eq!(*depth.lock().unwrap(), 64);
+        // A channel CC 1 move re-composes both parts.
+        m.set_mod_wheel(0, 0);
+        assert_eq!(*depth.lock().unwrap(), 25);
+        // Brightness #74 routes live like CC 74 …
+        m.set_registered_per_note_controller(0, 60, rpnc::BRIGHTNESS, 100 << 25);
+        assert_eq!(*timbre.lock().unwrap(), 100);
+        // … and reaches a later note on that number at strike time.
+        let (v2, _b2, _p2, depth2, timbre2) = instrumented_voice_full(0.5, 64);
+        m.note_on(0, 60, 100, v2);
+        assert_eq!(*timbre2.lock().unwrap(), 100);
+        assert_eq!(*depth2.lock().unwrap(), 25);
+        // Another note number is untouched.
+        let (v3, _b3, _p3, depth3, timbre3) = instrumented_voice_full(0.5, 64);
+        m.note_on(0, 61, 100, v3);
+        assert_eq!(*timbre3.lock().unwrap(), 0);
+        assert_eq!(*depth3.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn reserved_per_note_controllers_are_ignored_and_assignable_recorded() {
+        let mut m = Mixer::new();
+        for idx in [0u8, 4, 5, 6, 9, 12, 69, 80, 90, 96, 200, 255] {
+            assert!(!rpnc::is_defined(idx), "{idx}");
+            m.set_registered_per_note_controller(0, 60, idx, 1);
+        }
+        assert!(m.per_note_state(0, 60).is_none());
+        m.set_registered_per_note_controller(0, 60, rpnc::BREATH, 7);
+        assert_eq!(
+            m.per_note_state(0, 60).unwrap().registered(rpnc::BREATH),
+            Some(7)
+        );
+        m.set_assignable_per_note_controller(0, 60, 200, 9);
+        assert_eq!(
+            m.per_note_state(0, 60).unwrap().assignable.get(&200),
+            Some(&9)
+        );
+        m.per_note_management(0, 60, false, true);
+        assert!(m.per_note_state(0, 60).is_none());
     }
 
     // ── MIDI 2.0 32-bit controllers (§7.4.6 / §7.4.7 / §7.4.8 / §7.4.10) ──
