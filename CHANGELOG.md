@@ -165,6 +165,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   concave / convex source types (the staged §8.2.4 formula is not
   usable as printed — the §8.4.1 velocity→attenuation default keeps
   the documented square-law approximation).
+- **Writer fixed points** (`tests/writer_fixed_point.rs`): the `.midi2`
+  writer round-trips a clip carrying every UMP Message Type the reader
+  hands back — JR Clock / Timestamp, every System and MIDI 1.0 / 2.0
+  Channel Voice opcode, SysEx7 / SysEx8 / Mixed Data Set runs, every
+  Flex Data family including a 32-packet text, every UMP Stream
+  message including the 98 / 42 / 91-byte names, Reserved Message
+  Types of every size, two Set Profile On profiles, configuration
+  events and 20-bit Delta Clockstamp restarts — `parse(write(c)) ==
+  c` with `write` idempotent; the SMF writers (explicit and running
+  status) do the same over every meta kind, `F0` / `F7` sysex, every
+  channel voice message on every channel, TPQN + SMPTE divisions,
+  formats 0 / 1 / 2 and 4-byte deltas; the fixture corpus round-trips;
+  and the SMF ⇄ clip concordance is lossy exactly once, then stable.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-midi/compare/v0.0.4...v0.0.5) - 2026-08-31
 
