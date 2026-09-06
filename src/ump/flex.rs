@@ -561,12 +561,24 @@ pub fn usec_per_quarter_to_10ns(usec: u32) -> u32 {
 /// nearest microsecond.
 #[must_use]
 pub fn ten_ns_per_quarter_to_usec(ten_ns: u32) -> u32 {
-    (ten_ns + 50) / 100
+    // Widen: the rounding term overflows u32 for the top 50 values
+    // (fuzz-found via a Set Tempo of 0xFFFF_FFFF); the quotient always
+    // fits (≈ 42.9 M µs).
+    ((u64::from(ten_ns) + 50) / 100) as u32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ten_ns_to_usec_rounds_and_survives_the_top_of_the_range() {
+        assert_eq!(ten_ns_per_quarter_to_usec(50_000_000), 500_000);
+        assert_eq!(ten_ns_per_quarter_to_usec(149), 1);
+        assert_eq!(ten_ns_per_quarter_to_usec(150), 2);
+        assert_eq!(ten_ns_per_quarter_to_usec(u32::MAX), 42_949_673);
+        assert_eq!(ten_ns_per_quarter_to_usec(u32::MAX - 49), 42_949_672);
+    }
 
     fn round_trip(m: &FlexDataMessage) {
         let p = m.encode();

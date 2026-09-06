@@ -178,6 +178,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channel voice message on every channel, TPQN + SMPTE divisions,
   formats 0 / 1 / 2 and 4-byte deltas; the fixture corpus round-trips;
   and the SMF ⇄ clip concordance is lossy exactly once, then stable.
+- **Fuzzing**: new `ump` target (UMP word-stream walker + every
+  Message Type's decoder / encoder, decode → encode → decode a fixed
+  point); the `clip` target now asserts `parse(write(clip)) == clip`
+  and renders a bounded slice through the native MIDI 2.0 scheduler +
+  mixer; the `smf` target asserts both writers are fixed points of the
+  parser, refusing only the documented reader-tolerated shapes (a
+  header `ntrks` that disagrees with the `MTrk` chunks present, a
+  track without / with a misplaced End of Track, an `Unknown { 0x2F }`
+  meta). Foreground campaigns (ump 7.7 M, clip 5.6 M, smf 25.6 M, sf2
+  44 M runs) found and fixed: a debug overflow in
+  `ten_ns_per_quarter_to_usec` for Set Tempo values above
+  `u32::MAX − 50`, and three SMF writer checks that refused bytes the
+  reader keeps verbatim (`KeySignature.mode` outside {0, 1}, `Port` /
+  `ChannelPrefix` above their spec ranges) — the writer now re-emits
+  them so every parsed file round-trips. Regression seeds are checked
+  in under `fuzz/corpus/`. A `Fuzz` workflow builds every target on
+  nightly and smoke-runs each for 30 s.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-midi/compare/v0.0.4...v0.0.5) - 2026-08-31
 

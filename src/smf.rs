@@ -10045,12 +10045,14 @@ fn write_meta(out: &mut Vec<u8>, meta: &MetaEvent) -> Result<()> {
             write_vlq(out, u32_len(text.len(), "Text payload")?)?;
             out.extend_from_slice(text);
         }
+        // Channel Prefix / Port carry one byte the reader keeps
+        // verbatim whatever its value (the spec ranges are 0..=15 and
+        // 0..=127); the writer re-emits it as-is so a parsed file
+        // always round-trips (fuzz-found: a Port of 0x8B).
         MetaEvent::ChannelPrefix(c) => {
-            check_data_byte(*c, "ChannelPrefix")?;
             out.extend_from_slice(&[0x20, 0x01, *c]);
         }
         MetaEvent::Port(p) => {
-            check_data_byte(*p, "Port")?;
             out.extend_from_slice(&[0x21, 0x01, *p]);
         }
         MetaEvent::EndOfTrack => {
@@ -10095,11 +10097,11 @@ fn write_meta(out: &mut Vec<u8>, meta: &MetaEvent) -> Result<()> {
             ]);
         }
         MetaEvent::KeySignature { sharps_flats, mode } => {
-            if !matches!(mode, 0 | 1) {
-                return Err(Error::invalid(format!(
-                    "SMF: KeySignature.mode {mode} not in {{0, 1}}",
-                )));
-            }
+            // The spec defines `mi` as 0 (major) or 1 (minor); the
+            // reader keeps whatever byte the file carried (the key
+            // classifiers report "unknown" for other values), so the
+            // writer re-emits it verbatim — a parsed file always
+            // round-trips (fuzz-found: a mode of 47).
             out.push(0x59);
             out.push(0x02);
             out.push(*sharps_flats as u8);

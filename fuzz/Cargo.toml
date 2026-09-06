@@ -10,6 +10,11 @@ cargo-fuzz = true
 # Five input surfaces in oxideav-midi take attacker-controlled bytes
 # and walk variable-length structures end-to-end:
 #
+#   * `ump`                 — Universal MIDI Packet word stream
+#                             (M2-104): self-delimiting 1..4-word
+#                             packets for every Message Type incl.
+#                             Reserved ones; decode → encode → decode
+#                             must be a fixed point.
 #   * `clip::parse`         — MIDI Clip File (`.midi2`, M2-116):
 #                             SMF2CLIP header, big-endian UMP word
 #                             stream with self-delimiting 1..4-word
@@ -74,6 +79,12 @@ doc = false
 [[bin]]
 name = "clip"
 path = "fuzz_targets/clip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ump"
+path = "fuzz_targets/ump.rs"
 test = false
 doc = false
 

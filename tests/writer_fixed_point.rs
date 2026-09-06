@@ -576,6 +576,73 @@ fn smf_writer_rejects_what_the_reader_cannot_produce() {
     let mut f = exhaustive_smf(SmfFormat::SingleTrack, Division::TicksPerQuarter(96), 1);
     f.header.ntrks = 2;
     assert!(f.to_bytes().is_err());
+    // The reader's spec-mandated tolerance for unknown chunk types can
+    // produce that shape: a file declaring one track whose only chunk
+    // is not an `MTrk` parses to zero tracks under `ntrks = 1` — and
+    // the writer refuses to re-emit the inconsistent model (fuzz-found).
+    let bytes = [
+        b"MThd".as_slice(),
+        &[0, 0, 0, 6, 0, 0, 0, 1, 0, 0x60],
+        b"OTrk",
+        &[0, 0, 0, 4, 0, 0xFF, 0x2F, 0],
+    ]
+    .concat();
+    let parsed = smf::parse(&bytes).expect("unknown chunks are skipped");
+    assert_eq!(parsed.header.ntrks, 1);
+    assert!(parsed.tracks.is_empty());
+    assert!(parsed.to_bytes().is_err());
+    assert!(parsed.to_bytes_running_status().is_err());
+    // Likewise a track chunk that simply ends without `FF 2F 00`: the
+    // reader keeps the events it found, the writer wants the End of
+    // Track appended first (fuzz-found).
+    let bytes = [
+        b"MThd".as_slice(),
+        &[0, 0, 0, 6, 0, 0, 0, 1, 0, 0x60],
+        b"MTrk",
+        &[0, 0, 0, 4, 0, 0x90, 0x3C, 0x40],
+    ]
+    .concat();
+    let parsed = smf::parse(&bytes).expect("truncated track tolerated");
+    assert_eq!(parsed.tracks[0].events.len(), 1);
+    assert!(parsed.to_bytes().is_err());
+    // Field *values* the reader keeps verbatim round-trip verbatim — a
+    // key-signature mode byte outside {0, 1} included (fuzz-found).
+    let bytes = [
+        b"MThd".as_slice(),
+        &[0, 0, 0, 6, 0, 0, 0, 1, 0, 0x60],
+        b"MTrk",
+        &[0, 0, 0, 10, 0, 0xFF, 0x59, 2, 0xF9, 47, 0, 0xFF, 0x2F, 0],
+    ]
+    .concat();
+    let parsed = smf::parse(&bytes).unwrap();
+    assert_eq!(
+        parsed.tracks[0].events[0].kind,
+        Event::Meta(MetaEvent::KeySignature {
+            sharps_flats: -7,
+            mode: 47
+        })
+    );
+    assert_eq!(parsed.to_bytes().unwrap(), bytes);
+    // Port / Channel Prefix bytes beyond their spec ranges likewise.
+    let bytes = [
+        b"MThd".as_slice(),
+        &[0, 0, 0, 6, 0, 0, 0, 1, 0, 0x60],
+        b"MTrk",
+        &[
+            0, 0, 0, 14, 0, 0xFF, 0x21, 1, 0x8B, 0, 0xFF, 0x20, 1, 0x90, 0, 0xFF, 0x2F, 0,
+        ],
+    ]
+    .concat();
+    let parsed = smf::parse(&bytes).unwrap();
+    assert_eq!(
+        parsed.tracks[0].events[0].kind,
+        Event::Meta(MetaEvent::Port(0x8B))
+    );
+    assert_eq!(
+        parsed.tracks[0].events[1].kind,
+        Event::Meta(MetaEvent::ChannelPrefix(0x90))
+    );
+    assert_eq!(parsed.to_bytes().unwrap(), bytes);
 }
 
 #[test]
