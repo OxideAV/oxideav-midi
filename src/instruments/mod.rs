@@ -191,6 +191,15 @@ pub trait Voice: Send {
     /// modulation depth (the tone fallback ignores it).
     fn set_mod_depth_cents(&mut self, _cents: i32) {}
 
+    /// Per-note modulation depth in **fractional** cents — the MIDI 2.0
+    /// resolution form of [`set_mod_depth_cents`](Voice::set_mod_depth_cents),
+    /// fed by a native 32-bit CC 1 (M2-104 §7.4.6). Default rounds to
+    /// the nearest cent and forwards; voices with a fractional LFO
+    /// depth override it.
+    fn set_mod_depth_fine_cents(&mut self, cents: f64) {
+        self.set_mod_depth_cents(cents.round() as i32);
+    }
+
     /// MPE-style "third dimension of control" (Control Change #74).
     /// Per the MPE spec §2.2.8 + Appendix D, this carries timbre
     /// information that affects the live voice independently of pitch

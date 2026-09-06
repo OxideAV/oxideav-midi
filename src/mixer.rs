@@ -81,6 +81,57 @@ pub fn gm2_cc_gain(value: u8) -> f32 {
     norm * norm
 }
 
+/// One 7-bit controller step expressed in the MIDI 2.0 32-bit
+/// controller space: the §D.1.4 downscale is `value >> 25`, so the
+/// low 25 bits are the resolution a 32-bit value adds *below* one
+/// 7-bit step.
+const HR_STEP: f64 = 33_554_432.0; // 2^25
+
+/// The MIDI 2.0 32-bit controller refinement rule shared by every
+/// hi-res controller path. Returns `None` when `value` sits exactly on
+/// the 7-bit grid (its low 25 bits are zero) — the caller then takes
+/// the MIDI 1.0 path verbatim, so such values render **bit-identically**
+/// to the 7-bit controller they downscale to. Otherwise returns the
+/// value as a fractional 7-bit controller position (`value / 2^25`,
+/// e.g. `100.5`), which the caller feeds through the same response
+/// curve as the 7-bit value: the 2^25 positions between two 7-bit
+/// steps become distinct, monotone responses. (The top position,
+/// `0xFFFF_FFFF`, sits 1/128 of a step above 127.)
+#[must_use]
+fn hr_refine(value: u32) -> Option<f64> {
+    if value & 0x01FF_FFFF == 0 {
+        None
+    } else {
+        Some(f64::from(value) / HR_STEP)
+    }
+}
+
+/// GM2 square-law gain (RP-024 §3.3.4) for a MIDI 2.0 32-bit Volume /
+/// Expression value: the 7-bit curve on the fractional controller
+/// position, exactly [`gm2_cc_gain`] on the 7-bit grid.
+#[doc(hidden)] // internal: voice-mixer conversion helper
+pub fn gm2_cc_gain_32(value: u32) -> f32 {
+    match hr_refine(value) {
+        None => gm2_cc_gain((value >> 25) as u8),
+        Some(pos) => {
+            let norm = pos / 127.0;
+            (norm * norm) as f32
+        }
+    }
+}
+
+/// A MIDI 2.0 32-bit controller as a `0..=1` fraction of the 7-bit
+/// full scale (127): exactly `v7 / 127` on the grid, continuous in
+/// between. Used for pressure and effect-send depths. Clamped at 1.0
+/// (the top 1/128 step above 127 saturates).
+#[doc(hidden)] // internal: voice-mixer conversion helper
+pub fn unit_32(value: u32) -> f32 {
+    match hr_refine(value) {
+        None => (value >> 25) as f32 / 127.0,
+        Some(pos) => (pos / 127.0).min(1.0) as f32,
+    }
+}
+
 /// Gain applied to a note struck while the Soft Pedal (CC 67) is down.
 /// The MIDI 1.0 spec describes CC 67 as a switch ("≤63 off, ≥64 on")
 /// without prescribing a depth; `0.667` (≈ −3.5 dB) is a moderate
@@ -430,6 +481,20 @@ pub struct ChannelState {
     /// live via [`Mixer::set_timbre`]. Per RP-015, Reset All
     /// Controllers does **not** reset the Sound Controllers.
     pub sound_controls: SoundControls,
+    /// Native MIDI 2.0 32-bit values of the controllers the synth
+    /// renders (M2-104 §7.4.6 / §7.4.10). Each is `Some` only while the
+    /// most recent message for that controller arrived at 32-bit
+    /// resolution; a MIDI 1.0 7-bit message clears it. The 7-bit fields
+    /// above always hold the §D.1.4 downscale so MIDI 1.0 consumers of
+    /// the state stay coherent.
+    pub hr: HiResControls,
+    /// Registered Controller Bank 0 / Index 7 — **Sensitivity of
+    /// Per-Note Pitch Bend** (M2-104 §7.4.13): a Q7.25 unsigned
+    /// interval in 100-cent units, shared by every note number on the
+    /// channel. Default 2.0 HCU (`0x0400_0000`, ±200 cents). The spec
+    /// leaves the default unstated; this synth mirrors the channel
+    /// Pitch Bend Sensitivity default (RP-018).
+    pub per_note_bend_sensitivity: u32,
     /// Pending CC 88 **High-Resolution Velocity Prefix** (CA-031): the
     /// lower 7 bits affixed below the *next* Note On / Note Off velocity
     /// on this channel, forming a 14-bit velocity
@@ -480,8 +545,54 @@ impl Default for ChannelState {
             ctrl_dest_cc_value: 0,
             mono: false,
             sound_controls: SoundControls::default(),
+            hr: HiResControls::default(),
+            per_note_bend_sensitivity: DEFAULT_PER_NOTE_BEND_SENSITIVITY,
             high_res_velocity_prefix: None,
         }
+    }
+}
+
+/// Default Sensitivity of Per-Note Pitch Bend (RPN #00/07): 2.0 HCU
+/// in Q7.25 — ±200 cents, matching the channel bend default.
+pub const DEFAULT_PER_NOTE_BEND_SENSITIVITY: u32 = 2 << 25;
+
+/// Native MIDI 2.0 32-bit controller shadows (see
+/// [`ChannelState::hr`]). Every field is `None` until a 32-bit
+/// message for that controller arrives, so a MIDI 1.0 score never
+/// touches them and renders exactly as before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[doc(hidden)] // internal: voice-mixer plumbing exposed for tests
+pub struct HiResControls {
+    /// CC 7 Channel Volume, 32-bit.
+    pub volume: Option<u32>,
+    /// CC 11 Expression, 32-bit.
+    pub expression: Option<u32>,
+    /// CC 10 Pan, 32-bit (centre `0x8000_0000` = RP-036 true centre).
+    pub pan: Option<u32>,
+    /// CC 1 Modulation Wheel, 32-bit.
+    pub mod_wheel: Option<u32>,
+    /// Channel Pressure, 32-bit (§7.4.10).
+    pub channel_pressure: Option<u32>,
+    /// CC 91 Reverb Send, 32-bit.
+    pub reverb_send: Option<u32>,
+    /// CC 93 Chorus Send, 32-bit.
+    pub chorus_send: Option<u32>,
+}
+
+impl ChannelState {
+    /// Channel Pressure as a `0..=1` fraction: the 32-bit value when one
+    /// is in force, else `channel_pressure / 127`.
+    pub fn pressure_frac(&self) -> f32 {
+        match self.hr.channel_pressure {
+            Some(v) => unit_32(v),
+            None => (self.channel_pressure as f32 / 127.0).clamp(0.0, 1.0),
+        }
+    }
+
+    /// Sensitivity of Per-Note Pitch Bend (RPN #00/07) in cents: the
+    /// Q7.25 HCU value × 100.
+    pub fn per_note_bend_range_cents(&self) -> f64 {
+        f64::from(self.per_note_bend_sensitivity) * 100.0 / HR_STEP
     }
 }
 
@@ -1258,6 +1369,12 @@ pub struct Mixer {
     /// (muted). All-false until both a Polyphony Level and a MIP
     /// message are present.
     channel_masked: [bool; NUM_CHANNELS],
+    /// MIDI 2.0 Assignable Controllers (NRPN, M2-104 §7.4.7) per
+    /// channel, keyed `bank << 7 | index`. They have no synth-defined
+    /// function ("available for any device-specific function"), so the
+    /// mixer records the last 32-bit value and applies the §7.4.8
+    /// relative form to it; [`Self::assignable_controller`] exposes it.
+    assignable: Vec<std::collections::HashMap<u16, u32>>,
     /// Key-Based Instrument Controller tables (CA-023 / GM2 §4.8):
     /// per channel, per key. Applied to Rhythm-Channel voices at
     /// note-on; cleared for a channel when a new percussion set is
@@ -1333,6 +1450,7 @@ impl Mixer {
             sp_midi_polyphony: None,
             sp_midi_mip: None,
             channel_masked: [false; NUM_CHANNELS],
+            assignable: vec![std::collections::HashMap::new(); NUM_CHANNELS],
             key_based: vec![std::collections::HashMap::new(); NUM_CHANNELS],
             master_balance_14: 0x2000,
             master_fine_tune_cents: 0,
@@ -1790,6 +1908,25 @@ impl Mixer {
     pub fn set_channel_pressure(&mut self, channel: u8, value: u8) {
         let ch = channel as usize % NUM_CHANNELS;
         self.channels[ch].channel_pressure = value;
+        self.channels[ch].hr.channel_pressure = None;
+        self.route_channel_pressure(channel);
+    }
+
+    /// Apply a native **MIDI 2.0 32-bit Channel Pressure** (M2-104
+    /// §7.4.10). The 7-bit shadow takes the §D.1.4 downscale (it also
+    /// feeds the CA-022 destination table); the voices receive the
+    /// full-resolution `0..=1` fraction ([`unit_32`]).
+    pub fn set_channel_pressure_32(&mut self, channel: u8, value: u32) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].channel_pressure = crate::ump::scaling::scale_32_to_7(value);
+        self.channels[ch].hr.channel_pressure = Some(value);
+        self.route_channel_pressure(channel);
+    }
+
+    /// Push the channel's pressure (7- or 32-bit) to every voice it
+    /// governs under the MPE rules, then re-run the CA-022 routing.
+    fn route_channel_pressure(&mut self, channel: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
         let role = self.channels[ch].mpe_role;
         for slot in self.slots.iter_mut() {
             let slot_ch = slot.channel as usize % NUM_CHANNELS;
@@ -1811,16 +1948,16 @@ impl Mixer {
             if routes {
                 if let Some(voice) = slot.voice.as_mut() {
                     let combined = Self::compose_pressure(
-                        self.channels[slot_ch].channel_pressure,
+                        self.channels[slot_ch].pressure_frac(),
                         match self.channels[slot_ch].mpe_role {
                             MpeRole::Member(kind) => {
                                 let mgr = match kind {
                                     MpeZoneKind::Lower => 0,
                                     MpeZoneKind::Upper => 15,
                                 };
-                                self.channels[mgr].channel_pressure
+                                self.channels[mgr].pressure_frac()
                             }
-                            _ => 0,
+                            _ => 0.0,
                         },
                     );
                     voice.set_pressure(combined);
@@ -1845,11 +1982,20 @@ impl Mixer {
     /// drop a stray PolyPressure on a Member to avoid clobbering an
     /// unrelated key's voice via the lookup.
     pub fn set_poly_pressure(&mut self, channel: u8, key: u8, value: u8) {
+        self.route_poly_pressure(channel, key, (value as f32 / 127.0).clamp(0.0, 1.0));
+    }
+
+    /// Apply a native **MIDI 2.0 32-bit Poly Pressure** (M2-104 §7.4.3)
+    /// to the voices on `(channel, key)` at full resolution.
+    pub fn set_poly_pressure_32(&mut self, channel: u8, key: u8, value: u32) {
+        self.route_poly_pressure(channel, key, unit_32(value));
+    }
+
+    fn route_poly_pressure(&mut self, channel: u8, key: u8, p: f32) {
         let ch = channel as usize % NUM_CHANNELS;
         if matches!(self.channels[ch].mpe_role, MpeRole::Member(_)) {
             return;
         }
-        let p = (value as f32 / 127.0).clamp(0.0, 1.0);
         for slot in self.slots.iter_mut() {
             if slot.channel == channel && slot.key == key {
                 if let Some(voice) = slot.voice.as_mut() {
@@ -1890,6 +2036,9 @@ impl Mixer {
         self.channels[ch].rpn = 0x3FFF; // RPN/NRPN selector → null
         self.channels[ch].pitch_bend = 0x2000; // centre
         self.channels[ch].pitch_bend_hr = None;
+        self.channels[ch].hr.expression = None;
+        self.channels[ch].hr.mod_wheel = None;
+        self.channels[ch].hr.channel_pressure = None;
 
         // Pedals (CC 64/65/66/67) → off. Lift the Sostenuto pedal first
         // (CC 66), then Sustain (CC 64): a held pedal must release on RAC.
@@ -1931,9 +2080,8 @@ impl Mixer {
     /// is the simplest combining rule that matches the spec's intent
     /// ("the two should be combined meaningfully") without
     /// double-counting overlapping inputs.
-    fn compose_pressure(member_0_127: u8, manager_0_127: u8) -> f32 {
-        let m = member_0_127.max(manager_0_127);
-        (m as f32 / 127.0).clamp(0.0, 1.0)
+    fn compose_pressure(member: f32, manager: f32) -> f32 {
+        member.max(manager).clamp(0.0, 1.0)
     }
 
     /// Update the currently-selected RPN. Called from the scheduler in
@@ -2156,8 +2304,16 @@ impl Mixer {
         // routes only to that channel's own voices.
         // CC 1 depth (scaled by RPN 5) plus the CA-022 LFO Pitch Depth
         // destination (GM2 §4.6) — both are LFO pitch sway, so they sum.
-        let depth_cents = (st.mod_wheel as i32) * (st.mod_depth_range_cents as i32) / 127
-            + st.ctrl_dest_mods().lfo_pitch_cents;
+        let dest_cents = st.ctrl_dest_mods().lfo_pitch_cents;
+        // A native 32-bit CC 1 off the 7-bit grid keeps its fractional
+        // depth (`pos / 127 × range`); on the grid, or from a 7-bit CC
+        // 1, the integer-cents MIDI 1.0 computation is used verbatim.
+        let fine =
+            st.hr.mod_wheel.and_then(hr_refine).map(|pos| {
+                pos * f64::from(st.mod_depth_range_cents) / 127.0 + f64::from(dest_cents)
+            });
+        let depth_cents =
+            (st.mod_wheel as i32) * (st.mod_depth_range_cents as i32) / 127 + dest_cents;
         for slot in self.slots.iter_mut() {
             if self.channels[slot.channel as usize % NUM_CHANNELS].matches_for_zone_broadcast(
                 slot.channel,
@@ -2165,7 +2321,10 @@ impl Mixer {
                 &st.mpe_role,
             ) {
                 if let Some(v) = slot.voice.as_mut() {
-                    v.set_mod_depth_cents(depth_cents);
+                    match fine {
+                        Some(f) => v.set_mod_depth_fine_cents(f),
+                        None => v.set_mod_depth_cents(depth_cents),
+                    }
                 }
             }
         }
@@ -2178,6 +2337,7 @@ impl Mixer {
     pub fn set_mod_wheel(&mut self, channel: u8, value: u8) {
         let ch = channel as usize % NUM_CHANNELS;
         self.channels[ch].mod_wheel = value & 0x7F;
+        self.channels[ch].hr.mod_wheel = None;
         // GM2 RP-024 §3.3.2 [recommended]: "Rhythm Channels shall not
         // respond to this message" — the value is recorded (the role
         // may change later) but not routed to held drum voices.
@@ -2831,6 +2991,268 @@ impl Mixer {
         self.channels[ch].high_res_velocity_prefix = Some(value & 0x7F);
     }
 
+    // ───────────── MIDI 1.0 setters for the mixed-at-render controllers ─────────────
+
+    /// CC 7 Channel Volume (7-bit). Clears a native 32-bit value.
+    pub fn set_volume(&mut self, channel: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].volume = value & 0x7F;
+        self.channels[ch].hr.volume = None;
+    }
+
+    /// CC 11 Expression (7-bit). Clears a native 32-bit value.
+    pub fn set_expression(&mut self, channel: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].expression = value & 0x7F;
+        self.channels[ch].hr.expression = None;
+    }
+
+    /// CC 10 Pan (7-bit, RP-036). Clears a native 32-bit value.
+    pub fn set_pan(&mut self, channel: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].pan = value & 0x7F;
+        self.channels[ch].hr.pan = None;
+    }
+
+    /// CC 91 Reverb Send (7-bit, CA-024). Clears a native 32-bit value.
+    pub fn set_reverb_send(&mut self, channel: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].reverb_send = value & 0x7F;
+        self.channels[ch].hr.reverb_send = None;
+    }
+
+    /// CC 93 Chorus Send (7-bit, CA-024). Clears a native 32-bit value.
+    pub fn set_chorus_send(&mut self, channel: u8, value: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].chorus_send = value & 0x7F;
+        self.channels[ch].hr.chorus_send = None;
+    }
+
+    // ───────────── MIDI 2.0 32-bit Control Change (M2-104 §7.4.6) ─────────────
+
+    /// Apply a native **MIDI 2.0 Control Change** with its 32-bit
+    /// `data` (M2-104 §7.4.6). Controllers the synth renders
+    /// continuously — CC 1 Modulation, CC 7 Volume, CC 10 Pan, CC 11
+    /// Expression, CC 91 / CC 93 sends — keep the full resolution
+    /// ([`HiResControls`]); a value on the 7-bit grid renders
+    /// bit-identically to the MIDI 1.0 controller it downscales to.
+    /// Switch-type and table-lookup controllers take the §D.1.4
+    /// downscale (pedals, Sound Controllers, Portamento Time, channel
+    /// modes, CA-022 routed CCs). The §7.4.6.1 special formats carry
+    /// their value in the top 7 bits: CC 84 Portamento Control (source
+    /// note) and CC 126 Mono (channel count). Per §7.4.6 a MIDI 2.0
+    /// receiver ignores CC 0 / 32 (Bank Select — see the 2.0 Program
+    /// Change), CC 6 / 38 / 98–101 (the RPN/NRPN compound — see the
+    /// Registered / Assignable Controller messages) and CC 88 (High
+    /// Resolution Velocity).
+    pub fn set_control_change_32(&mut self, channel: u8, index: u8, data: u32) {
+        use crate::ump::scaling::scale_32_to_7;
+        let ch = channel as usize % NUM_CHANNELS;
+        let v7 = scale_32_to_7(data);
+        let top7 = (data >> 25) as u8;
+        match index & 0x7F {
+            0 | 6 | 32 | 38 | 88 | 98..=101 => {}
+            1 => {
+                self.channels[ch].mod_wheel = v7;
+                self.channels[ch].hr.mod_wheel = Some(data);
+                if !self.channels[ch].rhythm {
+                    self.reapply_mod_wheel_for_channel(channel);
+                }
+            }
+            7 => {
+                self.channels[ch].volume = v7;
+                self.channels[ch].hr.volume = Some(data);
+            }
+            10 => {
+                self.channels[ch].pan = v7;
+                self.channels[ch].hr.pan = Some(data);
+            }
+            11 => {
+                self.channels[ch].expression = v7;
+                self.channels[ch].hr.expression = Some(data);
+            }
+            91 => {
+                self.channels[ch].reverb_send = v7;
+                self.channels[ch].hr.reverb_send = Some(data);
+            }
+            93 => {
+                self.channels[ch].chorus_send = v7;
+                self.channels[ch].hr.chorus_send = Some(data);
+            }
+            5 => self.set_portamento_time(channel, v7),
+            64 => self.set_sustain(channel, v7),
+            65 => self.set_portamento(channel, v7),
+            66 => self.set_sostenuto(channel, v7),
+            67 => self.set_soft_pedal(channel, v7),
+            71..=78 => self.set_sound_controller(channel, index, v7),
+            // §7.4.6.1 Figure 53: source note in the top 7 bits.
+            84 => self.set_portamento_control(channel, top7),
+            96 => self.data_inc_dec(channel, 1),
+            97 => self.data_inc_dec(channel, -1),
+            120 => self.all_sound_off(channel),
+            121 => self.reset_all_controllers(channel),
+            122 => {}
+            123..=125 => self.all_notes_off_channel(channel),
+            // §7.4.6.1 Figure 54: channel count in the top 7 bits.
+            126 => self.set_mono_mode(channel, top7),
+            127 => self.set_poly_mode(channel),
+            _ => {}
+        }
+        // CA-022 routed-CC slot (the table is 7-bit), as on the MIDI
+        // 1.0 path — a no-op unless a Controller Destination Setting
+        // routes this controller.
+        if !matches!(index & 0x7F, 0 | 6 | 32 | 38 | 88 | 98..=101) {
+            self.update_ctrl_dest_cc(channel, index & 0x7F, v7);
+        }
+    }
+
+    // ───────────── MIDI 2.0 Registered / Assignable Controllers (§7.4.7/§7.4.8) ─────────────
+
+    /// Apply a native **MIDI 2.0 Registered Controller** (M2-104 §7.4.7)
+    /// — the unified form of the MIDI 1.0 RPN compound. Bank / index
+    /// correspond to RPN MSB / LSB; only Bank 0 has defined functions:
+    ///
+    /// * **#00/00 Pitch Bend Sensitivity** (§7.4.7.1 Figure 57): HCUs in
+    ///   the top 7 bits, cents in the next 7, the low 18 ignored.
+    /// * **#00/01 Channel Fine Tuning**: the 14-bit RPN value in the top
+    ///   14 bits (§D.2.3 downscale).
+    /// * **#00/02 Coarse Tuning** (Figure 58): semitones in the top 7
+    ///   bits.
+    /// * **#00/05 Modulation Depth Range** (CA-26): like #00/00.
+    /// * **#00/06 MPE MCM** (Figure 61): member-channel count in the
+    ///   top 7 bits.
+    /// * **#00/07 Sensitivity of Per-Note Pitch Bend** (§7.4.13): the
+    ///   whole 32-bit Q7.25 value is kept.
+    ///
+    /// #00/03 / #00/04 (Tuning Program / Bank) and every other bank are
+    /// recorded nowhere — this synth has no tuning-program store. The
+    /// RPN *selector* state of the MIDI 1.0 path is left untouched.
+    pub fn set_registered_controller(&mut self, channel: u8, bank: u8, index: u8, data: u32) {
+        if bank != 0 {
+            return;
+        }
+        let msb = (data >> 25) as u8;
+        let lsb = ((data >> 18) & 0x7F) as u8;
+        match index {
+            0 => self.apply_rpn_data(channel, 0, msb, Some(lsb)),
+            1 => self.apply_rpn_data(channel, 1, msb, Some(lsb)),
+            2 => self.apply_rpn_data(channel, 2, msb, None),
+            5 => self.apply_rpn_data(channel, 5, msb, Some(lsb)),
+            6 => self.apply_rpn_data(channel, 6, msb, None),
+            7 => {
+                let ch = channel as usize % NUM_CHANNELS;
+                self.channels[ch].per_note_bend_sensitivity = data;
+                self.reapply_pitch_for_channel(channel);
+            }
+            _ => {}
+        }
+    }
+
+    /// Run the MIDI 1.0 data-entry decoder for `rpn` with the given
+    /// MSB (+ optional LSB), preserving the channel's RPN selector.
+    fn apply_rpn_data(&mut self, channel: u8, rpn: u16, msb: u8, lsb: Option<u8>) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let saved = self.channels[ch].rpn;
+        self.channels[ch].rpn = rpn;
+        self.set_data_entry(channel, msb, true);
+        if let Some(l) = lsb {
+            self.set_data_entry(channel, l, false);
+        }
+        self.channels[ch].rpn = saved;
+    }
+
+    /// The current value of a Bank-0 Registered Controller in its
+    /// 32-bit message layout (the inverse of
+    /// [`Self::set_registered_controller`]), or `None` for controllers
+    /// the synth does not hold. This is the base the §7.4.8 relative
+    /// form adds to.
+    pub fn registered_controller(&self, channel: u8, bank: u8, index: u8) -> Option<u32> {
+        if bank != 0 {
+            return None;
+        }
+        let st = &self.channels[channel as usize % NUM_CHANNELS];
+        let pack = |msb: u32, lsb: u32| (msb.min(127) << 25) | (lsb.min(127) << 18);
+        match index {
+            0 => {
+                let r = u32::from(st.pitch_bend_range_cents);
+                Some(pack(r / 100, r % 100))
+            }
+            1 => Some(u32::from(st.channel_fine_tune_raw_14 & 0x3FFF) << 18),
+            2 => Some(pack(
+                (st.channel_coarse_tune_semitones + 0x40).clamp(0, 127) as u32,
+                0,
+            )),
+            5 => {
+                let r = u32::from(st.mod_depth_range_cents);
+                Some(pack(r / 100, r % 100))
+            }
+            6 => {
+                let kind = match channel & 0x0F {
+                    0x0 => MpeZoneKind::Lower,
+                    0xF => MpeZoneKind::Upper,
+                    _ => return None,
+                };
+                Some(pack(
+                    self.mpe_zone(kind).map_or(0, |z| u32::from(z.members)),
+                    0,
+                ))
+            }
+            7 => Some(st.per_note_bend_sensitivity),
+            _ => None,
+        }
+    }
+
+    /// Apply a native **MIDI 2.0 Relative Registered Controller**
+    /// (M2-104 §7.4.8): `delta` (two's complement) is added to the
+    /// controller's current 32-bit value, saturating at the ends of
+    /// the 32-bit range, and the result applied as an absolute set.
+    /// Controllers the synth does not hold are ignored.
+    pub fn set_relative_registered_controller(
+        &mut self,
+        channel: u8,
+        bank: u8,
+        index: u8,
+        delta: i32,
+    ) {
+        if let Some(cur) = self.registered_controller(channel, bank, index) {
+            let new = (i64::from(cur) + i64::from(delta)).clamp(0, i64::from(u32::MAX));
+            self.set_registered_controller(channel, bank, index, new as u32);
+        }
+    }
+
+    /// Record a native **MIDI 2.0 Assignable Controller** (NRPN, M2-104
+    /// §7.4.7). Assignable Controllers "have no specific function";
+    /// the mixer keeps the last 32-bit value per `(bank, index)` so the
+    /// §7.4.8 relative form and [`Self::assignable_controller`] work.
+    pub fn set_assignable_controller(&mut self, channel: u8, bank: u8, index: u8, data: u32) {
+        let ch = channel as usize % NUM_CHANNELS;
+        let key = (u16::from(bank & 0x7F) << 7) | u16::from(index & 0x7F);
+        self.assignable[ch].insert(key, data);
+    }
+
+    /// The last value recorded for an Assignable Controller, if any.
+    pub fn assignable_controller(&self, channel: u8, bank: u8, index: u8) -> Option<u32> {
+        let ch = channel as usize % NUM_CHANNELS;
+        let key = (u16::from(bank & 0x7F) << 7) | u16::from(index & 0x7F);
+        self.assignable[ch].get(&key).copied()
+    }
+
+    /// Apply a native **MIDI 2.0 Relative Assignable Controller**
+    /// (§7.4.8) to the recorded value (0 when never set), saturating.
+    pub fn set_relative_assignable_controller(
+        &mut self,
+        channel: u8,
+        bank: u8,
+        index: u8,
+        delta: i32,
+    ) {
+        let cur = self
+            .assignable_controller(channel, bank, index)
+            .unwrap_or(0);
+        let new = (i64::from(cur) + i64::from(delta)).clamp(0, i64::from(u32::MAX));
+        self.set_assignable_controller(channel, bank, index, new as u32);
+    }
+
     /// Compute the glide setup for a note-on at `target_key` on `ch`,
     /// returning `(offset_cents, total_samples)` when a glide should run
     /// or `None` for an immediate (non-gliding) attack. Consumes the
@@ -3217,18 +3639,18 @@ impl Mixer {
         }
         // Compose Member + Manager channel pressure for MPE; otherwise
         // just hand the channel's value through.
-        let pressure_byte = match st.mpe_role {
+        let pressure = match st.mpe_role {
             MpeRole::Member(zone_kind) => {
                 let mgr = match zone_kind {
                     MpeZoneKind::Lower => 0,
                     MpeZoneKind::Upper => 15,
                 };
-                st.channel_pressure.max(self.channels[mgr].channel_pressure)
+                st.pressure_frac().max(self.channels[mgr].pressure_frac())
             }
-            _ => st.channel_pressure,
+            _ => st.pressure_frac(),
         };
-        if pressure_byte != 0 {
-            voice.set_pressure(pressure_byte as f32 / 127.0);
+        if pressure != 0.0 {
+            voice.set_pressure(pressure);
         }
         // Mod-wheel depth (CC 1 scaled by RPN 5) + the CA-022 LFO
         // Pitch Depth destination carry to a fresh voice the same way
@@ -3237,8 +3659,15 @@ impl Mixer {
         let dest = st.ctrl_dest_mods();
         let depth_cents =
             (st.mod_wheel as i32) * (st.mod_depth_range_cents as i32) / 127 + dest.lfo_pitch_cents;
-        if depth_cents != 0 && !is_drum {
-            voice.set_mod_depth_cents(depth_cents);
+        if !is_drum {
+            match st.hr.mod_wheel.and_then(hr_refine) {
+                Some(pos) => voice.set_mod_depth_fine_cents(
+                    pos * f64::from(st.mod_depth_range_cents) / 127.0
+                        + f64::from(dest.lfo_pitch_cents),
+                ),
+                None if depth_cents != 0 => voice.set_mod_depth_cents(depth_cents),
+                None => {}
+            }
         }
         // CA-022 / GM2 §4.6 filter + LFO destinations reach the fresh
         // voice too (pitch is already inside the composed bend above;
@@ -3433,15 +3862,16 @@ impl Mixer {
         // and the whole effects DSP. `reset_gm_effects` / GM-reset paths
         // call `fx.clear()`, which re-zeroes the state and the flag.
         if !self.fx.active {
-            let sends_present = self
-                .channels
-                .iter()
-                .any(|c| c.reverb_send > 0 || c.chorus_send > 0)
-                || self.slots.iter().any(|s| {
-                    s.voice.is_some()
-                        && (s.reverb_send_override.unwrap_or(0) > 0
-                            || s.chorus_send_override.unwrap_or(0) > 0)
-                });
+            let sends_present = self.channels.iter().any(|c| {
+                c.reverb_send > 0
+                    || c.chorus_send > 0
+                    || c.hr.reverb_send.unwrap_or(0) > 0
+                    || c.hr.chorus_send.unwrap_or(0) > 0
+            }) || self.slots.iter().any(|s| {
+                s.voice.is_some()
+                    && (s.reverb_send_override.unwrap_or(0) > 0
+                        || s.chorus_send_override.unwrap_or(0) > 0)
+            });
             self.fx.active |= sends_present;
         }
         let fx_active = self.fx.active;
@@ -3500,8 +3930,15 @@ impl Mixer {
             // CA-022 / GM2 §4.6 Amplitude Control destination: a
             // channel-wide gain factor driven by Channel Pressure /
             // the routed CC (1.0 while unrouted).
-            let vol = gm2_cc_gain(st.volume)
-                * gm2_cc_gain(st.expression)
+            // A native 32-bit CC 7 / CC 11 (M2-104 §7.4.6) keeps its
+            // full resolution through the same square law.
+            let vol = st
+                .hr
+                .volume
+                .map_or_else(|| gm2_cc_gain(st.volume), gm2_cc_gain_32)
+                * st.hr
+                    .expression
+                    .map_or_else(|| gm2_cc_gain(st.expression), gm2_cc_gain_32)
                 * st.ctrl_dest_mods().amp_factor
                 * slot.note_gain;
             // Constant-power pan per RP-036 (Default Pan Formula):
@@ -3520,15 +3957,29 @@ impl Mixer {
                 Some(kp) => (kp as i16 + st.pan as i16 - 64).clamp(0, 127) as u8,
                 None => st.pan,
             };
-            let pan_norm = (pan_value.saturating_sub(1) as f32 / 126.0).clamp(0.0, 1.0);
+            // A native 32-bit CC 10 (no per-key override in play) walks
+            // the RP-036 formula on its fractional position: centre
+            // `0x8000_0000` = position 64.0 = the true centre.
+            let pan_norm = match (slot.pan_override, st.hr.pan.and_then(hr_refine)) {
+                (None, Some(pos)) => (((pos - 1.0).max(0.0)) / 126.0).min(1.0) as f32,
+                _ => (pan_value.saturating_sub(1) as f32 / 126.0).clamp(0.0, 1.0),
+            };
             let theta = pan_norm * std::f32::consts::FRAC_PI_2;
 
             // CA-024 per-channel effect send fractions (CC 91 / CC 93),
             // overridden per voice by the Key-Based Reverb / Chorus
             // Send (GM2 §4.8, absolute). Zero when nothing touched the
             // controllers, so a dry score bypasses the bus entirely.
-            let reverb_send = slot.reverb_send_override.unwrap_or(st.reverb_send) as f32 / 127.0;
-            let chorus_send = slot.chorus_send_override.unwrap_or(st.chorus_send) as f32 / 127.0;
+            let reverb_send = match (slot.reverb_send_override, st.hr.reverb_send) {
+                (Some(kb), _) => kb as f32 / 127.0,
+                (None, Some(hr)) => unit_32(hr),
+                (None, None) => st.reverb_send as f32 / 127.0,
+            };
+            let chorus_send = match (slot.chorus_send_override, st.hr.chorus_send) {
+                (Some(kb), _) => kb as f32 / 127.0,
+                (None, Some(hr)) => unit_32(hr),
+                (None, None) => st.chorus_send as f32 / 127.0,
+            };
             let any_send = fx_active && (reverb_send > 0.0 || chorus_send > 0.0);
 
             if stereo {
@@ -5155,6 +5606,303 @@ mod tests {
         assert_eq!(m.live_voice_count(), 2);
         m.all_notes_off();
         assert_eq!(m.live_voice_count(), 0);
+    }
+
+    // ── MIDI 2.0 32-bit controllers (§7.4.6 / §7.4.7 / §7.4.8 / §7.4.10) ──
+
+    /// Mix one sample of a unit voice and return the (L, R) gains.
+    fn one_sample_lr(m: &mut Mixer) -> (f32, f32) {
+        let (mut l, mut r) = (vec![0.0f32; 1], vec![0.0f32; 1]);
+        m.mix_stereo(&mut l, &mut r);
+        (l[0] / m.mix_gain, r[0] / m.mix_gain)
+    }
+
+    #[test]
+    fn cc_32_volume_is_bit_identical_on_the_7bit_grid_and_finer_between() {
+        for v7 in [0u8, 1, 64, 100, 127] {
+            assert_eq!(gm2_cc_gain_32(u32::from(v7) << 25), gm2_cc_gain(v7), "{v7}");
+        }
+        // Off grid: strictly between the neighbouring 7-bit gains,
+        // and 256 samples across one step are distinct + monotone.
+        let mut last = gm2_cc_gain(100);
+        let mut distinct = std::collections::BTreeSet::new();
+        for i in 1..256u32 {
+            let g = gm2_cc_gain_32((100 << 25) + i * (1 << 17));
+            assert!(g > last && g < gm2_cc_gain(101), "step {i}: {g}");
+            last = g;
+            distinct.insert(g.to_bits());
+        }
+        assert_eq!(distinct.len(), 255);
+        // The top of the range is 1/128 of a step above 127: barely
+        // over the 7-bit maximum, never a gross jump.
+        let top = gm2_cc_gain_32(0xFFFF_FFFF);
+        assert!(top > 1.0 && top < 1.02, "{top}");
+    }
+
+    #[test]
+    fn cc_32_volume_expression_reach_the_mix_and_midi1_clears_them() {
+        let mut m = Mixer::new();
+        m.set_pan(0, 0); // hard left for a clean read
+        m.note_on(0, 60, 100, voice(1.0, 64));
+        m.set_volume(0, 100);
+        let (l7, _) = one_sample_lr(&mut m);
+        m.set_control_change_32(0, 7, 100 << 25);
+        assert_eq!(m.channel_state(0).hr.volume, Some(100 << 25));
+        assert_eq!(m.channel_state(0).volume, 100, "7-bit shadow");
+        let (l32, _) = one_sample_lr(&mut m);
+        assert_eq!(l7, l32, "on-grid 32-bit CC 7 renders as CC 7 = 100");
+        m.set_control_change_32(0, 7, (100 << 25) | (1 << 24));
+        let (lhalf, _) = one_sample_lr(&mut m);
+        assert!(lhalf > l32, "half a step louder: {lhalf} vs {l32}");
+        assert_eq!(m.channel_state(0).volume, 100, "shadow still floors to 100");
+        // Expression composes the same way.
+        m.set_control_change_32(0, 11, 64 << 25);
+        let (lexp, _) = one_sample_lr(&mut m);
+        assert!((lexp - lhalf * gm2_cc_gain(64)).abs() < 1e-6);
+        // A MIDI 1.0 CC 7 supersedes the 32-bit one.
+        m.set_volume(0, 100);
+        assert_eq!(m.channel_state(0).hr.volume, None);
+        m.set_expression(0, 127);
+        assert_eq!(m.channel_state(0).hr.expression, None);
+        let (lback, _) = one_sample_lr(&mut m);
+        assert_eq!(lback, l7);
+    }
+
+    #[test]
+    fn cc_32_pan_centre_is_the_rp036_true_centre_and_walks_between_steps() {
+        let mut m = Mixer::new();
+        m.note_on(0, 60, 100, voice(1.0, 64));
+        m.set_pan(0, 64);
+        let (l64, r64) = one_sample_lr(&mut m);
+        assert_eq!(l64, r64, "CC 10 = 64 is the RP-036 true centre");
+        m.set_control_change_32(0, 10, 0x8000_0000);
+        let (lc, rc) = one_sample_lr(&mut m);
+        assert_eq!((lc, rc), (l64, r64), "0x8000_0000 is that same centre");
+        // Halfway to 65: right gains, left loses, staying between the
+        // 64 and 65 positions.
+        m.set_pan(0, 65);
+        let (l65, r65) = one_sample_lr(&mut m);
+        m.set_control_change_32(0, 10, (64 << 25) | (1 << 24));
+        let (lh, rh) = one_sample_lr(&mut m);
+        assert!(lh < l64 && lh > l65, "{lh} vs [{l65}, {l64}]");
+        assert!(rh > r64 && rh < r65, "{rh} vs [{r64}, {r65}]");
+        // Hard left / hard right at the 32-bit extremes.
+        m.set_control_change_32(0, 10, 0);
+        let (_, r0) = one_sample_lr(&mut m);
+        assert_eq!(r0, 0.0);
+        m.set_control_change_32(0, 10, 0xFFFF_FFFF);
+        let (lmax, _) = one_sample_lr(&mut m);
+        assert!(lmax.abs() < 1e-6, "{lmax}");
+    }
+
+    #[test]
+    fn cc_32_sends_feed_the_effects_bus_at_full_resolution() {
+        let mut m = Mixer::new();
+        m.set_control_change_32(0, 91, 1 << 20); // below one 7-bit step
+        assert_eq!(m.channel_state(0).reverb_send, 0, "shadow floors to 0");
+        assert_eq!(m.channel_state(0).hr.reverb_send, Some(1 << 20));
+        m.note_on(0, 60, 100, voice(1.0, 64));
+        let (mut l, mut r) = (vec![0.0f32; 4], vec![0.0f32; 4]);
+        m.mix_stereo(&mut l, &mut r);
+        assert!(
+            m.fx.active,
+            "a sub-step 32-bit send still latches the bus on"
+        );
+        m.set_reverb_send(0, 0);
+        assert_eq!(m.channel_state(0).hr.reverb_send, None);
+        assert_eq!(unit_32(100 << 25), 100.0 / 127.0);
+        assert!(unit_32((100 << 25) | (1 << 24)) > 100.0 / 127.0);
+        assert_eq!(unit_32(0xFFFF_FFFF), 1.0, "saturates at full scale");
+    }
+
+    #[test]
+    fn channel_and_poly_pressure_32_route_full_resolution() {
+        let mut m = Mixer::new();
+        let (v, _bend, press) = instrumented_voice(0.5, 64);
+        m.note_on(0, 60, 100, v);
+        m.set_channel_pressure(0, 100);
+        assert_eq!(*press.lock().unwrap(), 100.0 / 127.0);
+        m.set_channel_pressure_32(0, 100 << 25);
+        assert_eq!(*press.lock().unwrap(), 100.0 / 127.0, "on-grid identity");
+        assert_eq!(m.channel_state(0).channel_pressure, 100, "7-bit shadow");
+        m.set_channel_pressure_32(0, (100 << 25) | (1 << 24));
+        assert_eq!(*press.lock().unwrap(), (100.5 / 127.0) as f32);
+        // A fresh note picks the 32-bit pressure up at strike time.
+        let (v2, _, press2) = instrumented_voice(0.5, 64);
+        m.note_on(0, 62, 100, v2);
+        assert_eq!(*press2.lock().unwrap(), (100.5 / 127.0) as f32);
+        // MIDI 1.0 pressure supersedes.
+        m.set_channel_pressure(0, 0);
+        assert_eq!(m.channel_state(0).hr.channel_pressure, None);
+        assert_eq!(*press.lock().unwrap(), 0.0);
+        // Poly pressure, per key.
+        m.set_poly_pressure_32(0, 60, (64 << 25) | (1 << 24));
+        assert_eq!(*press.lock().unwrap(), (64.5 / 127.0) as f32);
+        assert_eq!(*press2.lock().unwrap(), 0.0, "other key untouched");
+    }
+
+    #[test]
+    fn cc_32_mod_wheel_keeps_fractional_depth_off_grid_only() {
+        let mut m = Mixer::new();
+        let (v, _b, _p, depth, _t) = instrumented_voice_full(0.5, 64);
+        m.note_on(0, 60, 100, v);
+        // On grid: the MIDI 1.0 integer computation (100·50/127 = 39).
+        m.set_control_change_32(0, 1, 100 << 25);
+        assert_eq!(*depth.lock().unwrap(), 39);
+        assert_eq!(m.channel_state(0).mod_wheel, 100);
+        // Off grid (100.5): 39.57 cents — the ConstVoice only records
+        // the trait-default rounding, which now lands on 40.
+        m.set_control_change_32(0, 1, (100 << 25) | (1 << 24));
+        assert_eq!(*depth.lock().unwrap(), 40);
+        // A MIDI 1.0 CC 1 returns to the integer path.
+        m.set_mod_wheel(0, 100);
+        assert_eq!(m.channel_state(0).hr.mod_wheel, None);
+        assert_eq!(*depth.lock().unwrap(), 39);
+    }
+
+    #[test]
+    fn cc_32_special_formats_and_ignored_indexes() {
+        let mut m = Mixer::new();
+        // §7.4.6.1: Portamento Control carries the source note in the
+        // top 7 bits; the low 25 are ignored.
+        m.set_control_change_32(0, 84, (55 << 25) | 0x01FF_FFFF);
+        assert_eq!(m.channel_state(0).portamento_ctrl_source, Some(55));
+        // Mono Mode with M = 1 in the top 7 bits.
+        m.set_control_change_32(0, 126, 1 << 25);
+        assert!(m.channel_state(0).mono);
+        m.set_control_change_32(0, 127, 0);
+        assert!(!m.channel_state(0).mono);
+        // Pedals switch on the downscale (≥ 64).
+        m.set_control_change_32(0, 64, 0x8000_0000);
+        assert!(m.channel_state(0).sustain);
+        m.set_control_change_32(0, 64, 0x7FFF_FFFF);
+        assert!(!m.channel_state(0).sustain);
+        // §7.4.6: Bank Select / Data Entry / RPN-NRPN selectors / CC 88
+        // are ignored by a MIDI 2.0 receiver.
+        let before = *m.channel_state(0);
+        for cc in [0u8, 6, 32, 38, 88, 98, 99, 100, 101] {
+            m.set_control_change_32(0, cc, 0xFFFF_FFFF);
+        }
+        let after = *m.channel_state(0);
+        assert_eq!(before.bank_msb_pending, after.bank_msb_pending);
+        assert_eq!(before.rpn, after.rpn);
+        assert_eq!(before.pitch_bend_range_cents, after.pitch_bend_range_cents);
+        assert_eq!(after.high_res_velocity_prefix, None);
+    }
+
+    #[test]
+    fn registered_controller_pitch_bend_range_uses_hcu_and_cents_fields() {
+        let mut m = Mixer::new();
+        let (v, fine, _) = fine_bend_voice(64);
+        m.note_on(0, 60, 100, v);
+        // Figure 57: HCUs in the top 7 bits, cents in the next 7, the
+        // low 18 bits ignored.
+        m.set_registered_controller(0, 0, 0, (12 << 25) | (50 << 18) | 0x3_FFFF);
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 1250);
+        assert_eq!(
+            m.registered_controller(0, 0, 0),
+            Some((12 << 25) | (50 << 18))
+        );
+        assert_eq!(
+            m.channel_state(0).rpn,
+            0x3FFF,
+            "MIDI 1.0 selector untouched"
+        );
+        // The wider range re-scales a held 32-bit bend immediately.
+        m.set_pitch_bend_32(0, 0xC000_0000); // +½ range
+        assert_eq!(*fine.lock().unwrap(), 625.0);
+        // Relative form: +1 cent (one LSB step = 1 << 18).
+        m.set_relative_registered_controller(0, 0, 0, 1 << 18);
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 1251);
+        // Saturates at zero rather than wrapping; the range floors at 1.
+        m.set_relative_registered_controller(0, 0, 0, i32::MIN);
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 1);
+        // Other banks have no defined function.
+        m.set_registered_controller(0, 1, 0, 0xFFFF_FFFF);
+        assert_eq!(m.channel_state(0).pitch_bend_range_cents, 1);
+        assert_eq!(m.registered_controller(0, 1, 0), None);
+    }
+
+    #[test]
+    fn registered_controller_tuning_and_mod_depth_range_and_mcm() {
+        let mut m = Mixer::new();
+        // #00/01 Fine Tuning: the 14-bit value in the top 14 bits.
+        m.set_registered_controller(0, 0, 1, 0x3000 << 18);
+        assert_eq!(m.channel_state(0).channel_fine_tune_raw_14, 0x3000);
+        assert_eq!(m.channel_state(0).channel_fine_tune_cents, 50);
+        assert_eq!(m.registered_controller(0, 0, 1), Some(0x3000 << 18));
+        // #00/02 Coarse Tuning: semitones (centre 0x40) in the top 7.
+        m.set_registered_controller(0, 0, 2, 0x41 << 25);
+        assert_eq!(m.channel_state(0).channel_coarse_tune_semitones, 1);
+        assert_eq!(m.registered_controller(0, 0, 2), Some(0x41 << 25));
+        m.set_relative_registered_controller(0, 0, 2, -(2 << 25));
+        assert_eq!(m.channel_state(0).channel_coarse_tune_semitones, -1);
+        // #00/05 Modulation Depth Range.
+        m.set_registered_controller(0, 0, 5, (1 << 25) | (25 << 18));
+        assert_eq!(m.channel_state(0).mod_depth_range_cents, 125);
+        // #00/06 MPE MCM on channel 0 creates the Lower Zone.
+        m.set_registered_controller(0, 0, 6, 3 << 25);
+        assert_eq!(m.mpe_zone(MpeZoneKind::Lower).map(|z| z.members), Some(3));
+        assert_eq!(m.registered_controller(0, 0, 6), Some(3 << 25));
+        assert_eq!(
+            m.registered_controller(5, 0, 6),
+            None,
+            "not a manager channel"
+        );
+        // #00/03 / #00/04 are not held.
+        assert_eq!(m.registered_controller(0, 0, 3), None);
+    }
+
+    #[test]
+    fn per_note_bend_sensitivity_defaults_to_two_hcu_and_is_q7_25() {
+        let mut m = Mixer::new();
+        assert_eq!(
+            m.channel_state(0).per_note_bend_sensitivity,
+            DEFAULT_PER_NOTE_BEND_SENSITIVITY
+        );
+        assert_eq!(m.channel_state(0).per_note_bend_range_cents(), 200.0);
+        // 1.5 HCU = 150 cents.
+        m.set_registered_controller(0, 0, 7, (1 << 25) | (1 << 24));
+        assert_eq!(m.channel_state(0).per_note_bend_range_cents(), 150.0);
+        assert_eq!(
+            m.registered_controller(0, 0, 7),
+            Some((1 << 25) | (1 << 24))
+        );
+        m.set_relative_registered_controller(0, 0, 7, 1 << 24);
+        assert_eq!(m.channel_state(0).per_note_bend_range_cents(), 200.0);
+    }
+
+    #[test]
+    fn assignable_controllers_are_recorded_and_relative_saturates() {
+        let mut m = Mixer::new();
+        assert_eq!(m.assignable_controller(3, 1, 2), None);
+        m.set_assignable_controller(3, 1, 2, 10);
+        assert_eq!(m.assignable_controller(3, 1, 2), Some(10));
+        m.set_relative_assignable_controller(3, 1, 2, -15);
+        assert_eq!(m.assignable_controller(3, 1, 2), Some(0));
+        m.set_relative_assignable_controller(3, 1, 2, i32::MAX);
+        m.set_relative_assignable_controller(3, 1, 2, i32::MAX);
+        m.set_relative_assignable_controller(3, 1, 2, i32::MAX);
+        assert_eq!(m.assignable_controller(3, 1, 2), Some(u32::MAX));
+        // Never-set + relative starts from 0.
+        m.set_relative_assignable_controller(3, 0, 9, 7);
+        assert_eq!(m.assignable_controller(3, 0, 9), Some(7));
+        assert_eq!(m.assignable_controller(4, 0, 9), None, "per channel");
+    }
+
+    #[test]
+    fn reset_all_controllers_clears_the_32bit_shadows_it_resets() {
+        let mut m = Mixer::new();
+        m.set_control_change_32(0, 11, 1);
+        m.set_control_change_32(0, 1, 1);
+        m.set_channel_pressure_32(0, 1);
+        m.set_control_change_32(0, 7, 1); // RP-015: Volume is preserved
+        m.reset_all_controllers(0);
+        let hr = m.channel_state(0).hr;
+        assert_eq!(hr.expression, None);
+        assert_eq!(hr.mod_wheel, None);
+        assert_eq!(hr.channel_pressure, None);
+        assert_eq!(hr.volume, Some(1));
     }
 
     // ── MIDI 2.0 Note On: 16-bit velocity + attributes (§7.4.2/§7.4.14) ──

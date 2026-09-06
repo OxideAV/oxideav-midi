@@ -196,3 +196,25 @@ fn pitch_7_9_half_semitone_equals_an_exact_50_cent_bend() {
     m.mix_stereo(&mut l, &mut r);
     assert_eq!(l, plain);
 }
+
+// ── 32-bit Control Change (M2-104 §7.4.6) ──
+
+#[test]
+fn cc7_32_on_grid_renders_bit_identically_and_off_grid_scales() {
+    let (v7, _) = render(|m| m.set_volume(0, 100));
+    let (grid, _) = render(|m| m.set_control_change_32(0, 7, 100 << 25));
+    assert_eq!(v7, grid);
+    let (half, _) = render(|m| m.set_control_change_32(0, 7, (100 << 25) | (1 << 24)));
+    // Same waveform, a static gain in between the CC 7 = 100 and 101
+    // renders.
+    let (v101, _) = render(|m| m.set_volume(0, 101));
+    for i in 0..FRAMES {
+        let (lo, hi) = (v7[i].abs(), v101[i].abs());
+        let h = half[i].abs();
+        assert!(
+            h >= lo.min(hi) - 1e-7 && h <= lo.max(hi) + 1e-7,
+            "sample {i}: {h} ∉ [{lo}, {hi}]"
+        );
+    }
+    assert!(max_abs_diff(&grid, &half) > 0.0);
+}

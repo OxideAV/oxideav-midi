@@ -39,6 +39,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Reserved attribute types are ignored; a pending CC 88 prefix is
   discarded (§7.4.6). PCM pins: a Pitch 7.9 half-semitone renders
   sample-identically to an exact +50-cent 32-bit bend.
+- **Native MIDI 2.0 32-bit controllers** (M2-104 §7.4.3/§7.4.6/§7.4.7/
+  §7.4.8/§7.4.10): `Mixer::set_control_change_32` keeps CC 1 / 7 / 10 /
+  11 / 91 / 93 at full resolution (`HiResControls` shadows next to the
+  §D.1.4 7-bit downscale, cleared by any MIDI 1.0 message for the same
+  controller) through the same response curves — GM2 square law for
+  Volume/Expression (`gm2_cc_gain_32`), RP-036 pan with `0x8000_0000`
+  the true centre, fractional-cents modulation depth via the new
+  `Voice::set_mod_depth_fine_cents` hook; a value on the 7-bit grid
+  renders bit-identically to its 7-bit controller, the 2^25 positions
+  between two steps are distinct and monotone. Switch / table
+  controllers take the downscale; the §7.4.6.1 special formats (CC 84
+  source note, CC 126 channel count in the top 7 bits) and the §7.4.6
+  ignore list (CC 0/32/6/38/98–101/88) are honoured.
+  `set_channel_pressure_32` / `set_poly_pressure_32` deliver 32-bit
+  pressure. `set_registered_controller` implements the unified RPN
+  form for Bank 0 #00–#02/#05/#06 (Figure 57–61 field layouts) plus
+  **#00/07 Sensitivity of Per-Note Pitch Bend** (Q7.25, default 2.0
+  HCU), `registered_controller` reads the 32-bit layout back, and
+  `set_relative_registered_controller` applies the two's-complement
+  relative form (saturating). Assignable Controllers (NRPN) are
+  recorded per channel with the relative form applied to them. The
+  scheduler routes CC 7/10/11/91/93 through the new 7-bit setters.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-midi/compare/v0.0.4...v0.0.5) - 2026-08-31
 

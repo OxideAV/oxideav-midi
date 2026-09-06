@@ -982,6 +982,10 @@ impl Voice for SamplePlayer {
         self.mod_depth_extra_cents = cents as f32;
     }
 
+    fn set_mod_depth_fine_cents(&mut self, cents: f64) {
+        self.mod_depth_extra_cents = cents as f32;
+    }
+
     fn set_filter_cutoff_mod_cents(&mut self, cents: i32) {
         // CA-022 / GM2 §4.6 Filter Cutoff Control destination. A
         // lowering offset on an "open" voice instantiates the biquad.

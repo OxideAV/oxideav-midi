@@ -293,9 +293,9 @@ impl Scheduler {
                     1 => mixer.set_mod_wheel(channel, value), // CC 1 — Modulation Wheel
                     5 => mixer.set_portamento_time(channel, value), // CC 5 — Portamento Time
                     6 => mixer.set_data_entry(channel, value, true), // RPN data MSB
-                    7 => mixer.channel_state_mut(channel).volume = value,
-                    10 => mixer.channel_state_mut(channel).pan = value,
-                    11 => mixer.channel_state_mut(channel).expression = value, // CC 11 — Expression
+                    7 => mixer.set_volume(channel, value),
+                    10 => mixer.set_pan(channel, value),
+                    11 => mixer.set_expression(channel, value), // CC 11 — Expression
 
                     38 => mixer.set_data_entry(channel, value, false), // RPN data LSB
                     64 => mixer.set_sustain(channel, value),
@@ -313,8 +313,8 @@ impl Scheduler {
                     // CC 88 — High-Resolution Velocity Prefix (CA-031): lower
                     // 7 bits affixed to the next Note On / Note Off velocity.
                     88 => mixer.set_high_res_velocity_prefix(channel, value),
-                    91 => mixer.channel_state_mut(channel).reverb_send = value, // CC 91 — Reverb Send (CA-024)
-                    93 => mixer.channel_state_mut(channel).chorus_send = value, // CC 93 — Chorus Send (CA-024)
+                    91 => mixer.set_reverb_send(channel, value), // CC 91 — Reverb Send (CA-024)
+                    93 => mixer.set_chorus_send(channel, value), // CC 93 — Chorus Send (CA-024)
                     96 => mixer.data_inc_dec(channel, 1), // Data Increment (RP-018; value ignored)
                     97 => mixer.data_inc_dec(channel, -1), // Data Decrement (RP-018; value ignored)
                     100 => mixer.set_rpn_byte(channel, value, false), // RPN LSB
