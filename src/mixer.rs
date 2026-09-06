@@ -4410,7 +4410,9 @@ impl Mixer {
                     && (s.reverb_send_override.unwrap_or(0) > 0
                         || s.chorus_send_override.unwrap_or(0) > 0
                         || s.pn_reverb_send.unwrap_or(0) > 0
-                        || s.pn_chorus_send.unwrap_or(0) > 0)
+                        || s.pn_chorus_send.unwrap_or(0) > 0
+                        || s.voice.as_ref().is_some_and(|v| v.reverb_send() > 0.0)
+                        || s.voice.as_ref().is_some_and(|v| v.chorus_send() > 0.0))
             });
             self.fx.active |= sends_present;
         }
@@ -4519,6 +4521,14 @@ impl Mixer {
                 },
                 _ => (pan_value.saturating_sub(1) as f32 / 126.0).clamp(0.0, 1.0),
             };
+            // The voice's own pan (SF2 gen 17) offsets the channel
+            // position; 0.0 for every voice without one.
+            let voice_pan = slot.voice.as_ref().map_or(0.0, |v| v.pan_offset());
+            let pan_norm = if voice_pan == 0.0 {
+                pan_norm
+            } else {
+                (pan_norm + voice_pan).clamp(0.0, 1.0)
+            };
             let theta = pan_norm * std::f32::consts::FRAC_PI_2;
 
             // CA-024 per-channel effect send fractions (CC 91 / CC 93),
@@ -4542,6 +4552,16 @@ impl Mixer {
                 (Some(kb), _) => kb as f32 / 127.0,
                 (None, Some(hr)) => unit_32(hr),
                 (None, None) => st.chorus_send as f32 / 127.0,
+            };
+            // The voice's own sends (SF2 gens 15 / 16) add to the
+            // controller-driven sends (SF2 §8.4.8 / §8.4.9 model the CC
+            // 91 / 93 contribution as additive), clamped at full.
+            let (reverb_send, chorus_send) = match slot.voice.as_ref() {
+                Some(v) if v.reverb_send() != 0.0 || v.chorus_send() != 0.0 => (
+                    (reverb_send + v.reverb_send()).min(1.0),
+                    (chorus_send + v.chorus_send()).min(1.0),
+                ),
+                _ => (reverb_send, chorus_send),
             };
             let any_send = fx_active && (reverb_send > 0.0 || chorus_send > 0.0);
 
@@ -4626,6 +4646,14 @@ impl Mixer {
         self.advance_portamento(left.len() as u32);
 
         active
+    }
+
+    /// Whether the Reverb + Chorus effects bus has been latched on by a
+    /// non-zero send (channel CC 91 / 93, key-based, per-note, or a
+    /// voice's own SF2 send). Diagnostics / tests.
+    #[doc(hidden)] // internal: effects-bus gate exposed for tests
+    pub fn effects_bus_active(&self) -> bool {
+        self.fx.active
     }
 
     /// Number of slots currently holding a (possibly already-released)

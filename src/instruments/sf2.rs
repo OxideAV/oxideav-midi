@@ -205,6 +205,56 @@ pub const GEN_INITIAL_FILTER_Q: u16 = 9;
 #[doc(hidden)] // internal: SF2 generator-table constant
 pub const GEN_EXCLUSIVE_CLASS: u16 = 57;
 
+/// `modLfoToPitch` (gen 5): cents of pitch per full-scale Modulation
+/// LFO excursion (§8.1.2).
+pub const GEN_MOD_LFO_TO_PITCH: u16 = 5;
+/// `vibLfoToPitch` (gen 6): cents of pitch per full-scale Vibrato LFO
+/// excursion (§8.1.2).
+pub const GEN_VIB_LFO_TO_PITCH: u16 = 6;
+/// `modLfoToFilterFc` (gen 10): cents of filter cutoff per full-scale
+/// Modulation LFO excursion.
+pub const GEN_MOD_LFO_TO_FILTER_FC: u16 = 10;
+/// `modLfoToVolume` (gen 13): centibels of volume per full-scale
+/// Modulation LFO excursion.
+pub const GEN_MOD_LFO_TO_VOLUME: u16 = 13;
+/// `chorusEffectsSend` (gen 15): 0.1 % units of the note sent to the
+/// chorus processor (§8.1.2, §9.1.5).
+pub const GEN_CHORUS_EFFECTS_SEND: u16 = 15;
+/// `reverbEffectsSend` (gen 16): 0.1 % units sent to the reverb.
+pub const GEN_REVERB_EFFECTS_SEND: u16 = 16;
+/// `pan` (gen 17): 0.1 % units, −500 (left) .. +500 (right).
+pub const GEN_PAN: u16 = 17;
+/// `delayModLFO` (gen 21): absolute timecents from key-on until the
+/// Modulation LFO starts its upward ramp; default −12000 (< 1 ms).
+pub const GEN_DELAY_MOD_LFO: u16 = 21;
+/// `freqModLFO` (gen 22): absolute cents re. 8.176 Hz of the
+/// Modulation LFO's triangular period; default 0 (= 8.176 Hz).
+pub const GEN_FREQ_MOD_LFO: u16 = 22;
+/// `delayVibLFO` (gen 23): absolute timecents of the Vibrato LFO delay.
+pub const GEN_DELAY_VIB_LFO: u16 = 23;
+/// `freqVibLFO` (gen 24): absolute cents re. 8.176 Hz of the Vibrato
+/// LFO frequency.
+pub const GEN_FREQ_VIB_LFO: u16 = 24;
+/// `keynumToModEnvHold` (gen 31): timecents per key by which the
+/// modulation-envelope hold shortens with rising key (unchanged at 60).
+pub const GEN_KEYNUM_TO_MOD_ENV_HOLD: u16 = 31;
+/// `keynumToModEnvDecay` (gen 32): as gen 31 for the decay.
+pub const GEN_KEYNUM_TO_MOD_ENV_DECAY: u16 = 32;
+/// `keynumToVolEnvHold` (gen 39): as gen 31 for the volume envelope.
+pub const GEN_KEYNUM_TO_VOL_ENV_HOLD: u16 = 39;
+/// `keynumToVolEnvDecay` (gen 40): as gen 32 for the volume envelope.
+pub const GEN_KEYNUM_TO_VOL_ENV_DECAY: u16 = 40;
+/// `scaleTuning` (gen 56): cents of pitch per key number; default 100
+/// (the tempered semitone scale), 0 = key has no effect on pitch.
+pub const GEN_SCALE_TUNING: u16 = 56;
+
+/// Absolute-cents → hertz (SF2 §8.1.3 "Abs Zero" 8.176 Hz):
+/// `8.176 × 2^(cents/1200)`.
+#[must_use]
+pub fn abs_cents_to_hz(cents: i32) -> f32 {
+    8.176 * 2f32.powf(cents as f32 / 1200.0)
+}
+
 // -------------------------------------------------------------------------
 // In-memory bank representation.
 // -------------------------------------------------------------------------
@@ -925,6 +975,31 @@ pub struct SamplePlan {
     /// Exclusive-class id (gen 57). Non-zero values cut every prior
     /// voice in the same class on the same channel.
     pub exclusive_class: u16,
+    /// Vibrato LFO → pitch depth in cents (gen 6).
+    pub vib_lfo_to_pitch_cents: i32,
+    /// Vibrato LFO delay in absolute timecents (gen 23; `i32::MIN` =
+    /// unset → the spec default −12000).
+    pub vib_lfo_delay_tc: i32,
+    /// Vibrato LFO frequency in absolute cents re. 8.176 Hz (gen 24;
+    /// default 0).
+    pub vib_lfo_freq_cents: i32,
+    /// Modulation LFO → pitch depth in cents (gen 5).
+    pub mod_lfo_to_pitch_cents: i32,
+    /// Modulation LFO → filter cutoff depth in cents (gen 10).
+    pub mod_lfo_to_filter_cents: i32,
+    /// Modulation LFO → volume depth in centibels (gen 13).
+    pub mod_lfo_to_volume_cb: i32,
+    /// Modulation LFO delay in absolute timecents (gen 21; `i32::MIN` =
+    /// unset).
+    pub mod_lfo_delay_tc: i32,
+    /// Modulation LFO frequency in absolute cents (gen 22).
+    pub mod_lfo_freq_cents: i32,
+    /// Pan in 0.1 % units, −500..=500 (gen 17).
+    pub pan_per_mille: i32,
+    /// Chorus effects send in 0.1 % units, 0..=1000 (gen 15).
+    pub chorus_send_per_mille: i32,
+    /// Reverb effects send in 0.1 % units, 0..=1000 (gen 16).
+    pub reverb_send_per_mille: i32,
     /// Optional paired stereo sample. When present, this voice renders
     /// natively in stereo using both samples — `start..end` of the
     /// primary above is the *left* (or first-seen) channel, and this
@@ -1152,12 +1227,66 @@ impl SamplePlan {
         let fine = signed_amount(igens, GEN_FINE_TUNE) as i32
             + signed_amount(pgens, GEN_FINE_TUNE) as i32
             + sample.pitch_correction as i32;
-        // Pitch ratio: 2^((target - root + coarse) / 12) × 2^(fine / 1200).
-        let semitones = target_key as i32 - root as i32 + coarse;
-        let pitch_ratio = (2f64).powf(semitones as f64 / 12.0) * (2f64).powf(fine as f64 / 1200.0);
+        // Pitch ratio: 2^((target - root) × scaleTuning/100 + coarse) / 12)
+        // × 2^(fine / 1200). `scaleTuning` (gen 56, §8.1.2) is the
+        // cents of pitch per key number — 100 (the default) is the
+        // tempered scale, 0 makes every key sound at the root pitch.
+        let scale_tuning = generator_amount(igens, GEN_SCALE_TUNING)
+            .or_else(|| generator_amount(pgens, GEN_SCALE_TUNING))
+            .map_or(100, |v| i32::from(v as i16).clamp(0, 1200));
+        let key_offset = target_key as i32 - root as i32;
+        let semitones = key_offset + coarse;
+        let scaled_key_semitones = f64::from(key_offset) * f64::from(scale_tuning) / 100.0;
+        let pitch_ratio = if scale_tuning == 100 {
+            (2f64).powf(semitones as f64 / 12.0) * (2f64).powf(fine as f64 / 1200.0)
+        } else {
+            (2f64).powf((scaled_key_semitones + f64::from(coarse)) / 12.0)
+                * (2f64).powf(fine as f64 / 1200.0)
+        };
 
-        let env = EnvParams::from_generators(igens, pgens);
-        let mod_env = ModEnvParams::from_generators(igens, pgens);
+        let mut env = EnvParams::from_generators(igens, pgens);
+        let mut mod_env = ModEnvParams::from_generators(igens, pgens);
+        // keynumTo{Vol,Mod}Env{Hold,Decay} (gens 31/32/39/40, §8.1.2):
+        // timecents per key, the time at key 60 unchanged, so
+        // `time_tc += (60 − key) × amount` — 100 tracks the keyboard
+        // (an octave up halves the time). Applied to the spec default
+        // (−12000 tc) when the base time is unset.
+        let keynum = |tc: i32, amount: i32| -> i32 {
+            if amount == 0 {
+                tc
+            } else {
+                let base = if tc == i32::MIN { -12_000 } else { tc };
+                base + (60 - target_key as i32) * amount
+            }
+        };
+        let sum = |oper: u16| signed_amount(igens, oper) as i32 + signed_amount(pgens, oper) as i32;
+        env.hold_tc = keynum(env.hold_tc, sum(GEN_KEYNUM_TO_VOL_ENV_HOLD));
+        env.decay_tc = keynum(env.decay_tc, sum(GEN_KEYNUM_TO_VOL_ENV_DECAY));
+        mod_env.hold_tc = keynum(mod_env.hold_tc, sum(GEN_KEYNUM_TO_MOD_ENV_HOLD));
+        mod_env.decay_tc = keynum(mod_env.decay_tc, sum(GEN_KEYNUM_TO_MOD_ENV_DECAY));
+        // LFOs (§9.1.6) and effects/pan (§9.1.5): instrument + preset
+        // amounts are additive (§9.4); the delay / frequency values
+        // fall back to the §8.1.3 defaults when neither level sets
+        // them.
+        let vib_lfo_to_pitch_cents = sum(GEN_VIB_LFO_TO_PITCH);
+        let mod_lfo_to_pitch_cents = sum(GEN_MOD_LFO_TO_PITCH);
+        let mod_lfo_to_filter_cents = sum(GEN_MOD_LFO_TO_FILTER_FC);
+        let mod_lfo_to_volume_cb = sum(GEN_MOD_LFO_TO_VOLUME);
+        let optional_sum = |oper: u16| -> i32 {
+            let i = generator_amount(igens, oper).map(|v| i32::from(v as i16));
+            let p = generator_amount(pgens, oper).map(|v| i32::from(v as i16));
+            match (i, p) {
+                (None, None) => i32::MIN,
+                (a, b) => a.unwrap_or(0) + b.unwrap_or(0),
+            }
+        };
+        let vib_lfo_delay_tc = optional_sum(GEN_DELAY_VIB_LFO);
+        let mod_lfo_delay_tc = optional_sum(GEN_DELAY_MOD_LFO);
+        let vib_lfo_freq_cents = sum(GEN_FREQ_VIB_LFO);
+        let mod_lfo_freq_cents = sum(GEN_FREQ_MOD_LFO);
+        let pan_per_mille = sum(GEN_PAN).clamp(-500, 500);
+        let chorus_send_per_mille = sum(GEN_CHORUS_EFFECTS_SEND).clamp(0, 1000);
+        let reverb_send_per_mille = sum(GEN_REVERB_EFFECTS_SEND).clamp(0, 1000);
         let initial_attenuation_cb = signed_amount(igens, GEN_INITIAL_ATTENUATION) as i32
             + signed_amount(pgens, GEN_INITIAL_ATTENUATION) as i32;
         let mod_env_to_pitch_cents = signed_amount(igens, GEN_MOD_ENV_TO_PITCH) as i32
@@ -1196,6 +1325,17 @@ impl SamplePlan {
             initial_filter_q_cb,
             initial_attenuation_cb,
             exclusive_class,
+            vib_lfo_to_pitch_cents,
+            vib_lfo_delay_tc,
+            vib_lfo_freq_cents,
+            mod_lfo_to_pitch_cents,
+            mod_lfo_to_filter_cents,
+            mod_lfo_to_volume_cb,
+            mod_lfo_delay_tc,
+            mod_lfo_freq_cents,
+            pan_per_mille,
+            chorus_send_per_mille,
+            reverb_send_per_mille,
             stereo_pair: None,
         }
     }
@@ -1665,6 +1805,34 @@ pub struct Sf2Voice {
     /// can recompute coefficients when the modulation envelope drifts
     /// the cutoff.
     output_rate: f32,
+    /// Vibrato LFO (§9.1.6): delay in output frames, period in output
+    /// frames, and the bank's pitch depth in cents (gen 6).
+    vib_lfo_delay: u32,
+    vib_lfo_period: f32,
+    vib_lfo_to_pitch_cents: f32,
+    /// Extra Vibrato-LFO pitch depth in cents from the default
+    /// modulators the mixer feeds: CC 1 (§8.4.4, via the mod-wheel
+    /// depth) and Channel Pressure (§8.4.3, 50 cents at full
+    /// pressure).
+    mod_wheel_vib_cents: f32,
+    pressure_vib_cents: f32,
+    /// Modulation LFO (§9.1.6): delay / period in output frames and
+    /// the three routing depths (gens 5 / 10 / 13).
+    mod_lfo_delay: u32,
+    mod_lfo_period: f32,
+    mod_lfo_to_pitch_cents: i32,
+    mod_lfo_to_filter_cents: i32,
+    mod_lfo_to_volume_cb: i32,
+    /// Modulation-LFO volume factor for the current render block
+    /// (gen 13 is evaluated once per `ENV_RUN` frames).
+    mod_lfo_gain: f32,
+    /// Pan offset in RP-036 pan-position units (gen 17 / 1000: −0.5 =
+    /// hard left, +0.5 = hard right), read by the mixer.
+    pan_offset: f32,
+    /// Effects sends as `0..=1` fractions (gens 15 / 16), read by the
+    /// mixer and summed with the channel's CC 91 / CC 93 sends.
+    chorus_send: f32,
+    reverb_send: f32,
 }
 
 /// Right-channel state for a stereo voice. Carries its own phase and
@@ -1764,6 +1932,23 @@ impl Sf2Voice {
             None
         };
 
+        // LFOs (§9.1.6): a delay during which the value stays zero,
+        // then a triangle from 0 up to +1, down to −1 and back. The
+        // delay defaults to −12000 tc (< 1 ms) and the frequency to
+        // 8.176 Hz (0 cents) per §8.1.3.
+        let lfo_delay = |tc: i32| -> u32 {
+            let s = if tc == i32::MIN {
+                0.001
+            } else {
+                timecents_to_seconds(tc, 0.001)
+            };
+            (sr * s) as u32
+        };
+        let lfo_period = |cents: i32| -> f32 {
+            let hz = abs_cents_to_hz(cents.clamp(-16_000, 4_500));
+            (sr / hz).max(2.0)
+        };
+
         Self {
             sample_data,
             start: plan.start,
@@ -1804,6 +1989,87 @@ impl Sf2Voice {
             dest_cutoff_offset_cents: 0,
             exclusive_class: plan.exclusive_class,
             output_rate: sr,
+            vib_lfo_delay: lfo_delay(plan.vib_lfo_delay_tc),
+            vib_lfo_period: lfo_period(plan.vib_lfo_freq_cents),
+            vib_lfo_to_pitch_cents: plan.vib_lfo_to_pitch_cents as f32,
+            mod_wheel_vib_cents: 0.0,
+            pressure_vib_cents: 0.0,
+            mod_lfo_delay: lfo_delay(plan.mod_lfo_delay_tc),
+            mod_lfo_period: lfo_period(plan.mod_lfo_freq_cents),
+            mod_lfo_to_pitch_cents: plan.mod_lfo_to_pitch_cents,
+            mod_lfo_to_filter_cents: plan.mod_lfo_to_filter_cents,
+            mod_lfo_to_volume_cb: plan.mod_lfo_to_volume_cb,
+            mod_lfo_gain: 1.0,
+            pan_offset: plan.pan_per_mille as f32 / 1000.0,
+            chorus_send: plan.chorus_send_per_mille as f32 / 1000.0,
+            reverb_send: plan.reverb_send_per_mille as f32 / 1000.0,
+        }
+    }
+
+    /// SF2 LFO waveform (§9.1.6): zero during `delay`, then a triangle
+    /// rising from 0 to +1, falling to −1, rising back, at `period`
+    /// output frames per cycle.
+    fn lfo_at(t: u32, delay: u32, period: f32) -> f32 {
+        if t < delay {
+            return 0.0;
+        }
+        let x = ((t - delay) as f32 / period).fract();
+        if x < 0.25 {
+            4.0 * x
+        } else if x < 0.75 {
+            2.0 - 4.0 * x
+        } else {
+            4.0 * x - 4.0
+        }
+    }
+
+    /// Total Vibrato-LFO pitch depth in cents: the bank's gen 6 plus
+    /// the CC 1 / Channel Pressure default-modulator contributions.
+    fn vib_depth_cents(&self) -> f32 {
+        self.vib_lfo_to_pitch_cents + self.mod_wheel_vib_cents + self.pressure_vib_cents
+    }
+
+    /// Whether any LFO routing is live — the render loop's cue to take
+    /// the modulated path.
+    fn lfo_active(&self) -> bool {
+        self.vib_depth_cents() != 0.0
+            || self.mod_lfo_to_pitch_cents != 0
+            || self.mod_lfo_to_filter_cents != 0
+            || self.mod_lfo_to_volume_cb != 0
+    }
+
+    /// LFO pitch contribution at output frame `t`, cents (0.0 when no
+    /// pitch routing is live).
+    fn lfo_pitch_cents_at(&self, t: u32) -> f32 {
+        let mut c = 0.0;
+        let vib = self.vib_depth_cents();
+        if vib != 0.0 {
+            c += Self::lfo_at(t, self.vib_lfo_delay, self.vib_lfo_period) * vib;
+        }
+        if self.mod_lfo_to_pitch_cents != 0 {
+            c += Self::lfo_at(t, self.mod_lfo_delay, self.mod_lfo_period)
+                * self.mod_lfo_to_pitch_cents as f32;
+        }
+        c
+    }
+
+    /// Modulation-LFO filter-cutoff contribution at frame `t`, cents.
+    fn mod_lfo_filter_cents_at(&self, t: u32) -> i32 {
+        if self.mod_lfo_to_filter_cents == 0 {
+            0
+        } else {
+            (Self::lfo_at(t, self.mod_lfo_delay, self.mod_lfo_period)
+                * self.mod_lfo_to_filter_cents as f32) as i32
+        }
+    }
+
+    /// Refresh the block-rate Modulation-LFO volume factor (gen 13,
+    /// centibels → linear: `10^(cB/200)`).
+    fn refresh_mod_lfo_gain(&mut self, t: u32) {
+        if self.mod_lfo_to_volume_cb != 0 {
+            let cb = Self::lfo_at(t, self.mod_lfo_delay, self.mod_lfo_period)
+                * self.mod_lfo_to_volume_cb as f32;
+            self.mod_lfo_gain = 10f32.powf(cb / 200.0);
         }
     }
 
@@ -2084,10 +2350,14 @@ impl Voice for Sf2Voice {
         // only operations that are provable no-ops in that configuration
         // (mod-env level unused, no biquad), so its output is identical to
         // the slow path — the SF2 corpus PCM hashes are unchanged.
-        let simple = self.filter.is_none() && self.mod_env_to_pitch_cents == 0;
+        let lfo = self.lfo_active();
+        let simple = self.filter.is_none() && self.mod_env_to_pitch_cents == 0 && !lfo;
         while base < total {
             let n = (total - base).min(ENV_RUN);
             self.envelope_run(self.elapsed, &mut env_buf[..n]);
+            if lfo {
+                self.refresh_mod_lfo_gain(self.elapsed);
+            }
             let chunk = &mut out[base..base + n];
 
             if simple {
@@ -2138,11 +2408,17 @@ impl Voice for Sf2Voice {
                 } else {
                     0.0
                 };
-                if self.mod_env_to_pitch_cents != 0 {
-                    // The mod-env contribution stays integer-quantised
-                    // (as before); only the bend term carries fractions.
+                // Pitch: bend + mod-env (integer-quantised, as before) +
+                // the Vibrato / Modulation LFO sway (§9.1.6).
+                let lfo_pitch = if lfo {
+                    self.lfo_pitch_cents_at(self.elapsed)
+                } else {
+                    0.0
+                };
+                if self.mod_env_to_pitch_cents != 0 || lfo_pitch != 0.0 {
                     let pitch_cents = self.pitch_bend_cents
-                        + f64::from((mod_lvl * self.mod_env_to_pitch_cents as f32) as i32);
+                        + f64::from((mod_lvl * self.mod_env_to_pitch_cents as f32) as i32)
+                        + f64::from(lfo_pitch);
                     let bend_ratio = (2.0f64).powf(pitch_cents / 1200.0);
                     self.phase_inc = self.base_phase_inc * bend_ratio;
                 }
@@ -2153,7 +2429,8 @@ impl Voice for Sf2Voice {
                     let target = self.initial_filter_fc_cents
                         + self.timbre_cutoff_offset_cents
                         + self.dest_cutoff_offset_cents
-                        + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32;
+                        + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32
+                        + self.mod_lfo_filter_cents_at(self.elapsed);
                     let last = self
                         .filter
                         .as_ref()
@@ -2194,7 +2471,7 @@ impl Voice for Sf2Voice {
                 if self.filter.is_some() {
                     s = self.filter_step(0, s);
                 }
-                *slot = s * env * self.amplitude * self.pressure_gain;
+                *slot = s * env * self.amplitude * self.pressure_gain * self.mod_lfo_gain;
                 self.phase += self.phase_inc;
                 self.elapsed = self.elapsed.wrapping_add(1);
             }
@@ -2231,11 +2508,26 @@ impl Voice for Sf2Voice {
     }
 
     fn set_pressure(&mut self, pressure: f32) {
-        // SF2 default modulator: pressure routed to volume. Map 0..1
-        // to a gentle gain curve so low pressure doesn't kill the note
-        // — synths typically treat 0 pressure as "no boost", not "off".
+        // SF2 default modulator §8.4.3 "MIDI Channel Pressure to
+        // Vibrato LFO Pitch Depth": positive unipolar linear source
+        // (127 → 127/128), amount 50 cents per max excursion, summed
+        // into the Vibrato LFO → Pitch node. (No default modulator
+        // routes pressure to volume.)
         let p = pressure.clamp(0.0, 1.0);
-        self.pressure_gain = 1.0 + 0.5 * p; // 1.0 at rest, 1.5 at full
+        self.pressure_vib_cents = 50.0 * p * (127.0 / 128.0);
+    }
+
+    fn set_mod_depth_cents(&mut self, cents: i32) {
+        // SF2 default modulator §8.4.4 "CC 1 to Vibrato LFO Pitch
+        // Depth" — the mixer already scales CC 1 by the RPN 5
+        // Modulation Depth Range (GM2 default 50 cents = the §8.4.4
+        // amount) and folds in the CA-022 LFO Pitch Depth; the result
+        // is the extra Vibrato-LFO excursion.
+        self.mod_wheel_vib_cents = cents as f32;
+    }
+
+    fn set_mod_depth_fine_cents(&mut self, cents: f64) {
+        self.mod_wheel_vib_cents = cents as f32;
     }
 
     fn set_timbre(&mut self, value_0_127: u8) {
@@ -2276,8 +2568,19 @@ impl Voice for Sf2Voice {
         self.attack_samples = scale_u32(self.attack_samples, controls.attack_time).max(1);
         self.decay_samples = scale_u32(self.decay_samples, controls.decay_time).max(1);
         self.release_samples = scale_u32(self.release_samples, controls.release_time).max(1);
-        // No preset vibrato LFO on the SF2 voice (the mod-wheel path
-        // owns pitch sway) — CC 76/77/78 have nothing to scale here.
+        // CC 76 / 77 / 78 Vibrato Rate / Depth / Delay (GM2 §3.3.16–
+        // §3.3.18) scale the Vibrato LFO (§9.1.6): rate → period,
+        // depth → the bank's gen 6 excursion, delay → the gen 23 delay.
+        if controls.vibrato_rate != 64 {
+            self.vib_lfo_period =
+                (self.vib_lfo_period / SoundControls::scale(controls.vibrato_rate)).max(2.0);
+        }
+        if controls.vibrato_depth != 64 {
+            self.vib_lfo_to_pitch_cents *= SoundControls::scale(controls.vibrato_depth);
+        }
+        if controls.vibrato_delay != 64 {
+            self.vib_lfo_delay = scale_u32(self.vib_lfo_delay, controls.vibrato_delay);
+        }
         if controls.resonance != 64 {
             self.initial_filter_q_cb =
                 (self.initial_filter_q_cb + (controls.resonance as i32 - 64) * 3).max(0);
@@ -2302,11 +2605,15 @@ impl Voice for Sf2Voice {
         if self.done {
             return 0;
         }
+        let lfo = self.lfo_active();
         for i in 0..out_l.len() {
             let env = self.envelope_at(self.elapsed);
             if self.release_pos.is_some() && env <= 0.0 {
                 self.done = true;
                 return i;
+            }
+            if lfo && self.elapsed % ENV_RUN as u32 == 0 {
+                self.refresh_mod_lfo_gain(self.elapsed);
             }
 
             // Mod-env routings same as the mono path.
@@ -2315,9 +2622,15 @@ impl Voice for Sf2Voice {
             } else {
                 0.0
             };
-            if self.mod_env_to_pitch_cents != 0 {
+            let lfo_pitch = if lfo {
+                self.lfo_pitch_cents_at(self.elapsed)
+            } else {
+                0.0
+            };
+            if self.mod_env_to_pitch_cents != 0 || lfo_pitch != 0.0 {
                 let pitch_cents = self.pitch_bend_cents
-                    + f64::from((mod_lvl * self.mod_env_to_pitch_cents as f32) as i32);
+                    + f64::from((mod_lvl * self.mod_env_to_pitch_cents as f32) as i32)
+                    + f64::from(lfo_pitch);
                 let bend_ratio = (2.0f64).powf(pitch_cents / 1200.0);
                 self.phase_inc = self.base_phase_inc * bend_ratio;
             }
@@ -2325,7 +2638,8 @@ impl Voice for Sf2Voice {
                 let target = self.initial_filter_fc_cents
                     + self.timbre_cutoff_offset_cents
                     + self.dest_cutoff_offset_cents
-                    + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32;
+                    + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32
+                    + self.mod_lfo_filter_cents_at(self.elapsed);
                 let last = self
                     .filter
                     .as_ref()
@@ -2387,7 +2701,7 @@ impl Voice for Sf2Voice {
                 sl = self.filter_step(0, sl);
                 sr = self.filter_step(1, sr);
             }
-            let amp = env * self.amplitude * self.pressure_gain;
+            let amp = env * self.amplitude * self.pressure_gain * self.mod_lfo_gain;
             out_l[i] = sl * amp;
             out_r[i] = sr * amp;
             self.phase += self.phase_inc;
@@ -2401,6 +2715,24 @@ impl Voice for Sf2Voice {
 
     fn exclusive_class(&self) -> u16 {
         self.exclusive_class
+    }
+
+    fn velocity_gain(&self, velocity: f32) -> f32 {
+        // `from_plan`: amplitude ∝ (v / 127)².
+        let n = (velocity / 127.0).clamp(0.0, 1.0);
+        n * n
+    }
+
+    fn pan_offset(&self) -> f32 {
+        self.pan_offset
+    }
+
+    fn reverb_send(&self) -> f32 {
+        self.reverb_send
+    }
+
+    fn chorus_send(&self) -> f32 {
+        self.chorus_send
     }
 }
 
@@ -2734,6 +3066,12 @@ mod tests {
     /// `sampleModes` generator (mode = 1 = continuous loop) so the
     /// voice doesn't run off the end during a release-tail test.
     fn build_minimal_looping_sf2() -> Vec<u8> {
+        build_looping_sf2_with_igens(&[])
+    }
+
+    /// The looping fixture with extra instrument-zone generators
+    /// (placed before `sampleModes` / `sampleID`, which must stay last).
+    fn build_looping_sf2_with_igens(extra: &[(u16, u16)]) -> Vec<u8> {
         // 20-frame ramp.
         let mut samples: Vec<i16> = Vec::with_capacity(20);
         for i in 0i32..20 {
@@ -2779,10 +3117,14 @@ mod tests {
         inst_chunk.extend_from_slice(&inst_record("EOI", 2));
         let mut ibag = Vec::new();
         ibag.extend_from_slice(&bag_record(0, 0));
-        ibag.extend_from_slice(&bag_record(2, 0));
+        ibag.extend_from_slice(&bag_record((2 + extra.len()) as u16, 0));
         let imod = vec![0u8; IMOD_RECORD];
-        // igen: sampleModes=1 *then* sampleID=0 (sampleID must be last).
+        // igen: extras, sampleModes=1 *then* sampleID=0 (sampleID must
+        // be last).
         let mut igen = Vec::new();
+        for &(oper, amount) in extra {
+            igen.extend_from_slice(&gen_record(oper, amount));
+        }
         igen.extend_from_slice(&gen_record(GEN_SAMPLE_MODES, 1));
         igen.extend_from_slice(&gen_record(GEN_SAMPLE_ID, 0));
         igen.extend_from_slice(&gen_record(0, 0));
@@ -2971,29 +3313,202 @@ mod tests {
         );
     }
 
-    #[test]
-    fn voice_pressure_boosts_amplitude() {
-        let blob = build_minimal_looping_sf2();
-        let bank = Sf2Bank::parse(&blob).unwrap();
-        let inst = Sf2Instrument {
+    fn looping_inst(extra: &[(u16, u16)]) -> Sf2Instrument {
+        let blob = build_looping_sf2_with_igens(extra);
+        Sf2Instrument {
             name: "test".into(),
-            bank,
-        };
+            bank: Sf2Bank::parse(&blob).unwrap(),
+        }
+    }
+
+    fn render_frames(voice: &mut Box<dyn Voice>, n: usize) -> Vec<f32> {
+        let mut buf = vec![0.0f32; n];
+        let got = voice.render(&mut buf);
+        buf.truncate(got);
+        buf
+    }
+
+    #[test]
+    fn voice_pressure_adds_vibrato_not_gain() {
+        // SF2 §8.4.3: Channel Pressure → Vibrato LFO pitch depth (50
+        // cents at full), and no default modulator routes it to volume.
+        let inst = looping_inst(&[]);
         let mut a = inst.make_voice(0, 60, 100, 22_050).unwrap();
         let mut b = inst.make_voice(0, 60, 100, 22_050).unwrap();
         b.set_pressure(1.0);
-        // Render past attack (5 ms = 110 samples at 22050 Hz).
-        let mut buf_a = vec![0.0f32; 1024];
-        let mut buf_b = vec![0.0f32; 1024];
-        a.render(&mut buf_a);
-        b.render(&mut buf_b);
-        // Sample post-attack peak.
-        let peak_a: f32 = buf_a[200..1000].iter().map(|s| s.abs()).fold(0.0, f32::max);
-        let peak_b: f32 = buf_b[200..1000].iter().map(|s| s.abs()).fold(0.0, f32::max);
+        let buf_a = render_frames(&mut a, 4096);
+        let buf_b = render_frames(&mut b, 4096);
+        let peak = |v: &[f32]| v[200..].iter().map(|s| s.abs()).fold(0.0, f32::max);
+        let (pa, pb) = (peak(&buf_a), peak(&buf_b));
         assert!(
-            peak_b > peak_a * 1.2,
-            "pressure didn't boost: a={peak_a}, b={peak_b}"
+            (pa - pb).abs() < pa * 0.05,
+            "no gain change: a={pa}, b={pb}"
         );
+        assert_ne!(buf_a, buf_b, "pressure must sway the pitch");
+        // CC 1 through the mixer's mod-depth hook does the same
+        // (§8.4.4), and zero depth is exactly the dry voice.
+        let mut c = inst.make_voice(0, 60, 100, 22_050).unwrap();
+        c.set_mod_depth_cents(50);
+        assert_ne!(render_frames(&mut c, 4096), buf_a);
+        let mut d = inst.make_voice(0, 60, 100, 22_050).unwrap();
+        d.set_mod_depth_cents(0);
+        d.set_pressure(0.0);
+        assert_eq!(render_frames(&mut d, 4096), buf_a);
+    }
+
+    #[test]
+    fn vibrato_lfo_generators_sway_pitch_and_zero_depth_is_dry() {
+        let plain = {
+            let inst = looping_inst(&[]);
+            let mut v = inst.make_voice(0, 60, 100, 22_050).unwrap();
+            render_frames(&mut v, 8192)
+        };
+        // gen 6 = 0 is exactly the dry voice, whatever the LFO rate.
+        let inst0 = looping_inst(&[(GEN_VIB_LFO_TO_PITCH, 0), (GEN_FREQ_VIB_LFO, 1200)]);
+        let mut v0 = inst0.make_voice(0, 60, 100, 22_050).unwrap();
+        assert_eq!(render_frames(&mut v0, 8192), plain);
+        // ±1 octave at 8.176 Hz (gen 24 default): the ramp loop's
+        // zero-crossing spacing must vary across the render.
+        let inst = looping_inst(&[(GEN_VIB_LFO_TO_PITCH, 1200)]);
+        let plan = inst.bank.resolve(0, 60, 100).unwrap();
+        assert_eq!(plan.vib_lfo_to_pitch_cents, 1200);
+        assert_eq!(plan.vib_lfo_freq_cents, 0);
+        let mut v = inst.make_voice(0, 60, 100, 22_050).unwrap();
+        let out = render_frames(&mut v, 8192);
+        assert_ne!(out, plain);
+        let crossings = |w: &[f32]| {
+            w.windows(2)
+                .filter(|p| (p[0] < 0.0) != (p[1] < 0.0))
+                .count()
+        };
+        let (a, b) = (crossings(&out[512..1536]), crossings(&out[2048..3072]));
+        assert_ne!(a, b, "pitch must move between windows: {a} vs {b}");
+        // Delay: with a 200 ms delay the first 4096 frames (186 ms at
+        // 22 050 Hz) are identical to the dry voice.
+        let delay_tc = (1200.0 * (0.2f64).log2()).round() as i16 as u16;
+        let inst_d = looping_inst(&[(GEN_VIB_LFO_TO_PITCH, 1200), (GEN_DELAY_VIB_LFO, delay_tc)]);
+        let mut vd = inst_d.make_voice(0, 60, 100, 22_050).unwrap();
+        let outd = render_frames(&mut vd, 8192);
+        assert_eq!(outd[..4096], plain[..4096]);
+        assert_ne!(outd[4096..], plain[4096..]);
+    }
+
+    #[test]
+    fn mod_lfo_to_volume_is_a_tremolo() {
+        // gen 13 = 960 cB: the block-rate gain sways over ±96 dB.
+        let inst = looping_inst(&[(GEN_MOD_LFO_TO_VOLUME, 960), (GEN_FREQ_MOD_LFO, 1200)]);
+        let mut v = inst.make_voice(0, 60, 100, 22_050).unwrap();
+        let out = render_frames(&mut v, 16_384);
+        let rms = |w: &[f32]| (w.iter().map(|s| s * s).sum::<f32>() / w.len() as f32).sqrt();
+        let blocks: Vec<f32> = out[2048..].chunks(256).map(rms).collect();
+        let (lo, hi) = blocks
+            .iter()
+            .fold((f32::MAX, 0.0f32), |(l, h), &b| (l.min(b), h.max(b)));
+        assert!(hi > lo * 4.0, "tremolo depth: {lo} .. {hi}");
+    }
+
+    #[test]
+    fn mod_lfo_to_pitch_and_filter_generators_are_live() {
+        let plain = {
+            let inst = looping_inst(&[]);
+            let mut v = inst.make_voice(0, 60, 100, 22_050).unwrap();
+            render_frames(&mut v, 4096)
+        };
+        let inst = looping_inst(&[(GEN_MOD_LFO_TO_PITCH, 700)]);
+        let mut v = inst.make_voice(0, 60, 100, 22_050).unwrap();
+        assert_ne!(render_frames(&mut v, 4096), plain);
+        // Filter sway needs a filter: an audible cutoff + gen 10.
+        let inst = looping_inst(&[
+            (GEN_INITIAL_FILTER_FC, 9000),
+            (GEN_MOD_LFO_TO_FILTER_FC, 2400),
+        ]);
+        let base = looping_inst(&[(GEN_INITIAL_FILTER_FC, 9000)]);
+        let mut a = inst.make_voice(0, 60, 100, 22_050).unwrap();
+        let mut b = base.make_voice(0, 60, 100, 22_050).unwrap();
+        assert_ne!(render_frames(&mut a, 4096), render_frames(&mut b, 4096));
+    }
+
+    #[test]
+    fn pan_and_effects_send_generators_reach_the_mixer() {
+        use crate::mixer::Mixer;
+        let inst = looping_inst(&[
+            (GEN_PAN, (-500i16) as u16),
+            (GEN_REVERB_EFFECTS_SEND, 500),
+            (GEN_CHORUS_EFFECTS_SEND, 250),
+        ]);
+        let v = inst.make_voice(0, 60, 100, 44_100).unwrap();
+        assert_eq!(v.pan_offset(), -0.5);
+        assert_eq!(v.reverb_send(), 0.5);
+        assert_eq!(v.chorus_send(), 0.25);
+        let mut m = Mixer::new();
+        m.note_on(0, 60, 100, v);
+        let (mut l, mut r) = (vec![0.0f32; 512], vec![0.0f32; 512]);
+        m.mix_stereo(&mut l, &mut r);
+        // Hard left from a centred channel; the bus is latched on by
+        // the voice's own send.
+        assert!(l.iter().any(|s| s.abs() > 0.0));
+        assert!(r.iter().all(|s| s.abs() < 1e-6));
+        assert!(m.effects_bus_active());
+        // Out-of-range values clamp (§8.1.3 useful range).
+        let inst = looping_inst(&[(GEN_PAN, 900), (GEN_REVERB_EFFECTS_SEND, 5000)]);
+        let v = inst.make_voice(0, 60, 100, 44_100).unwrap();
+        assert_eq!(v.pan_offset(), 0.5);
+        assert_eq!(v.reverb_send(), 1.0);
+    }
+
+    #[test]
+    fn keynum_to_envelope_generators_track_the_keyboard() {
+        // hold = −1200 tc (0.5 s) at key 60; gen 39 = 100 tc/key → key
+        // 72 holds 0.25 s (−2400 tc), key 48 holds 1 s (0 tc). §8.1.2.
+        let inst = looping_inst(&[
+            (GEN_HOLD_VOL_ENV, (-1200i16) as u16),
+            (GEN_KEYNUM_TO_VOL_ENV_HOLD, 100),
+            (GEN_KEYNUM_TO_MOD_ENV_DECAY, 50),
+        ]);
+        assert_eq!(inst.bank.resolve(0, 60, 100).unwrap().env.hold_tc, -1200);
+        assert_eq!(inst.bank.resolve(0, 72, 100).unwrap().env.hold_tc, -2400);
+        assert_eq!(inst.bank.resolve(0, 48, 100).unwrap().env.hold_tc, 0);
+        // Unset base time: the keynum term applies to the −12000 default
+        // (the spec's worked example: 10 ms at 60 → 20 ms at 36 with 50).
+        let plan36 = inst.bank.resolve(0, 36, 100).unwrap();
+        assert_eq!(plan36.mod_env.decay_tc, -12_000 + 24 * 50);
+        assert_eq!(plan36.mod_env.hold_tc, i32::MIN, "untouched without a gen");
+    }
+
+    #[test]
+    fn scale_tuning_generator_controls_key_tracking() {
+        let inst = looping_inst(&[(GEN_SCALE_TUNING, 0)]);
+        let r60 = inst.bank.resolve(0, 60, 100).unwrap().pitch_ratio;
+        let r72 = inst.bank.resolve(0, 72, 100).unwrap().pitch_ratio;
+        assert_eq!(r60, r72, "scaleTuning 0: key has no effect on pitch");
+        let half = looping_inst(&[(GEN_SCALE_TUNING, 50)]);
+        let r72h = half.bank.resolve(0, 72, 100).unwrap().pitch_ratio;
+        assert!((r72h - 2f64.sqrt()).abs() < 1e-9, "{r72h}");
+        // Default 100 is the tempered scale (bit-identical to before).
+        let plain = looping_inst(&[]);
+        assert_eq!(plain.bank.resolve(0, 72, 100).unwrap().pitch_ratio, 2.0);
+    }
+
+    #[test]
+    fn sound_controllers_scale_the_vibrato_lfo() {
+        use crate::instruments::SoundControls;
+        let inst = looping_inst(&[
+            (GEN_VIB_LFO_TO_PITCH, 100),
+            (GEN_DELAY_VIB_LFO, (-1200i16) as u16),
+        ]);
+        let plan = inst.bank.resolve(0, 60, 100).unwrap();
+        let mut v = Sf2Voice::from_plan(inst.bank.sample_data.clone(), &plan, 100, 44_100);
+        let (period, delay, depth) = (v.vib_lfo_period, v.vib_lfo_delay, v.vib_lfo_to_pitch_cents);
+        assert_eq!(delay, 22_050);
+        v.apply_sound_controls(&SoundControls {
+            vibrato_rate: 96,  // ×2 rate → half the period
+            vibrato_depth: 96, // ×2 depth
+            vibrato_delay: 32, // ×0.5 delay
+            ..SoundControls::default()
+        });
+        assert!((v.vib_lfo_period - period / 2.0).abs() < 1e-3);
+        assert_eq!(v.vib_lfo_to_pitch_cents, depth * 2.0);
+        assert_eq!(v.vib_lfo_delay, delay / 2);
     }
 
     #[test]
@@ -4099,6 +4614,17 @@ mod tests {
             initial_filter_q_cb: 0,
             initial_attenuation_cb: 0,
             exclusive_class: 0,
+            vib_lfo_to_pitch_cents: 0,
+            vib_lfo_delay_tc: i32::MIN,
+            vib_lfo_freq_cents: 0,
+            mod_lfo_to_pitch_cents: 0,
+            mod_lfo_to_filter_cents: 0,
+            mod_lfo_to_volume_cb: 0,
+            mod_lfo_delay_tc: i32::MIN,
+            mod_lfo_freq_cents: 0,
+            pan_per_mille: 0,
+            chorus_send_per_mille: 0,
+            reverb_send_per_mille: 0,
             stereo_pair: None,
         };
         let data: Arc<[i32]> = Arc::from(vec![0i32; 32].into_boxed_slice());
@@ -4180,6 +4706,17 @@ mod tests {
             initial_filter_q_cb: 0,
             initial_attenuation_cb: 0,
             exclusive_class: 0,
+            vib_lfo_to_pitch_cents: 0,
+            vib_lfo_delay_tc: i32::MIN,
+            vib_lfo_freq_cents: 0,
+            mod_lfo_to_pitch_cents: 0,
+            mod_lfo_to_filter_cents: 0,
+            mod_lfo_to_volume_cb: 0,
+            mod_lfo_delay_tc: i32::MIN,
+            mod_lfo_freq_cents: 0,
+            pan_per_mille: 0,
+            chorus_send_per_mille: 0,
+            reverb_send_per_mille: 0,
             stereo_pair: None,
         };
         // A ramp sample so divergence anywhere is visible in the output.

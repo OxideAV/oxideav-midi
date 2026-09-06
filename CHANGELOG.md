@@ -123,6 +123,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Profile specification is staged, so enabling changes no sound
   parameter by itself — the state is what Profile-specific behaviour
   (Attribute Type 0x02, Profile-defined controllers) gates on.
+- **SoundFont 2 synthesis depth — LFOs, pan, sends, key tracking**
+  (sf2-spec-2.04 §8.1.2/§8.1.3/§9.1.5/§9.1.6): the SF2 voice now runs
+  the **Vibrato LFO** (gens 6/23/24) and the **Modulation LFO** (gens
+  5/10/13/21/22) — delay, then the §9.1.6 triangle at the absolute-cents
+  frequency — routed to pitch, filter cutoff and (block-rate) volume;
+  the §8.4.3 / §8.4.4 default modulators put **Channel Pressure and CC
+  1 on the Vibrato LFO** (50 cents at full; pressure no longer boosts
+  gain, which no default modulator specifies), and the GM2 Sound
+  Controllers CC 76/77/78 scale the Vibrato LFO's rate / depth / delay.
+  `pan` (gen 17), `reverbEffectsSend` / `chorusEffectsSend` (gens 16/15)
+  reach the mixer through the new `Voice::pan_offset` / `reverb_send` /
+  `chorus_send` hooks (voice sends add to the CC 91/93 sends per
+  §8.4.8/§8.4.9 and latch the effects bus); `keynumTo{Vol,Mod}Env
+  {Hold,Decay}` (gens 31/32/39/40) and `scaleTuning` (gen 56) are
+  honoured at plan time. Banks that set none of these render
+  bit-identically (bench `--corpus` hashes unchanged).
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-midi/compare/v0.0.4...v0.0.5) - 2026-08-31
 

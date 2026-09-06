@@ -269,6 +269,28 @@ pub trait Voice: Send {
         n * n
     }
 
+    /// The voice's own stereo position offset, in RP-036 pan-position
+    /// units (`−0.5` = hard left of the channel pan, `+0.5` = hard
+    /// right): the SF2 `pan` generator (gen 17, 0.1 % units / 1000).
+    /// The mixer adds it to the channel's pan position and clamps.
+    /// Default `0.0` = the channel pan alone.
+    fn pan_offset(&self) -> f32 {
+        0.0
+    }
+
+    /// The voice's own reverb send as a `0..=1` fraction (SF2 gen 16
+    /// `reverbEffectsSend`, §9.1.5), summed by the mixer with the
+    /// channel's CC 91 send (the §8.4.8 default modulator) and clamped.
+    fn reverb_send(&self) -> f32 {
+        0.0
+    }
+
+    /// The voice's own chorus send as a `0..=1` fraction (SF2 gen 15
+    /// `chorusEffectsSend`), summed with the channel's CC 93 send.
+    fn chorus_send(&self) -> f32 {
+        0.0
+    }
+
     /// Non-zero exclusive-class id (SF2 generator 57). When a new
     /// voice with the same `exclusive_class` is started on the same
     /// channel, the mixer hard-stops every prior voice in that class —
