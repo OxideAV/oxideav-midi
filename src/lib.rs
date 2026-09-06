@@ -311,6 +311,12 @@ impl MidiDecoder {
         self.scheduler.as_ref()
     }
 
+    /// Borrow the mixer (channel state, enabled MIDI-CI Profiles,
+    /// per-note state). Useful for diagnostics + tests.
+    pub fn mixer(&self) -> &Mixer {
+        &self.mixer
+    }
+
     /// Convert the planar stereo `(left, right)` buffers into one
     /// interleaved S16 [`AudioFrame`].
     fn build_audio_frame(&mut self) -> Frame {
@@ -344,8 +350,10 @@ impl Decoder for MidiDecoder {
         // reach the mixer's MIDI 2.0 entry points at full resolution
         // (`Scheduler::from_clip`); the Appendix-D translated path
         // (`ClipFile::to_smf`) stays available to callers.
+        let mut profiles = Vec::new();
         let scheduler = if crate::clip::is_clip_file(&packet.data) {
             let clip = crate::clip::parse(&packet.data)?;
+            profiles = clip.profiles.clone();
             Scheduler::from_clip(&clip, self.sample_rate)
         } else {
             // Confirm the packet at least *looks* like an SMF — saves
@@ -364,6 +372,12 @@ impl Decoder for MidiDecoder {
         // `flush` first if that matters.
         self.scheduler = Some(scheduler);
         self.mixer.all_notes_off();
+        // M2-116 §6.2: the Set Profile On messages at the head of the
+        // Clip Configuration Header configure the receiver before any
+        // timed message — apply them through the MIDI-CI route now.
+        for p in &profiles {
+            crate::scheduler::dispatch_universal_sysex(p, &mut self.mixer);
+        }
         self.next_pts = 0;
         self.drained = false;
         self.finished = false;

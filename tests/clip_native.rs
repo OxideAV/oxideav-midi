@@ -410,3 +410,32 @@ fn decoder_plays_a_clip_natively_and_matches_the_smf_of_a_midi1_clip() {
     assert!(from_clip.len() > 40_000);
     assert_eq!(from_clip, from_smf);
 }
+
+// ── Clip Configuration Header profiles (M2-116 §6.2) ──
+
+#[test]
+fn clip_header_set_profile_on_configures_the_decoder_before_playback() {
+    use oxideav_midi::ci::{sub_id2, CiBody, CiMessage, ProfileId, BROADCAST_MUID, CI_VERSION_2};
+    let profile = ProfileId::standard(0x00, 0x02, 0x01, 0x01);
+    let set_on = CiMessage {
+        device_id: 0x7E, // the whole Group
+        sub_id2: sub_id2::SET_PROFILE_ON,
+        version: CI_VERSION_2,
+        source_muid: 0x0000_0001,
+        destination_muid: BROADCAST_MUID,
+        body: CiBody::SetProfileOn {
+            profile,
+            num_channels: Some(0),
+        },
+    }
+    .emit();
+    let mut clip = midi1_clip();
+    clip.profiles = vec![set_on];
+    let bytes = clip::write(&clip).expect("clip serialises");
+    let mut dec = MidiDecoder::new(Arc::new(ToneInstrument::new()), RATE);
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, i64::from(RATE)), bytes))
+        .expect("accepted");
+    assert!(dec.mixer().profile_enabled(0, profile));
+    assert!(dec.mixer().profile_enabled(15, profile));
+    assert_eq!(dec.mixer().enabled_profiles(9), vec![profile]);
+}

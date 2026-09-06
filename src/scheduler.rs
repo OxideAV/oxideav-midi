@@ -701,6 +701,27 @@ fn dispatch_universal_non_real_time(payload: &[u8], mixer: &mut crate::mixer::Mi
         // forms are "setup messages" that should not retune sounding
         // notes; we update the table but skip the live re-apply.
         dispatch_mts(payload, mixer, false);
+    } else if sub_id1 == crate::ci::SUB_ID_1_MIDI_CI {
+        // MIDI-CI (M2-101): the Profile Configuration messages that
+        // configure a receiver — Set Profile On / Off (§7.8 / §7.9)
+        // — reach the mixer's Profile state with their M2-102 §2.3
+        // Channel / Group / Function Block addressing. Discovery,
+        // Property Exchange and Process Inquiry are transactions with
+        // an Initiator; an offline renderer has nothing to reply to.
+        if let Ok(ci) = crate::ci::CiMessage::parse(payload) {
+            match ci.body {
+                crate::ci::CiBody::SetProfileOn {
+                    profile,
+                    num_channels,
+                } => {
+                    mixer.set_profile_on(ci.device_id, profile, num_channels);
+                }
+                crate::ci::CiBody::SetProfileOff { profile } => {
+                    mixer.set_profile_off(ci.device_id, profile);
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1427,6 +1448,48 @@ mod tests {
         v.extend_from_slice(body);
         v.push(0xF7);
         v
+    }
+
+    #[test]
+    fn midi_ci_set_profile_on_off_sysex_routes_to_the_mixer() {
+        use crate::ci::{sub_id2, CiBody, CiMessage, ProfileId, CI_VERSION_2};
+        let profile = ProfileId::standard(0x00, 0x05, 0x01, 0x01);
+        let ci = |sub: u8, body: CiBody| {
+            CiMessage {
+                device_id: 0x02,
+                sub_id2: sub,
+                version: CI_VERSION_2,
+                source_muid: 0x0123_4567,
+                destination_muid: crate::ci::BROADCAST_MUID,
+                body,
+            }
+            .emit()
+        };
+        let on = ci(
+            sub_id2::SET_PROFILE_ON,
+            CiBody::SetProfileOn {
+                profile,
+                num_channels: Some(3),
+            },
+        );
+        let off = ci(sub_id2::SET_PROFILE_OFF, CiBody::SetProfileOff { profile });
+        let mut events = sysex_event(0, &on);
+        events.extend(sysex_event(10, &off));
+        events.extend([0, 0xFF, 0x2F, 0]);
+        let smf = crate::smf::parse(&smf_with_events(96, &events)).unwrap();
+        let mut sched = Scheduler::new(&smf, 44_100);
+        let mut mixer = Mixer::new();
+        let inst = crate::instruments::tone::ToneInstrument::new();
+        // Tick 0 only: the Set Profile On lands, channels 2..=4.
+        sched.step(1, &mut mixer, &inst);
+        assert!(mixer.profile_enabled(2, profile));
+        assert!(mixer.profile_enabled(4, profile));
+        assert!(!mixer.profile_enabled(5, profile));
+        assert_eq!(mixer.profile_manager_channel(4, profile), Some(2));
+        // Play through the Set Profile Off.
+        sched.step(44_100, &mut mixer, &inst);
+        assert!(!mixer.profile_enabled(2, profile));
+        assert!(mixer.enabled_profiles(3).is_empty());
     }
 
     #[test]

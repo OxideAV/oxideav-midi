@@ -109,6 +109,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   natively. Groups fold onto the single 16-channel Function Block; JR
   Timestamps are accepted and rendered at their Delta Clockstamp
   position (M2-116 defines no JR ↔ DCS relation).
+- **MIDI-CI Profile Configuration state** (M2-101 §7.8/§7.9, M2-102
+  §2.3/§2.6): `Mixer::set_profile_on` / `set_profile_off` implement
+  the Device-ID addressing — a Channel (the Manager of a Multi-Channel
+  Profile, with the version-2 Number Channels Requested spanning its
+  Members, capped at the Function Block's 16), the Group (`0x7E`) or
+  the Function Block (`0x7F`) — and `profile_enabled` /
+  `enabled_profiles` / `profile_manager_channel` expose the result.
+  The scheduler routes MIDI-CI Set Profile On/Off SysEx (SMF `F0` or
+  UMP SysEx7) into it, and the decoder applies a clip's Configuration
+  Header Set Profile On messages (M2-116 §6.2) before playback
+  (`MidiDecoder::mixer` borrows the state). No Standard Defined
+  Profile specification is staged, so enabling changes no sound
+  parameter by itself — the state is what Profile-specific behaviour
+  (Attribute Type 0x02, Profile-defined controllers) gates on.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-midi/compare/v0.0.4...v0.0.5) - 2026-08-31
 

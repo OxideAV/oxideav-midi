@@ -33,6 +33,7 @@
 //! held-chord killing every new note in a busy passage. Round-4 may
 //! revisit.
 
+use crate::ci::{ProfileId, DEVICE_ID_FUNCTION_BLOCK, DEVICE_ID_GROUP};
 use crate::instruments::{SoundControls, Voice};
 
 /// Hard cap on simultaneous voices. Picked to land below the audible
@@ -1573,6 +1574,14 @@ pub struct Mixer {
     /// (muted). All-false until both a Polyphony Level and a MIP
     /// message are present.
     channel_masked: [bool; NUM_CHANNELS],
+    /// MIDI-CI Profiles enabled per channel (M2-102 §2.3.1 / §2.3.4):
+    /// each entry is the Profile and the Manager Channel it was enabled
+    /// on (equal to the channel itself for a Single Channel Profile).
+    profiles_channel: Vec<Vec<(ProfileId, u8)>>,
+    /// Profiles enabled Group-wide (Device ID `0x7E`, §2.3.2).
+    profiles_group: Vec<ProfileId>,
+    /// Profiles enabled Function-Block-wide (Device ID `0x7F`, §2.3.3).
+    profiles_function_block: Vec<ProfileId>,
     /// MIDI 2.0 Per-Note Controller state (§7.4.4 / §7.4.12) per
     /// channel, keyed by note number. Entries appear on the first
     /// per-note message for that number.
@@ -1658,6 +1667,9 @@ impl Mixer {
             sp_midi_polyphony: None,
             sp_midi_mip: None,
             channel_masked: [false; NUM_CHANNELS],
+            profiles_channel: vec![Vec::new(); NUM_CHANNELS],
+            profiles_group: Vec::new(),
+            profiles_function_block: Vec::new(),
             per_note: vec![std::collections::HashMap::new(); NUM_CHANNELS],
             assignable: vec![std::collections::HashMap::new(); NUM_CHANNELS],
             key_based: vec![std::collections::HashMap::new(); NUM_CHANNELS],
@@ -3906,6 +3918,123 @@ impl Mixer {
         }
     }
 
+    // ───────────── MIDI-CI Profile Configuration (M2-102 §2.3 / §2.6) ─────────────
+
+    /// Enable a MIDI-CI Profile in response to a **Set Profile On**
+    /// message (M2-101 §7.8, M2-102 §2.6: "A device shall enable any
+    /// Profile it supports after it receives the associated Set
+    /// Profile On Message"). `device_id` is the message's Device ID —
+    /// the addressing of M2-102 §2.3: `0x00..=0x0F` a Channel (the
+    /// Manager Channel of a Multi-Channel Profile, whose Member
+    /// Channels follow it: `num_channels` is the version-2 "Number
+    /// Channels Requested", Manager included, capped at the 16
+    /// channels of this Function Block), `0x7E` the whole Group,
+    /// `0x7F` the whole Function Block.
+    ///
+    /// No Standard Defined Profile specification is part of this
+    /// crate's reference set, so enabling a Profile changes no sound
+    /// parameter by itself: the Profile is recorded as active for the
+    /// addressed channels ([`Self::profile_enabled`] /
+    /// [`Self::enabled_profiles`]) — the state a Profile-specific
+    /// definition (Attribute Type 0x02, Profile-defined CCs) would be
+    /// gated on. Returns the channels the Profile now covers.
+    pub fn set_profile_on(
+        &mut self,
+        device_id: u8,
+        profile: ProfileId,
+        num_channels: Option<u16>,
+    ) -> Vec<u8> {
+        match device_id {
+            DEVICE_ID_GROUP => {
+                if !self.profiles_group.contains(&profile) {
+                    self.profiles_group.push(profile);
+                }
+                (0..NUM_CHANNELS as u8).collect()
+            }
+            DEVICE_ID_FUNCTION_BLOCK => {
+                if !self.profiles_function_block.contains(&profile) {
+                    self.profiles_function_block.push(profile);
+                }
+                (0..NUM_CHANNELS as u8).collect()
+            }
+            manager @ 0x00..=0x0F => {
+                let span = usize::from(num_channels.unwrap_or(1).max(1));
+                let first = usize::from(manager);
+                let last = (first + span).min(NUM_CHANNELS);
+                let mut covered = Vec::new();
+                for ch in first..last {
+                    let entry = (profile, manager);
+                    if !self.profiles_channel[ch].contains(&entry) {
+                        // A re-enable on the same Manager replaces the
+                        // previous span (drop stale Member entries).
+                        self.profiles_channel[ch].push(entry);
+                    }
+                    covered.push(ch as u8);
+                }
+                for ch in last..NUM_CHANNELS {
+                    self.profiles_channel[ch].retain(|e| *e != (profile, manager));
+                }
+                covered
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Disable a MIDI-CI Profile in response to a **Set Profile Off**
+    /// message (M2-101 §7.9) with the same addressing as
+    /// [`Self::set_profile_on`]: a Channel Device ID disables the
+    /// Profile on the Manager Channel and every Member Channel it was
+    /// enabled with.
+    pub fn set_profile_off(&mut self, device_id: u8, profile: ProfileId) {
+        match device_id {
+            DEVICE_ID_GROUP => self.profiles_group.retain(|p| *p != profile),
+            DEVICE_ID_FUNCTION_BLOCK => self.profiles_function_block.retain(|p| *p != profile),
+            manager @ 0x00..=0x0F => {
+                for list in self.profiles_channel.iter_mut() {
+                    list.retain(|e| *e != (profile, manager));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `profile` is active on `channel` — enabled on it (as
+    /// Manager or Member), Group-wide, or Function-Block-wide.
+    pub fn profile_enabled(&self, channel: u8, profile: ProfileId) -> bool {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.profiles_channel[ch].iter().any(|(p, _)| *p == profile)
+            || self.profiles_group.contains(&profile)
+            || self.profiles_function_block.contains(&profile)
+    }
+
+    /// Every Profile active on `channel` (channel-level entries first,
+    /// then Group, then Function Block), without duplicates.
+    pub fn enabled_profiles(&self, channel: u8) -> Vec<ProfileId> {
+        let ch = channel as usize % NUM_CHANNELS;
+        let mut out: Vec<ProfileId> = Vec::new();
+        for p in self.profiles_channel[ch]
+            .iter()
+            .map(|(p, _)| *p)
+            .chain(self.profiles_group.iter().copied())
+            .chain(self.profiles_function_block.iter().copied())
+        {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// The Manager Channel a Profile was enabled on for `channel`, if
+    /// it is active there through a Channel-addressed Set Profile On.
+    pub fn profile_manager_channel(&self, channel: u8, profile: ProfileId) -> Option<u8> {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.profiles_channel[ch]
+            .iter()
+            .find(|(p, _)| *p == profile)
+            .map(|(_, m)| *m)
+    }
+
     // ───────────── MIDI 2.0 Per-Note messages (§7.4.4 / §7.4.5 / §7.4.12) ─────────────
 
     /// The Per-Note Controller state of `(channel, note)`, if any
@@ -6056,6 +6185,72 @@ mod tests {
         assert_eq!(m.live_voice_count(), 2);
         m.all_notes_off();
         assert_eq!(m.live_voice_count(), 0);
+    }
+
+    // ── MIDI-CI Profile Configuration (M2-102 §2.3 / §2.6) ──
+
+    #[test]
+    fn profile_on_off_addresses_channel_group_and_function_block() {
+        let piano = ProfileId::standard(0x00, 0x01, 0x01, 0x01);
+        let gm2 = ProfileId::standard(0x00, 0x02, 0x01, 0x01);
+        let fx = ProfileId([0x00, 0x21, 0x09, 0x00, 0x00]);
+        let mut m = Mixer::new();
+        assert!(!m.profile_enabled(0, piano));
+        assert!(m.enabled_profiles(0).is_empty());
+        // Single Channel Profile on channel 3 (§2.3.1).
+        assert_eq!(m.set_profile_on(3, piano, None), vec![3]);
+        assert!(m.profile_enabled(3, piano));
+        assert!(!m.profile_enabled(2, piano));
+        assert_eq!(m.profile_manager_channel(3, piano), Some(3));
+        // Group Profile (§2.3.2) covers every channel.
+        assert_eq!(m.set_profile_on(DEVICE_ID_GROUP, gm2, Some(0)).len(), 16);
+        assert!(m.profile_enabled(0, gm2) && m.profile_enabled(15, gm2));
+        assert_eq!(m.profile_manager_channel(0, gm2), None);
+        // Function Block Profile (§2.3.3).
+        m.set_profile_on(DEVICE_ID_FUNCTION_BLOCK, fx, None);
+        assert_eq!(m.enabled_profiles(3), vec![piano, gm2, fx]);
+        assert_eq!(m.enabled_profiles(0), vec![gm2, fx]);
+        // Off, per address.
+        m.set_profile_off(DEVICE_ID_GROUP, gm2);
+        assert!(!m.profile_enabled(0, gm2));
+        m.set_profile_off(3, piano);
+        assert!(!m.profile_enabled(3, piano));
+        m.set_profile_off(DEVICE_ID_FUNCTION_BLOCK, fx);
+        assert!(m.enabled_profiles(3).is_empty());
+        // Reserved Device IDs do nothing.
+        assert!(m.set_profile_on(0x40, piano, None).is_empty());
+    }
+
+    #[test]
+    fn multi_channel_profile_spans_manager_plus_members_capped_at_sixteen() {
+        let guitar = ProfileId::standard(0x00, 0x03, 0x01, 0x01);
+        let mut m = Mixer::new();
+        // Manager on channel 4, 7 channels requested (§2.3.4 / §2.5):
+        // channels 4..=10.
+        assert_eq!(
+            m.set_profile_on(4, guitar, Some(7)),
+            (4..=10).collect::<Vec<_>>()
+        );
+        for ch in 4..=10 {
+            assert!(m.profile_enabled(ch, guitar), "{ch}");
+            assert_eq!(m.profile_manager_channel(ch, guitar), Some(4));
+        }
+        assert!(!m.profile_enabled(3, guitar) && !m.profile_enabled(11, guitar));
+        // Re-enabling with a smaller span drops the stale Members.
+        m.set_profile_on(4, guitar, Some(2));
+        assert!(m.profile_enabled(5, guitar) && !m.profile_enabled(6, guitar));
+        // The span is capped at the Function Block's 16 channels.
+        assert_eq!(m.set_profile_on(14, guitar, Some(100)), vec![14, 15]);
+        // Set Profile Off on the Manager clears every Member too.
+        m.set_profile_off(4, guitar);
+        assert!(!m.profile_enabled(4, guitar) && !m.profile_enabled(5, guitar));
+        assert!(
+            m.profile_enabled(15, guitar),
+            "the other Manager's span stays"
+        );
+        // An Off on a channel that is only a Member does nothing.
+        m.set_profile_off(15, guitar);
+        assert!(m.profile_enabled(15, guitar));
     }
 
     // ── MIDI 2.0 Per-Note messages (§7.4.4 / §7.4.5 / §7.4.12 / §7.4.15.2) ──
