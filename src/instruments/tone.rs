@@ -201,6 +201,13 @@ impl Voice for ToneVoice {
     }
 
     fn set_pitch_bend_cents(&mut self, cents: i32) {
+        self.set_pitch_bend_fine_cents(f64::from(cents));
+    }
+
+    fn set_pitch_bend_fine_cents(&mut self, cents: f64) {
+        // `cents as f32` of an integer-valued f64 equals the i32 → f32
+        // conversion the integer hook used to perform, so MIDI 1.0
+        // bends land on the same phase increment.
         let bend_ratio = (2.0f32).powf(cents as f32 / 1200.0);
         self.phase_inc = self.base_phase_inc * bend_ratio;
     }

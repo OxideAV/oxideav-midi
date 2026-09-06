@@ -1599,9 +1599,11 @@ pub struct Sf2Voice {
     /// Aftertouch / channel-pressure gain in `0.0..=1.0`. Multiplied
     /// into every sample at render time. Default 1.0 = no attenuation.
     pressure_gain: f32,
-    /// Live pitch-bend offset in cents (1/100 semitone). Updated by
-    /// [`set_pitch_bend_cents`]; consumed when computing `phase_inc`.
-    pitch_bend_cents: i32,
+    /// Live pitch-bend offset in cents (1/100 semitone), fractional
+    /// for the MIDI 2.0 32-bit / per-note pitch paths. Updated by
+    /// [`set_pitch_bend_cents`] / `set_pitch_bend_fine_cents`;
+    /// consumed when computing `phase_inc`.
+    pitch_bend_cents: f64,
     /// Sample counter (in *output* frames, not source frames).
     elapsed: u32,
     /// Sample at which `release()` was called, or `None` while the note
@@ -1775,7 +1777,7 @@ impl Sf2Voice {
             phase_inc,
             amplitude,
             pressure_gain: 1.0,
-            pitch_bend_cents: 0,
+            pitch_bend_cents: 0.0,
             elapsed: 0,
             release_pos: None,
             release_start_level: 1.0,
@@ -2137,9 +2139,11 @@ impl Voice for Sf2Voice {
                     0.0
                 };
                 if self.mod_env_to_pitch_cents != 0 {
+                    // The mod-env contribution stays integer-quantised
+                    // (as before); only the bend term carries fractions.
                     let pitch_cents = self.pitch_bend_cents
-                        + (mod_lvl * self.mod_env_to_pitch_cents as f32) as i32;
-                    let bend_ratio = (2.0f64).powf(pitch_cents as f64 / 1200.0);
+                        + f64::from((mod_lvl * self.mod_env_to_pitch_cents as f32) as i32);
+                    let bend_ratio = (2.0f64).powf(pitch_cents / 1200.0);
                     self.phase_inc = self.base_phase_inc * bend_ratio;
                 }
                 // Filter cutoff modulation: only recompute coefficients
@@ -2217,8 +2221,12 @@ impl Voice for Sf2Voice {
     }
 
     fn set_pitch_bend_cents(&mut self, cents: i32) {
+        self.set_pitch_bend_fine_cents(f64::from(cents));
+    }
+
+    fn set_pitch_bend_fine_cents(&mut self, cents: f64) {
         self.pitch_bend_cents = cents;
-        let bend_ratio = (2.0f64).powf(cents as f64 / 1200.0);
+        let bend_ratio = (2.0f64).powf(cents / 1200.0);
         self.phase_inc = self.base_phase_inc * bend_ratio;
     }
 
@@ -2308,9 +2316,9 @@ impl Voice for Sf2Voice {
                 0.0
             };
             if self.mod_env_to_pitch_cents != 0 {
-                let pitch_cents =
-                    self.pitch_bend_cents + (mod_lvl * self.mod_env_to_pitch_cents as f32) as i32;
-                let bend_ratio = (2.0f64).powf(pitch_cents as f64 / 1200.0);
+                let pitch_cents = self.pitch_bend_cents
+                    + f64::from((mod_lvl * self.mod_env_to_pitch_cents as f32) as i32);
+                let bend_ratio = (2.0f64).powf(pitch_cents / 1200.0);
                 self.phase_inc = self.base_phase_inc * bend_ratio;
             }
             if self.filter.is_some() {

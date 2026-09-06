@@ -159,6 +159,22 @@ pub trait Voice: Send {
     /// pitch (the round-3 / round-4 generators all support it).
     fn set_pitch_bend_cents(&mut self, _cents: i32) {}
 
+    /// Set the per-voice pitch offset in **fractional** cents. This is
+    /// the MIDI 2.0 resolution path: a 32-bit Pitch Bend (M2-104
+    /// §7.4.11), Per-Note Pitch Bend (§7.4.12), or a Pitch 7.9 / 7.25
+    /// note pitch (§7.4.15) resolves to far finer than one cent, and
+    /// the mixer hands the exact value here. The default rounds to the
+    /// nearest cent and forwards to [`set_pitch_bend_cents`]
+    /// (`Voice::set_pitch_bend_cents`), so voices that only model
+    /// integer cents keep working; the in-tree voices override it and
+    /// compute their playback ratio from the fractional value. For an
+    /// integer-valued argument every in-tree voice produces exactly the
+    /// output the integer hook produces, so MIDI 1.0 content renders
+    /// bit-identically through either path.
+    fn set_pitch_bend_fine_cents(&mut self, cents: f64) {
+        self.set_pitch_bend_cents(cents.round() as i32);
+    }
+
     /// Set per-voice pressure (aftertouch), `0.0..=1.0`. Default route
     /// is a multiplicative gain on the rendered samples. Voices may
     /// override to route pressure into filter cutoff, vibrato depth,

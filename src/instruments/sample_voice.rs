@@ -366,7 +366,9 @@ pub struct SamplePlayer {
     phase_inc: f64,
     amplitude: f32,
     pressure_gain: f32,
-    pitch_bend_cents: i32,
+    /// Live pitch-bend offset in cents; fractional on the MIDI 2.0
+    /// 32-bit / per-note pitch paths.
+    pitch_bend_cents: f32,
     /// Output sample counter — drives the envelope phases and the LFO.
     elapsed: u32,
     /// Sample at which `release()` fired, or `None` while held.
@@ -550,7 +552,7 @@ impl SamplePlayer {
             phase_inc,
             amplitude: cfg.amplitude,
             pressure_gain: 1.0,
-            pitch_bend_cents: 0,
+            pitch_bend_cents: 0.0,
             elapsed: 0,
             release_pos: None,
             release_start_level: 1.0,
@@ -848,8 +850,8 @@ impl Voice for SamplePlayer {
         for (i, slot) in out.iter_mut().enumerate() {
             // Recompute pitch each sample if pitch-bend or LFO is non-zero.
             let lfo_cents = self.lfo_cents_at(self.elapsed);
-            if self.pitch_bend_cents != 0 || lfo_cents != 0.0 {
-                let total_cents = self.pitch_bend_cents as f32 + lfo_cents;
+            if self.pitch_bend_cents != 0.0 || lfo_cents != 0.0 {
+                let total_cents = self.pitch_bend_cents + lfo_cents;
                 let bend_ratio = (2.0f64).powf(total_cents as f64 / 1200.0);
                 self.phase_inc = self.base_phase_inc * bend_ratio;
             }
@@ -946,7 +948,11 @@ impl Voice for SamplePlayer {
     }
 
     fn set_pitch_bend_cents(&mut self, cents: i32) {
-        self.pitch_bend_cents = cents;
+        self.pitch_bend_cents = cents as f32;
+    }
+
+    fn set_pitch_bend_fine_cents(&mut self, cents: f64) {
+        self.pitch_bend_cents = cents as f32;
     }
 
     fn set_pressure(&mut self, pressure: f32) {

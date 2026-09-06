@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Native MIDI 2.0 32-bit Pitch Bend in the mixer** (M2-104 §7.4.11):
+  `Mixer::set_pitch_bend_32` keeps the full 32-bit resolution
+  (`ChannelState::pitch_bend_hr`, `pitch_bend_32_to_cents`) and delivers
+  exact fractional cents to voices through the new
+  `Voice::set_pitch_bend_fine_cents` hook (defaulted to round into the
+  legacy integer-cents hook; implemented natively by the SF2, SFZ/DLS
+  and pure-tone voices). The mixer's whole pitch composition now runs
+  in `f64`; MIDI 1.0 14-bit bends still contribute whole cents, so
+  MIDI 1.0 content renders bit-identically (bench `--corpus` PCM hashes
+  unchanged). `tests/midi2_native.rs` pins the contract on rendered
+  PCM: on-grid 32-bit values match their 14-bit counterparts
+  sample-for-sample, values between two 14-bit steps are audible
+  natively and invisible through the Appendix-D downscale, and a sweep
+  inside one 14-bit step is strictly monotone.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-midi/compare/v0.0.4...v0.0.5) - 2026-08-31
 
 ### Other

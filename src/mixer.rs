@@ -51,6 +51,18 @@ pub fn pitch_bend_to_cents(value: u16, range_cents: u16) -> i32 {
     centred * range_cents as i32 / 0x2000
 }
 
+/// Convert a MIDI 2.0 32-bit Pitch Bend scalar (M2-104 §7.4.11: an
+/// unsigned bipolar value centred at `0x8000_0000`) to a signed,
+/// **fractional** cents offset using the per-channel bend range. The
+/// full 32-bit resolution survives: one step is `range / 2^31` cents
+/// (≈ 0.0001 cents at the ±200-cent default), where the 14-bit path
+/// above quantises to whole cents.
+#[doc(hidden)] // internal: voice-mixer conversion helper
+pub fn pitch_bend_32_to_cents(value: u32, range_cents: u16) -> f64 {
+    const CENTRE: f64 = 2_147_483_648.0; // 0x8000_0000
+    (f64::from(value) - CENTRE) * f64::from(range_cents) / CENTRE
+}
+
 /// Number of MIDI channels — fixed by the spec, not configurable.
 pub const NUM_CHANNELS: usize = 16;
 
@@ -260,8 +272,19 @@ pub struct ChannelState {
     pub portamento_ctrl_source: Option<u8>,
     /// Live pitch-bend value as the raw 14-bit MIDI scalar
     /// (`0..=16383`). Centre is `0x2000`. Map to cents via
-    /// `(value - 0x2000) * pitch_bend_range_cents / 8192`.
+    /// `(value - 0x2000) * pitch_bend_range_cents / 8192`. Always kept
+    /// coherent with [`Self::pitch_bend_hr`] (a 32-bit bend also lands
+    /// its Appendix-D downscale here).
     pub pitch_bend: u16,
+    /// Native MIDI 2.0 32-bit Pitch Bend (M2-104 §7.4.11), centred at
+    /// `0x8000_0000`, when the most recent bend on this channel arrived
+    /// at full resolution. `None` after a MIDI 1.0 14-bit bend (or at
+    /// reset), in which case [`Self::pitch_bend`] alone governs and the
+    /// composed pitch is the integer-cents value the MIDI 1.0 path has
+    /// always produced — so MIDI 1.0 content renders bit-identically.
+    /// When `Some`, the bend contributes exact fractional cents
+    /// ([`pitch_bend_32_to_cents`]).
+    pub pitch_bend_hr: Option<u32>,
     /// Pitch-bend range in cents (default 200 = ±2 semitones per GM
     /// recommended practice). Updated via RPN 0 (CC 100/101 = 0/0,
     /// CC 6 = MSB semitones, CC 38 = LSB cents). MPE Receivers default
@@ -382,6 +405,7 @@ impl Default for ChannelState {
             portamento_last_key: None,
             portamento_ctrl_source: None,
             pitch_bend: 0x2000,
+            pitch_bend_hr: None,
             pitch_bend_range_cents: 200,
             channel_pressure: 0,
             rpn: 0x3FFF,
@@ -514,6 +538,20 @@ impl CtrlDestMods {
 }
 
 impl ChannelState {
+    /// The channel's live pitch-bend contribution in cents: exact
+    /// fractional cents from a native 32-bit bend when one is in force
+    /// ([`Self::pitch_bend_hr`]), else the whole-cent MIDI 1.0 value of
+    /// [`Self::pitch_bend`] (`pitch_bend_to_cents`).
+    pub fn bend_cents(&self) -> f64 {
+        match self.pitch_bend_hr {
+            Some(hr) => pitch_bend_32_to_cents(hr, self.pitch_bend_range_cents),
+            None => f64::from(pitch_bend_to_cents(
+                self.pitch_bend,
+                self.pitch_bend_range_cents,
+            )),
+        }
+    }
+
     /// The channel's current combined Controller Destination
     /// modifications (CA-022 / GM2 RP-024 §4.6): the Channel-Pressure
     /// routing evaluated at the live pressure, combined with the
@@ -1533,6 +1571,32 @@ impl Mixer {
         let ch = channel as usize % NUM_CHANNELS;
         let v = value & 0x3FFF;
         self.channels[ch].pitch_bend = v;
+        // A 14-bit bend supersedes any earlier 32-bit one: the
+        // composed pitch drops back to whole cents.
+        self.channels[ch].pitch_bend_hr = None;
+        self.reapply_channel_bend(channel);
+    }
+
+    /// Apply a native **MIDI 2.0 32-bit Pitch Bend** (M2-104 §7.4.11):
+    /// `value` is the unsigned bipolar scalar centred at `0x8000_0000`.
+    /// Unlike [`Self::set_pitch_bend`], the full resolution reaches the
+    /// voices as fractional cents through
+    /// [`Voice::set_pitch_bend_fine_cents`] — a bend that the Appendix-D
+    /// downscale would fold onto the same 14-bit step still moves the
+    /// pitch here. The 14-bit shadow ([`ChannelState::pitch_bend`]) is
+    /// kept coherent via the §D.1.4 downscale so MIDI 1.0 consumers of
+    /// the channel state see the translated value.
+    pub fn set_pitch_bend_32(&mut self, channel: u8, value: u32) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].pitch_bend = crate::ump::scaling::scale_32_to_14(value);
+        self.channels[ch].pitch_bend_hr = Some(value);
+        self.reapply_channel_bend(channel);
+    }
+
+    /// Push the channel's (possibly just-changed) bend to every voice
+    /// it governs, honouring the MPE Manager / Member routing.
+    fn reapply_channel_bend(&mut self, channel: u8) {
+        let ch = channel as usize % NUM_CHANNELS;
 
         // If this is an MPE Manager Channel, the bend reaches every
         // voice in the zone *combined* with that member channel's own
@@ -1557,20 +1621,20 @@ impl Mixer {
                         if let Some(voice) = slot.voice.as_mut() {
                             let mut total = Self::compose_pitch_cents(
                                 &self.channels[slot_ch],
-                                self.channels[ch].pitch_bend,
-                                self.channels[ch].pitch_bend_range_cents,
+                                self.channels[ch].bend_cents(),
                                 self.master_fine_tune_cents,
                                 self.master_coarse_tune_semitones,
                                 self.channels[slot_ch].rhythm,
                             );
                             if slot_ch != 9 {
-                                total +=
-                                    self.tuning.offset_cents(slot.channel, slot.key).round() as i32;
+                                total += f64::from(
+                                    self.tuning.offset_cents(slot.channel, slot.key).round() as i32,
+                                );
                             }
                             // Preserve an in-progress portamento glide on
                             // this voice — a live bend sums with the glide.
-                            total += slot.glide_offset_cents.round() as i32;
-                            voice.set_pitch_bend_cents(total);
+                            total += f64::from(slot.glide_offset_cents.round() as i32);
+                            voice.set_pitch_bend_fine_cents(total);
                         }
                     }
                 }
@@ -1589,39 +1653,36 @@ impl Mixer {
                                 MpeZoneKind::Upper => 15u8,
                             };
                             let mgr_state = &self.channels[mgr_ch as usize];
-                            let member_cents =
-                                pitch_bend_to_cents(v, self.channels[ch].pitch_bend_range_cents);
-                            let mgr_cents = pitch_bend_to_cents(
-                                mgr_state.pitch_bend,
-                                mgr_state.pitch_bend_range_cents,
-                            );
+                            let member_cents = self.channels[ch].bend_cents();
+                            let mgr_cents = mgr_state.bend_cents();
                             let mut total = member_cents + mgr_cents;
                             if !is_drum {
-                                total += self.channels[ch].channel_fine_tune_cents as i32;
-                                total +=
-                                    self.channels[ch].channel_coarse_tune_semitones as i32 * 100;
-                                total += self.master_fine_tune_cents as i32;
-                                total += self.master_coarse_tune_semitones as i32 * 100;
+                                total += f64::from(self.channels[ch].channel_fine_tune_cents);
+                                total += f64::from(
+                                    self.channels[ch].channel_coarse_tune_semitones as i32 * 100,
+                                );
+                                total += f64::from(self.master_fine_tune_cents);
+                                total += f64::from(self.master_coarse_tune_semitones as i32 * 100);
                             }
                             total
                         } else {
                             Self::compose_pitch_cents(
                                 &self.channels[ch],
-                                v,
-                                self.channels[ch].pitch_bend_range_cents,
+                                self.channels[ch].bend_cents(),
                                 self.master_fine_tune_cents,
                                 self.master_coarse_tune_semitones,
                                 is_drum,
                             )
                         };
                         if !is_drum {
-                            total +=
-                                self.tuning.offset_cents(slot.channel, slot.key).round() as i32;
+                            total += f64::from(
+                                self.tuning.offset_cents(slot.channel, slot.key).round() as i32,
+                            );
                         }
                         // Preserve an in-progress portamento glide on this
                         // voice — a live bend sums with the glide offset.
-                        total += slot.glide_offset_cents.round() as i32;
-                        voice.set_pitch_bend_cents(total);
+                        total += f64::from(slot.glide_offset_cents.round() as i32);
+                        voice.set_pitch_bend_fine_cents(total);
                     }
                 }
             }
@@ -1632,23 +1693,28 @@ impl Mixer {
     /// tuning into a single cents value. Pulled out so the MPE
     /// per-zone broadcast path can compute the per-slot sum without
     /// borrowing `self` mutably twice.
+    ///
+    /// `bend_cents` is the (already resolved) bend contribution — whole
+    /// cents from a 14-bit bend, fractional from a 32-bit one (see
+    /// [`ChannelState::bend_cents`]). Every other term is an integer,
+    /// so a MIDI 1.0 score composes to an integer-valued `f64` and the
+    /// voices reproduce their integer-cents output exactly.
     fn compose_pitch_cents(
         ch_state: &ChannelState,
-        bend_14: u16,
-        bend_range_cents: u16,
+        bend_cents: f64,
         master_fine_cents: i16,
         master_coarse_semis: i16,
         is_drum: bool,
-    ) -> i32 {
-        let mut total = pitch_bend_to_cents(bend_14, bend_range_cents);
+    ) -> f64 {
+        let mut total = bend_cents;
         if !is_drum {
-            total += ch_state.channel_fine_tune_cents as i32;
-            total += ch_state.channel_coarse_tune_semitones as i32 * 100;
-            total += master_fine_cents as i32;
-            total += master_coarse_semis as i32 * 100;
+            total += f64::from(ch_state.channel_fine_tune_cents);
+            total += f64::from(ch_state.channel_coarse_tune_semitones as i32 * 100);
+            total += f64::from(master_fine_cents);
+            total += f64::from(master_coarse_semis as i32 * 100);
             // CA-022 / GM2 §4.6 Pitch Control destination (Channel
             // Pressure and/or routed CC → pitch, in cents).
-            total += ch_state.ctrl_dest_mods().pitch_cents;
+            total += f64::from(ch_state.ctrl_dest_mods().pitch_cents);
         }
         total
     }
@@ -1766,6 +1832,7 @@ impl Mixer {
         self.channels[ch].channel_pressure = 0;
         self.channels[ch].rpn = 0x3FFF; // RPN/NRPN selector → null
         self.channels[ch].pitch_bend = 0x2000; // centre
+        self.channels[ch].pitch_bend_hr = None;
 
         // Pedals (CC 64/65/66/67) → off. Lift the Sostenuto pedal first
         // (CC 66), then Sustain (CC 64): a held pedal must release on RAC.
@@ -2778,8 +2845,7 @@ impl Mixer {
         let is_drum = st.rhythm;
         let mut cents = Self::compose_pitch_cents(
             &st,
-            st.pitch_bend,
-            st.pitch_bend_range_cents,
+            st.bend_cents(),
             self.master_fine_tune_cents,
             self.master_coarse_tune_semitones,
             is_drum,
@@ -2789,15 +2855,14 @@ impl Mixer {
                 MpeZoneKind::Lower => 0,
                 MpeZoneKind::Upper => 15,
             };
-            let mgr_state = self.channels[mgr];
-            cents += pitch_bend_to_cents(mgr_state.pitch_bend, mgr_state.pitch_bend_range_cents);
+            cents += self.channels[mgr].bend_cents();
         }
         if !is_drum {
-            cents += self.tuning.offset_cents(channel, key).round() as i32;
+            cents += f64::from(self.tuning.offset_cents(channel, key).round() as i32);
         }
-        cents += glide.round() as i32;
+        cents += f64::from(glide.round() as i32);
         if let Some(v) = self.slots[idx].voice.as_mut() {
-            v.set_pitch_bend_cents(cents);
+            v.set_pitch_bend_fine_cents(cents);
         }
     }
 
@@ -2928,8 +2993,7 @@ impl Mixer {
         // a note triggered while the bend wheel is held doesn't pop.
         let mut cents = Self::compose_pitch_cents(
             &st,
-            st.pitch_bend,
-            st.pitch_bend_range_cents,
+            st.bend_cents(),
             self.master_fine_tune_cents,
             self.master_coarse_tune_semitones,
             is_drum,
@@ -2939,8 +3003,7 @@ impl Mixer {
                 MpeZoneKind::Lower => 0,
                 MpeZoneKind::Upper => 15,
             };
-            let mgr_state = self.channels[mgr];
-            cents += pitch_bend_to_cents(mgr_state.pitch_bend, mgr_state.pitch_bend_range_cents);
+            cents += self.channels[mgr].bend_cents();
         }
         // Fold in the MTS per-key tuning offset (key-based table +
         // channel scale/octave). Drum channels are exempt from
@@ -2948,7 +3011,7 @@ impl Mixer {
         // drum kit is a different sound), matching the master-tuning
         // exemption above.
         if !is_drum {
-            cents += self.tuning.offset_cents(channel, key).round() as i32;
+            cents += f64::from(self.tuning.offset_cents(channel, key).round() as i32);
         }
         // Key-Based Fine / Coarse Tuning (CA-023 `nn = 78H/79H`): the
         // drum-channel note-shift exemption doesn't apply — this IS
@@ -2957,10 +3020,10 @@ impl Mixer {
         // (v−64)·100/64 cents.
         if let Some(kb) = kb {
             if let Some(f) = kb.fine_tune {
-                cents += ((f as i32 - 64) * 100) / 64;
+                cents += f64::from(((f as i32 - 64) * 100) / 64);
             }
             if let Some(c) = kb.coarse_tune {
-                cents += (c as i32 - 64) * 100;
+                cents += f64::from((c as i32 - 64) * 100);
             }
         }
         // Portamento (CC 5 / 65 / 84): compute the glide for this note-on
@@ -2980,9 +3043,9 @@ impl Mixer {
             Some((offset, total)) => (offset, -offset / total as f32, total),
             None => (0.0, 0.0, 0),
         };
-        let initial_cents = cents + glide_offset_cents.round() as i32;
-        if initial_cents != 0 {
-            voice.set_pitch_bend_cents(initial_cents);
+        let initial_cents = cents + f64::from(glide_offset_cents.round() as i32);
+        if initial_cents != 0.0 {
+            voice.set_pitch_bend_fine_cents(initial_cents);
         }
         // Sound Controllers CC 71–78 (GM2 RP-024 §3.3.11–§3.3.18):
         // capture the channel's snapshot into the fresh voice. Skipped
@@ -3433,6 +3496,9 @@ mod tests {
         last_pressure: std::sync::Arc<std::sync::Mutex<f32>>,
         last_mod_depth_cents: std::sync::Arc<std::sync::Mutex<i32>>,
         last_timbre: std::sync::Arc<std::sync::Mutex<u8>>,
+        /// The exact fractional cents the mixer pushed through the
+        /// MIDI 2.0 resolution hook (`set_pitch_bend_fine_cents`).
+        last_bend_fine: std::sync::Arc<std::sync::Mutex<f64>>,
     }
     impl Voice for ConstVoice {
         fn render(&mut self, out: &mut [f32]) -> usize {
@@ -3459,6 +3525,12 @@ mod tests {
         fn set_pitch_bend_cents(&mut self, cents: i32) {
             *self.last_bend_cents.lock().unwrap() = cents;
         }
+        fn set_pitch_bend_fine_cents(&mut self, cents: f64) {
+            *self.last_bend_fine.lock().unwrap() = cents;
+            // Mirror the trait default so the integer cell keeps
+            // recording what an integer-only voice would have seen.
+            self.set_pitch_bend_cents(cents.round() as i32);
+        }
         fn set_pressure(&mut self, p: f32) {
             *self.last_pressure.lock().unwrap() = p;
         }
@@ -3479,6 +3551,7 @@ mod tests {
             last_pressure: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
             last_mod_depth_cents: std::sync::Arc::new(std::sync::Mutex::new(0)),
             last_timbre: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            last_bend_fine: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
         })
     }
 
@@ -3503,8 +3576,29 @@ mod tests {
             last_pressure: press.clone(),
             last_mod_depth_cents: depth,
             last_timbre: timbre,
+            last_bend_fine: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
         });
         (v, bend, press)
+    }
+
+    type FineBendCell = std::sync::Arc<std::sync::Mutex<f64>>;
+
+    /// [`ConstVoice`] plus the handle to its fractional-cents cell —
+    /// what the MIDI 2.0 32-bit / per-note pitch paths deliver.
+    fn fine_bend_voice(samples: usize) -> (Box<dyn Voice>, FineBendCell, BendCell) {
+        let fine = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+        let coarse = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let v = Box::new(ConstVoice {
+            value: 0.25,
+            remaining: samples,
+            done: false,
+            last_bend_cents: coarse.clone(),
+            last_pressure: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
+            last_mod_depth_cents: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            last_timbre: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            last_bend_fine: fine.clone(),
+        });
+        (v, fine, coarse)
     }
 
     /// Full instrumented voice + handles for *every* cell.
@@ -3530,6 +3624,7 @@ mod tests {
             last_pressure: press.clone(),
             last_mod_depth_cents: depth.clone(),
             last_timbre: timbre.clone(),
+            last_bend_fine: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
         });
         (v, bend, press, depth, timbre)
     }
@@ -4913,6 +5008,108 @@ mod tests {
         assert_eq!(m.live_voice_count(), 2);
         m.all_notes_off();
         assert_eq!(m.live_voice_count(), 0);
+    }
+
+    // ── MIDI 2.0 32-bit Pitch Bend (M2-104 §7.4.11) ──────────────────
+
+    #[test]
+    fn pitch_bend_32_centre_and_extremes_match_the_14bit_values() {
+        // Centre is exactly 0; the bottom of the range is exactly
+        // −range, the same whole-cent value the 14-bit path yields.
+        assert_eq!(pitch_bend_32_to_cents(0x8000_0000, 200), 0.0);
+        assert_eq!(pitch_bend_32_to_cents(0, 200), -200.0);
+        assert_eq!(f64::from(pitch_bend_to_cents(0, 200)), -200.0);
+        // Top of range: one 32-bit step short of +200.
+        let top = pitch_bend_32_to_cents(0xFFFF_FFFF, 200);
+        assert!(top > 199.999 && top < 200.0, "{top}");
+    }
+
+    #[test]
+    fn pitch_bend_32_resolves_below_one_14bit_step() {
+        // 0x0001_0000 above centre folds to 14-bit 0x2000 under the
+        // §D.1.4 downscale (it is far below one 14-bit step = 2^18), so
+        // the MIDI 1.0 path renders it as *no bend*; natively it is a
+        // real (tiny) offset.
+        let mut m = Mixer::new();
+        let (v, fine, coarse) = fine_bend_voice(64);
+        m.note_on(0, 60, 100, v);
+        m.set_pitch_bend_32(0, 0x8000_0000 + 0x0001_0000);
+        assert_eq!(m.channel_state(0).pitch_bend, 0x2000, "14-bit shadow");
+        assert_eq!(m.channel_state(0).pitch_bend_hr, Some(0x8001_0000));
+        let expected = 65_536.0 * 200.0 / 2_147_483_648.0;
+        assert_eq!(*fine.lock().unwrap(), expected);
+        // The integer-cents view of the same bend is zero — exactly
+        // what the Appendix-D translated path would deliver.
+        assert_eq!(*coarse.lock().unwrap(), 0);
+        // And the translated form (14-bit 0x2000) is identically 0.0.
+        m.set_pitch_bend(0, 0x2000);
+        assert_eq!(*fine.lock().unwrap(), 0.0);
+        assert_eq!(m.channel_state(0).pitch_bend_hr, None);
+    }
+
+    #[test]
+    fn pitch_bend_32_sweep_inside_one_14bit_step_is_strictly_monotone() {
+        // 256 evenly spaced 32-bit values that all share one 14-bit
+        // step: the native path delivers 256 distinct, increasing
+        // pitches; the 14-bit shadow never moves.
+        let mut m = Mixer::new();
+        let (v, fine, _) = fine_bend_voice(64);
+        m.note_on(0, 60, 100, v);
+        let base = 0x8000_0000u32;
+        let mut last = f64::NEG_INFINITY;
+        let mut distinct = std::collections::BTreeSet::new();
+        for i in 0..256u32 {
+            let value = base + i * (1 << 10); // 256 × 2^10 < 2^18
+            m.set_pitch_bend_32(0, value);
+            assert_eq!(m.channel_state(0).pitch_bend, 0x2000);
+            let c = *fine.lock().unwrap();
+            assert!(c > last, "step {i}: {c} !> {last}");
+            last = c;
+            distinct.insert(c.to_bits());
+        }
+        assert_eq!(distinct.len(), 256);
+    }
+
+    #[test]
+    fn pitch_bend_32_reaches_new_notes_and_composes_with_tuning() {
+        // A note struck while a 32-bit bend is held picks it up on
+        // its first sample, summed with the (integer) channel coarse
+        // tune — the integer terms stay integer inside the f64 sum.
+        let mut m = Mixer::new();
+        m.channel_state_mut(0).channel_coarse_tune_semitones = 1;
+        m.set_pitch_bend_32(0, 0xC000_0000); // +½ range = +100.0 cents
+        let (v, fine, _) = fine_bend_voice(64);
+        m.note_on(0, 60, 100, v);
+        assert_eq!(*fine.lock().unwrap(), 200.0);
+    }
+
+    #[test]
+    fn reset_all_controllers_clears_the_32bit_bend() {
+        let mut m = Mixer::new();
+        let (v, fine, _) = fine_bend_voice(64);
+        m.note_on(0, 60, 100, v);
+        m.set_pitch_bend_32(0, 0x4000_0000);
+        assert_eq!(*fine.lock().unwrap(), -100.0);
+        m.reset_all_controllers(0);
+        assert_eq!(m.channel_state(0).pitch_bend_hr, None);
+        assert_eq!(m.channel_state(0).pitch_bend, 0x2000);
+        assert_eq!(*fine.lock().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn mpe_member_and_manager_32bit_bends_sum() {
+        // MPE Lower Zone with one member: a 32-bit bend on the Manager
+        // (ch 0, ±2 st default) and a 32-bit bend on the Member (ch 1,
+        // ±48 st default per MPE) reach the Member's voice summed.
+        let mut m = Mixer::new();
+        m.set_mpe_zone(MpeZoneKind::Lower, 1);
+        let (v, fine, _) = fine_bend_voice(64);
+        m.note_on(1, 60, 100, v);
+        m.set_pitch_bend_32(0, 0xC000_0000); // +100 cents on the manager
+        assert_eq!(*fine.lock().unwrap(), 100.0);
+        m.set_pitch_bend_32(1, 0x8000_0000 + (1 << 24)); // +2400·2^24/2^31 c
+        let member = 16_777_216.0 * 4800.0 / 2_147_483_648.0;
+        assert_eq!(*fine.lock().unwrap(), 100.0 + member);
     }
 
     #[test]
