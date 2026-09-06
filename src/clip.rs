@@ -314,7 +314,9 @@ pub fn write(clip: &ClipFile) -> Result<Vec<u8>> {
 }
 
 /// Map a UMP MIDI 1.0 Channel Voice message to an SMF channel event.
-fn midi1_to_channel(msg: &Midi1ChannelVoice) -> ChannelMessage {
+/// Map a MIDI 1.0 Channel Voice UMP (MT 0x2) onto the SMF channel
+/// message the scheduler dispatches.
+pub(crate) fn midi1_to_channel(msg: &Midi1ChannelVoice) -> ChannelMessage {
     match *msg {
         Midi1ChannelVoice::NoteOff {
             channel,

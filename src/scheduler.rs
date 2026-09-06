@@ -44,13 +44,25 @@
 //! no-op for SMPTE) so the scheduler never trusts a stale rate when a
 //! tempo meta event arrives mid-track.
 
+use crate::clip::ClipFile;
 use crate::instruments::Instrument;
 use crate::mixer::{Mixer, NUM_CHANNELS};
 use crate::smf::{ChannelBody, ChannelMessage, Division, Event, MetaEvent, SmfFile};
+use crate::ump::flex::{self, FlexDataMessage};
+use crate::ump::message::{Midi2ChannelVoice, UmpMessage};
+use crate::ump::Sysex7Assembler;
 
 /// Default tempo when no `FF 51 03` is seen yet — 120 BPM = 500 000 µs
 /// per quarter note. The SMF spec mandates this default.
 pub const DEFAULT_TEMPO_USEC_PER_QUARTER: u32 = 500_000;
+
+/// A scheduled message: an SMF event (MIDI 1.0 file path) or a
+/// Universal MIDI Packet (native MIDI Clip File path, M2-116).
+#[derive(Clone, Debug)]
+enum Timed {
+    Smf(Event),
+    Ump(UmpMessage),
+}
 
 /// One event in the merged time line. We keep the source `track` index
 /// for stable-sort ties and `order` for intra-track ordering, both
@@ -65,7 +77,7 @@ struct AbsEvent {
     track: u16,
     /// Within-track order — tie-breaker after `track`.
     order: u32,
-    event: Event,
+    event: Timed,
 }
 
 /// SMF event scheduler. Owns the merged event list + current tempo +
@@ -90,6 +102,9 @@ pub struct Scheduler {
     /// Accumulated samples that have already been "consumed" by the
     /// caller via `step`. Used to compute when the next event fires.
     sample_clock: f64,
+    /// SysEx7 packet-run reassembly for the native UMP path (M2-104
+    /// §7.7): a completed payload is dispatched like an SMF `F0` event.
+    sysex7: Sysex7Assembler,
 }
 
 impl Scheduler {
@@ -109,7 +124,7 @@ impl Scheduler {
                     tick,
                     track: ti as u16,
                     order: oi as u32,
-                    event: te.kind.clone(),
+                    event: Timed::Smf(te.kind.clone()),
                 });
             }
         }
@@ -131,6 +146,66 @@ impl Scheduler {
             samples_elapsed: 0.0,
             samples_per_tick: 0.0,
             sample_clock: 0.0,
+            sysex7: Sysex7Assembler::new(),
+        };
+        s.recompute_samples_per_tick();
+        s
+    }
+
+    /// Build a scheduler that plays a MIDI Clip File (M2-116)
+    /// **natively**: every UMP is dispatched into the mixer's MIDI 2.0
+    /// entry points at full resolution — 16-bit velocity, 32-bit
+    /// controllers / pressure / pitch bend, per-note messages,
+    /// Registered / Assignable Controllers — instead of being folded
+    /// through the Appendix-D downscale (compare
+    /// [`ClipFile::to_smf`] + [`Self::new`], which remain available and
+    /// render every MIDI 1.0-in-UMP clip identically).
+    ///
+    /// The Clip Configuration Header messages (§6.3) and the Clip
+    /// Sequence Data (§7) are scheduled in file order on the DCTPQ
+    /// tick grid (the Delta Clockstamps are already folded into each
+    /// [`ClipEvent::tick`](crate::clip::ClipEvent::tick)). Flex Data
+    /// Set Tempo drives the tempo (§7.5.3); SysEx7 runs are
+    /// reassembled and routed through the Universal SysEx surface;
+    /// Stream messages, Data128 and the other Flex families carry no
+    /// playback semantics. The leading Set Profile On messages (§6.2)
+    /// are the caller's to apply (see `ClipFile::profiles`).
+    ///
+    /// Groups are folded onto the mixer's single 16-channel Function
+    /// Block: this synth addresses one Group. JR Timestamps / JR Clock
+    /// (§7.2.2) are accepted and rendered "as soon as possible" at
+    /// their Delta Clockstamp position — M2-116 defines no JR-to-DCS
+    /// relation and no JR Clock domain exists inside a file.
+    pub fn from_clip(clip: &ClipFile, sample_rate: u32) -> Self {
+        let events: Vec<AbsEvent> = clip
+            .config
+            .iter()
+            .chain(clip.sequence.iter())
+            .enumerate()
+            .map(|(oi, ev)| AbsEvent {
+                tick: ev.tick,
+                track: 0,
+                order: oi as u32,
+                event: Timed::Ump(ev.message.clone()),
+            })
+            .collect();
+        // Already in file order (ticks are non-decreasing by
+        // construction of the Delta Clockstamp sum); a stable sort keeps
+        // simultaneous messages in their written order.
+        let mut events = events;
+        events.sort_by(|a, b| a.tick.cmp(&b.tick).then_with(|| a.order.cmp(&b.order)));
+        let mut s = Self {
+            events,
+            cursor: 0,
+            // DCTPQ is a 16-bit field (M2-104 §7.2.3.1); the SMF
+            // `Division` carries it unchanged.
+            division: Division::TicksPerQuarter(clip.ticks_per_quarter_note.max(1)),
+            tempo_us_per_quarter: DEFAULT_TEMPO_USEC_PER_QUARTER,
+            sample_rate: sample_rate.max(1),
+            samples_elapsed: 0.0,
+            samples_per_tick: 0.0,
+            sample_clock: 0.0,
+            sysex7: Sysex7Assembler::new(),
         };
         s.recompute_samples_per_tick();
         s
@@ -190,7 +265,10 @@ impl Scheduler {
             self.samples_elapsed = evt_sample;
             // Clone the event so we don't hold a borrow across `dispatch`.
             let event = self.events[self.cursor].event.clone();
-            self.dispatch(&event, mixer, instrument);
+            match &event {
+                Timed::Smf(e) => self.dispatch(e, mixer, instrument),
+                Timed::Ump(m) => self.dispatch_ump(m, mixer, instrument),
+            }
             self.cursor += 1;
         }
         self.sample_clock = next_clock;
@@ -229,6 +307,157 @@ impl Scheduler {
                     dispatch_universal_sysex(data, mixer);
                 }
             }
+        }
+    }
+
+    /// Dispatch one Universal MIDI Packet from a natively-scheduled
+    /// MIDI Clip File.
+    fn dispatch_ump(&mut self, msg: &UmpMessage, mixer: &mut Mixer, instrument: &dyn Instrument) {
+        match msg {
+            UmpMessage::Midi1 { msg, .. } => {
+                let cm = crate::clip::midi1_to_channel(msg);
+                self.dispatch_channel(cm.channel, cm.body, mixer, instrument);
+            }
+            UmpMessage::Midi2 { msg, .. } => self.dispatch_midi2(msg, mixer, instrument),
+            UmpMessage::Sysex7(sx) => {
+                if let Some(payload) = self.sysex7.push(sx) {
+                    // Payload = the bytes between F0 and F7, exactly the
+                    // shape `dispatch_universal_sysex` accepts.
+                    dispatch_universal_sysex(&payload, mixer);
+                }
+            }
+            UmpMessage::Flex(FlexDataMessage::SetTempo {
+                ten_ns_per_quarter_note,
+                ..
+            }) => {
+                let us = flex::ten_ns_per_quarter_to_usec(*ten_ns_per_quarter_note);
+                if us != 0 {
+                    self.tempo_us_per_quarter = us;
+                    self.recompute_samples_per_tick();
+                }
+            }
+            // Time / key signature, metronome, chords, text: no
+            // playback semantics. Stream messages address the
+            // Endpoint; Data128 / Utility (JR Timestamps, NOOP) and
+            // System messages carry nothing for an offline renderer.
+            _ => {}
+        }
+    }
+
+    /// Dispatch one MIDI 2.0 Channel Voice message (M2-104 §7.4) into
+    /// the mixer's native full-resolution entry points.
+    fn dispatch_midi2(
+        &self,
+        msg: &Midi2ChannelVoice,
+        mixer: &mut Mixer,
+        instrument: &dyn Instrument,
+    ) {
+        use crate::mixer::midi2_velocity_to_7;
+        match *msg {
+            Midi2ChannelVoice::NoteOn {
+                channel,
+                note,
+                attribute_type,
+                velocity,
+                attribute,
+            } => {
+                let st = mixer.channel_state(channel);
+                let (program, bank_msb, bank_lsb) = (st.program, st.bank_msb, st.bank_lsb);
+                // Sample selection honours a Pitch 7.9 attribute or the
+                // note number's persistent Pitch 7.25 (§7.4.15).
+                let key = mixer.midi2_note_sample_key(channel, note, attribute_type, attribute);
+                if let Ok(voice) = instrument.make_voice_banked(
+                    bank_msb,
+                    bank_lsb,
+                    program,
+                    key,
+                    midi2_velocity_to_7(velocity),
+                    self.sample_rate,
+                ) {
+                    mixer.note_on_midi2(channel, note, velocity, attribute_type, attribute, voice);
+                }
+            }
+            // Release velocity and attributes are not modelled as a
+            // gain (as on the MIDI 1.0 path).
+            Midi2ChannelVoice::NoteOff { channel, note, .. } => mixer.note_off(channel, note),
+            Midi2ChannelVoice::PolyPressure {
+                channel,
+                note,
+                data,
+            } => mixer.set_poly_pressure_32(channel, note, data),
+            Midi2ChannelVoice::ControlChange {
+                channel,
+                index,
+                data,
+            } => mixer.set_control_change_32(channel, index, data),
+            Midi2ChannelVoice::ProgramChange {
+                channel,
+                bank_valid,
+                program,
+                bank_msb,
+                bank_lsb,
+            } => {
+                // §7.4.9: with B = 1 the Bank Select happens first, then
+                // the Program Change latches it (GM2 RP-024 §3.3.1).
+                if bank_valid {
+                    mixer.set_bank_select(channel, bank_msb, true);
+                    mixer.set_bank_select(channel, bank_lsb, false);
+                }
+                mixer.set_program(channel, program);
+            }
+            Midi2ChannelVoice::ChannelPressure { channel, data } => {
+                mixer.set_channel_pressure_32(channel, data);
+            }
+            Midi2ChannelVoice::PitchBend { channel, data } => {
+                mixer.set_pitch_bend_32(channel, data)
+            }
+            Midi2ChannelVoice::PerNotePitchBend {
+                channel,
+                note,
+                data,
+            } => mixer.set_per_note_pitch_bend(channel, note, data),
+            Midi2ChannelVoice::RegisteredPerNoteController {
+                channel,
+                note,
+                index,
+                data,
+            } => mixer.set_registered_per_note_controller(channel, note, index, data),
+            Midi2ChannelVoice::AssignablePerNoteController {
+                channel,
+                note,
+                index,
+                data,
+            } => mixer.set_assignable_per_note_controller(channel, note, index, data),
+            Midi2ChannelVoice::RegisteredController {
+                channel,
+                bank,
+                index,
+                data,
+            } => mixer.set_registered_controller(channel, bank, index, data),
+            Midi2ChannelVoice::AssignableController {
+                channel,
+                bank,
+                index,
+                data,
+            } => mixer.set_assignable_controller(channel, bank, index, data),
+            Midi2ChannelVoice::RelativeRegisteredController {
+                channel,
+                bank,
+                index,
+                data,
+            } => mixer.set_relative_registered_controller(channel, bank, index, data),
+            Midi2ChannelVoice::RelativeAssignableController {
+                channel,
+                bank,
+                index,
+                data,
+            } => mixer.set_relative_assignable_controller(channel, bank, index, data),
+            Midi2ChannelVoice::PerNoteManagement {
+                channel,
+                note,
+                detach,
+                reset,
+            } => mixer.per_note_management(channel, note, detach, reset),
         }
     }
 

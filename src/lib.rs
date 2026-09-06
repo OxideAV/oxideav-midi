@@ -340,11 +340,13 @@ impl Decoder for MidiDecoder {
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         // Two container framings share the decoder: the MIDI 1.0
         // Standard MIDI File ('MThd') and the M2-116 MIDI Clip File
-        // ('SMF2CLIP'). A clip is translated to an SMF sequence via
-        // the Appendix-D Default Translation and rendered through the
-        // same scheduler + mixer path.
-        let smf = if crate::clip::is_clip_file(&packet.data) {
-            crate::clip::parse(&packet.data)?.to_smf()?
+        // ('SMF2CLIP'). A clip is scheduled **natively** — its UMPs
+        // reach the mixer's MIDI 2.0 entry points at full resolution
+        // (`Scheduler::from_clip`); the Appendix-D translated path
+        // (`ClipFile::to_smf`) stays available to callers.
+        let scheduler = if crate::clip::is_clip_file(&packet.data) {
+            let clip = crate::clip::parse(&packet.data)?;
+            Scheduler::from_clip(&clip, self.sample_rate)
         } else {
             // Confirm the packet at least *looks* like an SMF — saves
             // the user from a "synthesis pending" misdiagnosis when
@@ -355,12 +357,12 @@ impl Decoder for MidiDecoder {
                      nor the 'SMF2CLIP' MIDI Clip File header",
                 ));
             }
-            crate::smf::parse(&packet.data)?
+            Scheduler::new(&crate::smf::parse(&packet.data)?, self.sample_rate)
         };
         // Prime the scheduler. Dropping the previous one (if any)
         // discards any partially-played file — callers should call
         // `flush` first if that matters.
-        self.scheduler = Some(Scheduler::new(&smf, self.sample_rate));
+        self.scheduler = Some(scheduler);
         self.mixer.all_notes_off();
         self.next_pts = 0;
         self.drained = false;

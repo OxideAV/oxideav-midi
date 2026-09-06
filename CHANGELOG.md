@@ -92,6 +92,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pitch_cents_for_slot`, used identically at note-on and on every
   re-application — which also stops a channel-bend re-application
   from dropping a 32-bit bend to 14-bit or an MPE Member's own bend.
+- **Native MIDI Clip File playback** (M2-116): `Scheduler::from_clip`
+  schedules a clip's Configuration Header + Sequence Data UMPs on the
+  DCTPQ tick grid and dispatches them straight into the mixer's MIDI
+  2.0 entry points — 16-bit velocity, 32-bit CC / pressure / bend,
+  Registered / Assignable (+ relative) Controllers, per-note messages,
+  the unified Program Change with Bank Valid (§7.4.9) — with Flex Set
+  Tempo driving the tempo and SysEx7 runs reassembled into the
+  Universal SysEx surface. `MidiDecoder` now plays `.midi2` this way;
+  `ClipFile::to_smf` (the Appendix-D translated path) stays available.
+  `tests/clip_native.rs` pins native vs translated on PCM: a MIDI
+  1.0-in-UMP clip and an on-grid MIDI 2.0 clip render bit-identically
+  either way (and the decoder's clip render equals its render of the
+  clip's SMF), while sub-grid velocity / bend / CC values and a
+  Per-Note Pitch Bend are folded away by translation but rendered
+  natively. Groups fold onto the single 16-channel Function Block; JR
+  Timestamps are accepted and rendered at their Delta Clockstamp
+  position (M2-116 defines no JR ↔ DCS relation).
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-midi/compare/v0.0.4...v0.0.5) - 2026-08-31
 
