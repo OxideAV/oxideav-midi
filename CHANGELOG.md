@@ -23,6 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sample-for-sample, values between two 14-bit steps are audible
   natively and invisible through the Appendix-D downscale, and a sweep
   inside one 14-bit step is strictly monotone.
+- **Native MIDI 2.0 Note On/Off** (M2-104 §7.4.1/§7.4.2/§7.4.14):
+  `Mixer::note_on_midi2` takes the 16-bit velocity and the Attribute
+  Type/Data. The voice is built from the §D.1.4 7-bit downscale
+  (`midi2_velocity_to_7`, floored to 1 — a 2.0 velocity 0 is a Note On
+  at the lowest velocity, never a Note Off) and the low 9 bits refine
+  the note's static gain by the exact `v16 / (v7 << 9)` ratio, so
+  on-grid velocities render bit-identically to MIDI 1.0 and the 512
+  values between two 7-bit steps are 512 distinct monotone gains.
+  **Attribute Type 0x03 Pitch 7.9** (§7.4.15.3) sets the note's absolute
+  pitch: the sample is selected at the integer part (`midi2_sample_key`)
+  and the 1/512-HCU fraction becomes an exact fractional-cents offset
+  that overrides MTS for that one note while channel/master tuning,
+  bends and glides still apply relatively. Manufacturer / Profile /
+  Reserved attribute types are ignored; a pending CC 88 prefix is
+  discarded (§7.4.6). PCM pins: a Pitch 7.9 half-semitone renders
+  sample-identically to an exact +50-cent 32-bit bend.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-midi/compare/v0.0.4...v0.0.5) - 2026-08-31
 

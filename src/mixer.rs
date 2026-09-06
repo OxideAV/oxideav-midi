@@ -102,6 +102,63 @@ pub const SOFT_PEDAL_GAIN: f32 = 0.667;
 #[doc(hidden)] // internal: voice-mixer tuning constant
 pub const PORTAMENTO_MAX_MS: f32 = 1000.0;
 
+/// MIDI 2.0 Note On/Off Attribute Type (M2-104 §7.4.14, Table 8):
+/// no attribute data — the Attribute field shall be 0 and is ignored.
+pub const ATTRIBUTE_TYPE_NONE: u8 = 0x00;
+/// Attribute Type 0x01 — Manufacturer Specific data (Table 8); the
+/// synth has no manufacturer semantics and ignores the data.
+pub const ATTRIBUTE_TYPE_MANUFACTURER: u8 = 0x01;
+/// Attribute Type 0x02 — Profile Specific data (Table 8): meaningful
+/// only under a MIDI-CI Profile the receiver understands; ignored.
+pub const ATTRIBUTE_TYPE_PROFILE: u8 = 0x02;
+/// Attribute Type 0x03 — **Pitch 7.9** (§7.4.15.3): the 16-bit
+/// Attribute is a Q7.9 unsigned pitch in HCUs (semitones) — 7 bits of
+/// note-number-scale pitch, 9 bits of fraction (1/512 HCU ≈ 0.2 c).
+/// The Note Number is then only a note index.
+pub const ATTRIBUTE_TYPE_PITCH_7_9: u8 = 0x03;
+
+/// The beyond-7-bit refinements a note-on entry point hands to the
+/// shared note-on body.
+#[derive(Clone, Copy, Debug)]
+struct NoteOnRefinement {
+    /// Static per-note gain factor multiplied into the slot's note
+    /// gain: the CA-031 14-bit or MIDI 2.0 16-bit velocity ratio over
+    /// the 7-bit velocity the voice was built from. `1.0` = none.
+    extra_gain: f32,
+    /// The key the voice was generated at — the note number, except
+    /// for a Pitch 7.9 note where it is the pitch's integer part.
+    sample_key: u8,
+    /// Absolute pitch override in HCUs (Pitch 7.9), applied as
+    /// `(pitch − sample_key) × 100` cents in place of the MTS per-key
+    /// offset. `None` = pitch from the note number as usual.
+    pitch_hcu: Option<f64>,
+}
+
+/// Downscale a MIDI 2.0 16-bit Note On velocity to the 7-bit value
+/// the voice generators are built from (M2-104 §D.1.4 truncation:
+/// the top 7 bits). A MIDI 2.0 velocity of 0 is a *Note On at the
+/// lowest velocity*, not a Note Off (§7.4.2), so the result is floored
+/// to 1 — the remaining resolution rides in the mixer's per-note gain
+/// (see [`Mixer::note_on_midi2`]).
+#[must_use]
+pub fn midi2_velocity_to_7(velocity: u16) -> u8 {
+    ((velocity >> 9) as u8).max(1)
+}
+
+/// The key a voice generator should be built from for a MIDI 2.0 Note
+/// On: with Attribute Type Pitch 7.9 the integer part of the pitch
+/// (§7.4.15: "Receivers that select samples … might choose to instead
+/// select samples based on the first 7 bits of the pitch data"), else
+/// the Note Number itself.
+#[must_use]
+pub fn midi2_sample_key(note: u8, attribute_type: u8, attribute: u16) -> u8 {
+    if attribute_type == ATTRIBUTE_TYPE_PITCH_7_9 {
+        (attribute >> 9) as u8 & 0x7F
+    } else {
+        note & 0x7F
+    }
+}
+
 /// One slot in the voice pool.
 struct VoiceSlot {
     /// The active voice, or `None` if the slot is free.
@@ -2902,7 +2959,104 @@ impl Mixer {
     /// with the same class is hard-stopped before the new voice is
     /// inserted (SF2 generator 57 — drum kits use this for hi-hat
     /// open/closed pairs).
-    pub fn note_on(&mut self, channel: u8, key: u8, velocity: u8, mut voice: Box<dyn Voice>) {
+    pub fn note_on(&mut self, channel: u8, key: u8, velocity: u8, voice: Box<dyn Voice>) {
+        // CA-031 CC 88 High-Resolution Velocity Prefix: consume a pending
+        // prefix and refine the note's gain by the ratio of the 14-bit
+        // velocity to its 7-bit-only value (`(vel<<7)|lsb` over `vel<<7`).
+        // The voice itself was built from the 7-bit velocity, so this
+        // multiplicative correction is exactly the extra resolution the
+        // prefix adds; a prefix of 0 — or no prefix — is a ratio of 1.0,
+        // keeping the legacy path bit-identical.
+        let ch = channel as usize % NUM_CHANNELS;
+        let hr_gain = match self.channels[ch].high_res_velocity_prefix.take() {
+            Some(lsb) if velocity > 0 => {
+                let coarse = (velocity as u16) << 7;
+                (coarse | (lsb & 0x7F) as u16) as f32 / coarse as f32
+            }
+            _ => 1.0,
+        };
+        self.note_on_inner(
+            channel,
+            key,
+            velocity,
+            voice,
+            NoteOnRefinement {
+                extra_gain: hr_gain,
+                sample_key: key,
+                pitch_hcu: None,
+            },
+        );
+    }
+
+    /// Insert a voice for a native **MIDI 2.0 Note On** (M2-104 §7.4.2)
+    /// at full resolution. `velocity` is the 16-bit value; `voice` was
+    /// built by the instrument from [`midi2_velocity_to_7`]`(velocity)`
+    /// at key [`midi2_sample_key`]`(note, attribute_type, attribute)`.
+    ///
+    /// * **16-bit velocity** — the voice carries the 7-bit velocity
+    ///   curve; the low 9 bits refine the note's static gain by the
+    ///   ratio `velocity / (velocity7 << 9)` (the same construction as
+    ///   the CA-031 14-bit prefix), so a velocity whose low 9 bits are
+    ///   zero renders **bit-identically** to the MIDI 1.0 note with the
+    ///   same 7-bit velocity, every one of the 512 values between two
+    ///   7-bit steps is a distinct gain, and velocity 0 — a Note On at
+    ///   the lowest velocity, *not* a Note Off (§7.4.2) — allocates a
+    ///   silent-gain voice rather than releasing anything.
+    /// * **Attribute Type 0x03 Pitch 7.9** (§7.4.15.3) — the Attribute
+    ///   is the note's absolute pitch in Q7.9 HCUs and `note` is only an
+    ///   index: the fractional part becomes an exact pitch offset from
+    ///   the sample key, and it overrides the MTS per-key tuning for
+    ///   this one note (channel / master tuning, bends and glides still
+    ///   apply relatively, §7.4.15). Types 0x01 / 0x02 (manufacturer /
+    ///   Profile specific) and Reserved types carry no synth semantics
+    ///   and are ignored, as is the Attribute under type 0x00.
+    /// * The MIDI 1.0 CC 88 prefix "shall not be used" in the MIDI 2.0
+    ///   Protocol (§7.4.6); a pending one is discarded.
+    pub fn note_on_midi2(
+        &mut self,
+        channel: u8,
+        note: u8,
+        velocity: u16,
+        attribute_type: u8,
+        attribute: u16,
+        voice: Box<dyn Voice>,
+    ) {
+        let ch = channel as usize % NUM_CHANNELS;
+        self.channels[ch].high_res_velocity_prefix = None;
+        let v7 = midi2_velocity_to_7(velocity);
+        let gain = f32::from(velocity) / f32::from(u16::from(v7) << 9);
+        let sample_key = midi2_sample_key(note, attribute_type, attribute);
+        let pitch =
+            (attribute_type == ATTRIBUTE_TYPE_PITCH_7_9).then(|| f64::from(attribute) / 512.0);
+        self.note_on_inner(
+            channel,
+            note & 0x7F,
+            v7,
+            voice,
+            NoteOnRefinement {
+                extra_gain: gain,
+                sample_key,
+                pitch_hcu: pitch,
+            },
+        );
+    }
+
+    /// Shared note-on body. `key` is the note number the slot answers
+    /// Note Off / per-key lookups for; see [`NoteOnRefinement`] for the
+    /// resolution refinements the MIDI 2.0 / CA-031 entry points add.
+    fn note_on_inner(
+        &mut self,
+        channel: u8,
+        key: u8,
+        velocity: u8,
+        mut voice: Box<dyn Voice>,
+        refine: NoteOnRefinement,
+    ) {
+        let NoteOnRefinement {
+            extra_gain,
+            sample_key,
+            pitch_hcu,
+        } = refine;
         // SP-MIDI Channel Masking (RP-034 §2.2 / §2.3): a masked
         // channel is muted — its note-ons are filtered out before they
         // reach the sound module.
@@ -3009,9 +3163,16 @@ impl Mixer {
         // channel scale/octave). Drum channels are exempt from
         // note-shifting per CA-25's principle (a different pitch on a
         // drum kit is a different sound), matching the master-tuning
-        // exemption above.
-        if !is_drum {
-            cents += f64::from(self.tuning.offset_cents(channel, key).round() as i32);
+        // exemption above. A MIDI 2.0 absolute pitch (Pitch 7.9)
+        // overrides MTS for this note (M2-104 §7.4.15.3): the voice
+        // sounds at `pitch_hcu`, expressed as an exact fractional
+        // offset from the key it was generated at.
+        match pitch_hcu {
+            Some(p) => cents += (p - f64::from(sample_key)) * 100.0,
+            None if !is_drum => {
+                cents += f64::from(self.tuning.offset_cents(channel, key).round() as i32);
+            }
+            None => {}
         }
         // Key-Based Fine / Coarse Tuning (CA-023 `nn = 78H/79H`): the
         // drum-channel note-shift exemption doesn't apply — this IS
@@ -3093,20 +3254,6 @@ impl Mixer {
                 voice.set_lfo_amp_depth(dest.lfo_amp_depth);
             }
         }
-        // CA-031 CC 88 High-Resolution Velocity Prefix: consume a pending
-        // prefix and refine the note's gain by the ratio of the 14-bit
-        // velocity to its 7-bit-only value (`(vel<<7)|lsb` over `vel<<7`).
-        // The voice itself was built from the 7-bit velocity, so this
-        // multiplicative correction is exactly the extra resolution the
-        // prefix adds; a prefix of 0 — or no prefix — is a ratio of 1.0,
-        // keeping the legacy path bit-identical.
-        let hr_gain = match self.channels[ch].high_res_velocity_prefix.take() {
-            Some(lsb) if velocity > 0 => {
-                let coarse = (velocity as u16) << 7;
-                (coarse | (lsb & 0x7F) as u16) as f32 / coarse as f32
-            }
-            _ => 1.0,
-        };
         let idx = self.pick_slot();
         let age = self.next_age;
         self.next_age = self.next_age.wrapping_add(1);
@@ -3124,11 +3271,11 @@ impl Mixer {
             velocity_norm: (velocity as f32 / 127.0).clamp(0.0, 1.0),
             // Soft Pedal (CC 67): a note struck while the pedal is down is
             // attenuated; one struck with it up renders at unity. The
-            // CA-031 high-resolution velocity refinement multiplies in —
-            // both are static per-note gains captured at strike time, as
+            // CA-031 / MIDI 2.0 16-bit velocity refinement multiplies in
+            // — both are static per-note gains captured at strike time, as
             // is the Key-Based Note Volume (GM2 §4.8: relative, 40H =
             // 100 %, 7FH = (127/64)·100 %).
-            note_gain: hr_gain
+            note_gain: extra_gain
                 * if st.soft_pedal { SOFT_PEDAL_GAIN } else { 1.0 }
                 * kb.and_then(|k| k.volume)
                     .map(|v| v as f32 / 64.0)
@@ -5008,6 +5155,148 @@ mod tests {
         assert_eq!(m.live_voice_count(), 2);
         m.all_notes_off();
         assert_eq!(m.live_voice_count(), 0);
+    }
+
+    // ── MIDI 2.0 Note On: 16-bit velocity + attributes (§7.4.2/§7.4.14) ──
+
+    /// Read a slot's static note gain by mixing one sample of a unit
+    /// ConstVoice on a fresh mixer with channel volume at unity.
+    fn note_gain_for_midi2(velocity: u16, attribute_type: u8, attribute: u16) -> f32 {
+        let mut m = Mixer::new();
+        m.channel_state_mut(0).volume = 127;
+        m.note_on_midi2(0, 60, velocity, attribute_type, attribute, voice(1.0, 8));
+        let (mut l, mut r) = (vec![0.0f32; 1], vec![0.0f32; 1]);
+        m.mix_stereo(&mut l, &mut r);
+        // Centre pan: cos(π/4) on each side; undo it and the mix gain.
+        l[0] / (std::f32::consts::FRAC_PI_4.cos() * m.mix_gain)
+    }
+
+    fn note_gain_for_midi1(velocity: u8) -> f32 {
+        let mut m = Mixer::new();
+        m.channel_state_mut(0).volume = 127;
+        m.note_on(0, 60, velocity, voice(1.0, 8));
+        let (mut l, mut r) = (vec![0.0f32; 1], vec![0.0f32; 1]);
+        m.mix_stereo(&mut l, &mut r);
+        l[0] / (std::f32::consts::FRAC_PI_4.cos() * m.mix_gain)
+    }
+
+    #[test]
+    fn midi2_velocity_helpers_follow_appendix_d_and_floor_to_one() {
+        assert_eq!(midi2_velocity_to_7(0xFFFF), 127);
+        assert_eq!(midi2_velocity_to_7(100 << 9), 100);
+        assert_eq!(midi2_velocity_to_7((100 << 9) | 0x1FF), 100);
+        // §7.4.2: velocity 0 is a Note On (lowest velocity), never a
+        // Note Off — the voice is built at 1 (the §D.2.1 floor too).
+        assert_eq!(midi2_velocity_to_7(0), 1);
+        assert_eq!(midi2_velocity_to_7(0x01FF), 1);
+        assert_eq!(midi2_sample_key(60, ATTRIBUTE_TYPE_NONE, 0x1234), 60);
+        assert_eq!(
+            midi2_sample_key(5, ATTRIBUTE_TYPE_PITCH_7_9, (69 << 9) | 256),
+            69
+        );
+    }
+
+    #[test]
+    fn midi2_velocity_on_7bit_grid_matches_midi1_gain_exactly() {
+        for v7 in [1u8, 37, 64, 100, 127] {
+            let g1 = note_gain_for_midi1(v7);
+            let g2 = note_gain_for_midi2(u16::from(v7) << 9, ATTRIBUTE_TYPE_NONE, 0);
+            assert_eq!(g1, g2, "velocity {v7}");
+        }
+    }
+
+    #[test]
+    fn midi2_velocity_between_7bit_steps_is_512_distinct_monotone_gains() {
+        let base = 100u16 << 9;
+        let g_lo = note_gain_for_midi1(100);
+        let mut last = f32::NEG_INFINITY;
+        let mut distinct = std::collections::BTreeSet::new();
+        for lsb in 0..512u16 {
+            let g = note_gain_for_midi2(base | lsb, ATTRIBUTE_TYPE_NONE, 0);
+            assert!(g > last, "lsb {lsb}: {g} !> {last}");
+            // The refinement is exactly the 16-bit / 7-bit velocity
+            // ratio over the (voice-defined) 7-bit gain.
+            let want = g_lo * f32::from(base | lsb) / f32::from(base);
+            assert!((g - want).abs() <= 1e-6, "lsb {lsb}: {g} vs {want}");
+            last = g;
+            distinct.insert(g.to_bits());
+        }
+        assert_eq!(distinct.len(), 512);
+    }
+
+    #[test]
+    fn midi2_note_on_velocity_zero_allocates_a_silent_voice_not_a_note_off() {
+        let mut m = Mixer::new();
+        // A sounding note on the same key must survive (a MIDI 1.0
+        // velocity-0 Note On would have released it).
+        m.note_on(0, 60, 100, voice(1.0, 64));
+        m.note_on_midi2(0, 60, 0, ATTRIBUTE_TYPE_NONE, 0, voice(1.0, 64));
+        assert_eq!(m.live_voice_count(), 2);
+        // The new voice contributes exactly nothing.
+        assert_eq!(note_gain_for_midi2(0, ATTRIBUTE_TYPE_NONE, 0), 0.0);
+        // … while velocity 1 (the smallest non-zero) already does.
+        assert!(note_gain_for_midi2(1, ATTRIBUTE_TYPE_NONE, 0) > 0.0);
+    }
+
+    #[test]
+    fn midi2_note_on_discards_a_pending_cc88_prefix() {
+        // §7.4.6: CC 88 shall not be used for High Resolution Velocity
+        // in the MIDI 2.0 Protocol.
+        let mut m = Mixer::new();
+        m.channel_state_mut(0).volume = 127;
+        m.set_high_res_velocity_prefix(0, 0x7F);
+        m.note_on_midi2(0, 60, 100 << 9, ATTRIBUTE_TYPE_NONE, 0, voice(1.0, 8));
+        assert_eq!(m.channel_state(0).high_res_velocity_prefix, None);
+        let (mut l, mut r) = (vec![0.0f32; 1], vec![0.0f32; 1]);
+        m.mix_stereo(&mut l, &mut r);
+        let g = l[0] / (std::f32::consts::FRAC_PI_4.cos() * m.mix_gain);
+        assert_eq!(g, note_gain_for_midi1(100));
+    }
+
+    #[test]
+    fn pitch_7_9_attribute_sets_exact_fractional_pitch_and_overrides_mts() {
+        let mut m = Mixer::new();
+        // MTS: detune key 60 by +30 cents — must NOT apply to the
+        // Pitch 7.9 note (§7.4.15.3 override), only to the plain one.
+        m.set_scale_octave_tuning(0, [30.0; 12], false);
+        let (v, fine, _) = fine_bend_voice(8);
+        m.note_on(0, 60, 100, v);
+        assert_eq!(*fine.lock().unwrap(), 30.0);
+        // Pitch 60 + 256/512 HCU = +50.0 cents above the sample key 60;
+        // the note index (5) is unrelated to the sounding pitch.
+        let (v, fine, _) = fine_bend_voice(8);
+        m.note_on_midi2(0, 5, 100 << 9, ATTRIBUTE_TYPE_PITCH_7_9, (60 << 9) | 256, v);
+        assert_eq!(*fine.lock().unwrap(), 50.0);
+        // Channel coarse tune (relative modifier, §7.4.15) still sums.
+        m.channel_state_mut(0).channel_coarse_tune_semitones = -1;
+        let (v, fine, _) = fine_bend_voice(8);
+        m.note_on_midi2(0, 6, 100 << 9, ATTRIBUTE_TYPE_PITCH_7_9, (60 << 9) | 1, v);
+        assert_eq!(*fine.lock().unwrap(), -100.0 + 100.0 / 512.0);
+        // The slot answers Note Off by the note *index*.
+        assert_eq!(m.live_voice_count(), 3);
+        m.note_off(0, 6);
+        let (mut l, mut r) = (vec![0.0f32; 4], vec![0.0f32; 4]);
+        m.mix_stereo(&mut l, &mut r);
+        assert_eq!(m.live_voice_count(), 2);
+    }
+
+    #[test]
+    fn non_pitch_attribute_types_are_ignored() {
+        for at in [
+            ATTRIBUTE_TYPE_NONE,
+            ATTRIBUTE_TYPE_MANUFACTURER,
+            ATTRIBUTE_TYPE_PROFILE,
+            0x7F,
+        ] {
+            let mut m = Mixer::new();
+            let (v, fine, _) = fine_bend_voice(8);
+            m.note_on_midi2(0, 60, 100 << 9, at, 0xABCD, v);
+            assert_eq!(*fine.lock().unwrap(), 0.0, "attribute type {at:#04x}");
+            assert_eq!(
+                note_gain_for_midi2(100 << 9, at, 0xABCD),
+                note_gain_for_midi1(100)
+            );
+        }
     }
 
     // ── MIDI 2.0 32-bit Pitch Bend (M2-104 §7.4.11) ──────────────────

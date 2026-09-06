@@ -101,3 +101,98 @@ fn pitch_bend_32_resolution_is_monotone_across_a_14_bit_step() {
         prev = Some(l);
     }
 }
+
+// ── 16-bit velocity + Pitch 7.9 attribute (M2-104 §7.4.2 / §7.4.15.3) ──
+
+use oxideav_midi::mixer::{
+    midi2_sample_key, midi2_velocity_to_7, ATTRIBUTE_TYPE_NONE, ATTRIBUTE_TYPE_PITCH_7_9,
+};
+
+/// Render a single MIDI 2.0 note (16-bit velocity + attribute) through
+/// a fresh mixer.
+fn render_midi2(velocity: u16, attribute_type: u8, attribute: u16) -> Vec<f32> {
+    let inst = ToneInstrument::new();
+    let mut m = Mixer::new();
+    let key = midi2_sample_key(69, attribute_type, attribute);
+    let voice = inst
+        .make_voice(0, key, midi2_velocity_to_7(velocity), RATE)
+        .expect("tone voice");
+    m.note_on_midi2(0, 69, velocity, attribute_type, attribute, voice);
+    let mut l = vec![0.0f32; FRAMES];
+    let mut r = vec![0.0f32; FRAMES];
+    m.mix_stereo(&mut l, &mut r);
+    l
+}
+
+#[test]
+fn velocity_16_on_the_7_bit_grid_renders_bit_identically_to_midi1() {
+    for v7 in [1u8, 64, 100, 127] {
+        let (l1, _) = render(|_| {});
+        // `render` strikes at velocity 100; rebuild at v7 for both.
+        let inst = ToneInstrument::new();
+        let mut m = Mixer::new();
+        m.note_on(0, 69, v7, inst.make_voice(0, 69, v7, RATE).unwrap());
+        let mut l1b = vec![0.0f32; FRAMES];
+        let mut r = vec![0.0f32; FRAMES];
+        m.mix_stereo(&mut l1b, &mut r);
+        let l2 = render_midi2(u16::from(v7) << 9, ATTRIBUTE_TYPE_NONE, 0);
+        assert_eq!(l1b, l2, "velocity {v7}");
+        if v7 == 100 {
+            assert_eq!(l1, l2);
+        }
+    }
+}
+
+#[test]
+fn velocity_16_low_bits_scale_the_render_where_translation_cannot() {
+    let v_grid = 100u16 << 9;
+    let v_half = v_grid | 256;
+    // Appendix D folds both onto velocity 100 …
+    assert_eq!(midi2_velocity_to_7(v_grid), midi2_velocity_to_7(v_half));
+    let grid = render_midi2(v_grid, ATTRIBUTE_TYPE_NONE, 0);
+    let half = render_midi2(v_half, ATTRIBUTE_TYPE_NONE, 0);
+    // … natively the half-step note is exactly (v_half / v_grid) louder,
+    // sample for sample (a static gain: same waveform, same envelope).
+    let ratio = f32::from(v_half) / f32::from(v_grid);
+    for (i, (g, h)) in grid.iter().zip(&half).enumerate() {
+        let want = g * ratio;
+        assert!(
+            (want - h).abs() <= 1e-6 * want.abs().max(1e-3),
+            "sample {i}: {h} vs {want}"
+        );
+    }
+    assert!(peak_abs(&half) > peak_abs(&grid));
+}
+
+#[test]
+fn pitch_7_9_half_semitone_equals_an_exact_50_cent_bend() {
+    // Pitch 69 + 256/512 HCU is exactly +50 c above A4; a 32-bit bend
+    // of 0xA000_0000 at the ±200 c default is exactly +50 c too. Both
+    // feed the same fractional-cents voice hook → identical PCM.
+    let attr = (69u16 << 9) | 256;
+    let via_attr = render_midi2(100 << 9, ATTRIBUTE_TYPE_PITCH_7_9, attr);
+    let (via_bend, _) = render(|m| m.set_pitch_bend_32(0, 0xA000_0000));
+    assert_eq!(via_attr, via_bend);
+    // And a Pitch 7.9 with a zero fraction is the plain note.
+    let plain = render_midi2(100 << 9, ATTRIBUTE_TYPE_NONE, 0);
+    let whole = render_midi2(100 << 9, ATTRIBUTE_TYPE_PITCH_7_9, 69 << 9);
+    assert_eq!(plain, whole);
+    // Note number is only an index for a Pitch 7.9 note: index 5 with
+    // pitch 69.0 renders exactly like the plain A4.
+    let inst = ToneInstrument::new();
+    let mut m = Mixer::new();
+    let key = midi2_sample_key(5, ATTRIBUTE_TYPE_PITCH_7_9, 69 << 9);
+    assert_eq!(key, 69);
+    m.note_on_midi2(
+        0,
+        5,
+        100 << 9,
+        ATTRIBUTE_TYPE_PITCH_7_9,
+        69 << 9,
+        inst.make_voice(0, key, 100, RATE).unwrap(),
+    );
+    let mut l = vec![0.0f32; FRAMES];
+    let mut r = vec![0.0f32; FRAMES];
+    m.mix_stereo(&mut l, &mut r);
+    assert_eq!(l, plain);
+}
