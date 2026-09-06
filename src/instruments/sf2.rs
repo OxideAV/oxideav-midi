@@ -2624,6 +2624,21 @@ impl Sf2Voice {
         filter.last_cutoff_cents = cutoff_cents;
     }
 
+    /// Recompute the biquad only when `target` drifted more than ~50
+    /// cents from the last computed cutoff (the `i32::MIN` sentinel of
+    /// a fresh filter always recomputes; saturating arithmetic keeps it
+    /// from wrapping).
+    fn maybe_update_filter(&mut self, target: i32) {
+        let last = self
+            .filter
+            .as_ref()
+            .map(|f| f.last_cutoff_cents)
+            .unwrap_or(i32::MIN);
+        if target.saturating_sub(last).saturating_abs() > 50 {
+            self.update_filter_coeffs(target, self.output_rate);
+        }
+    }
+
     /// Run one input sample through the biquad on `channel` (0 = left
     /// or mono, 1 = right). No-op if the voice has no filter state.
     fn filter_step(&mut self, channel: usize, x: f32) -> f32 {
@@ -2683,13 +2698,88 @@ impl Voice for Sf2Voice {
         // the slow path — the SF2 corpus PCM hashes are unchanged.
         let lfo = self.lfo_active();
         let simple = self.filter.is_none() && self.mod_env_to_pitch_cents == 0 && !lfo;
+        // The modulation envelope only matters when a routing depth
+        // consumes it; a filter whose cutoff nothing modulates (no
+        // mod-env / mod-LFO routing) keeps one target for the whole
+        // block, so its drift check runs once per block instead of per
+        // sample — the same coefficient updates, the same samples.
+        let mod_env_needed = self.mod_env_to_pitch_cents != 0 || self.mod_env_to_filter_cents != 0;
+        let filter_static = self.filter.is_some()
+            && self.mod_env_to_filter_cents == 0
+            && self.mod_lfo_to_filter_cents == 0;
         while base < total {
             let n = (total - base).min(ENV_RUN);
             self.envelope_run(self.elapsed, &mut env_buf[..n]);
             if lfo {
                 self.refresh_mod_lfo_gain(self.elapsed);
             }
+            if filter_static {
+                let target = self.initial_filter_fc_cents
+                    + self.timbre_cutoff_offset_cents
+                    + self.dest_cutoff_offset_cents;
+                self.maybe_update_filter(target);
+            }
             let chunk = &mut out[base..base + n];
+
+            if filter_static && !mod_env_needed && !lfo {
+                // ---- Static-filter path: the only non-trivial stage is
+                // a biquad whose coefficients are fixed for the block.
+                // Same sample arithmetic as the general path below (the
+                // biquad expression is evaluated in the same order), with
+                // the coefficients and delay line held in locals. ----
+                let gain = self.amplitude * self.pressure_gain;
+                let releasing = self.release_pos.is_some();
+                let f = self
+                    .filter
+                    .as_ref()
+                    .expect("filter_static implies a filter");
+                let (b0, b1, b2, a1, a2) = (f.b0, f.b1, f.b2, f.a1, f.a2);
+                let (mut x1, mut x2, mut y1, mut y2) = (f.x1[0], f.x2[0], f.y1[0], f.y2[0]);
+                let mut stop: Option<usize> = None;
+                for (j, (slot, &env)) in chunk.iter_mut().zip(&env_buf[..n]).enumerate() {
+                    if releasing && env <= 0.0 {
+                        stop = Some(base + j);
+                        break;
+                    }
+                    if self.phase >= self.end as f64 {
+                        if self.loops {
+                            let over = self.phase - self.end_loop as f64;
+                            let loop_len = (self.end_loop as f64 - self.start_loop as f64).max(1.0);
+                            self.phase = self.start_loop as f64 + over.rem_euclid(loop_len);
+                        } else {
+                            stop = Some(base + j);
+                            break;
+                        }
+                    } else if self.loops && self.phase >= self.end_loop as f64 {
+                        let over = self.phase - self.end_loop as f64;
+                        let loop_len = (self.end_loop as f64 - self.start_loop as f64).max(1.0);
+                        self.phase = self.start_loop as f64 + over.rem_euclid(loop_len);
+                    }
+                    let x = self.fetch(self.phase);
+                    let y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+                    x2 = x1;
+                    x1 = x;
+                    y2 = y1;
+                    y1 = y;
+                    *slot = y * env * gain;
+                    self.phase += self.phase_inc;
+                    self.elapsed = self.elapsed.wrapping_add(1);
+                }
+                let f = self
+                    .filter
+                    .as_mut()
+                    .expect("filter_static implies a filter");
+                f.x1[0] = x1;
+                f.x2[0] = x2;
+                f.y1[0] = y1;
+                f.y2[0] = y2;
+                if let Some(at) = stop {
+                    self.done = true;
+                    return at;
+                }
+                base += n;
+                continue;
+            }
 
             if simple {
                 // ---- Fast path: no filter, no mod-env→pitch routing. ----
@@ -2734,7 +2824,7 @@ impl Voice for Sf2Voice {
                 // playback rate every sample only when the mod-env routes
                 // to pitch — most banks don't, so the common path stays
                 // multiplication-only.
-                let mod_lvl = if self.mod_env_to_pitch_cents != 0 || self.filter.is_some() {
+                let mod_lvl = if mod_env_needed {
                     self.mod_env_at(self.elapsed)
                 } else {
                     0.0
@@ -2753,26 +2843,18 @@ impl Voice for Sf2Voice {
                     let bend_ratio = (2.0f64).powf(pitch_cents / 1200.0);
                     self.phase_inc = self.base_phase_inc * bend_ratio;
                 }
-                // Filter cutoff modulation: only recompute coefficients
-                // when the cutoff drifts more than ~50 cents from the last
-                // computed value (cheap perceptual gate).
-                if self.filter.is_some() {
+                // Filter cutoff modulation (mod-env / mod-LFO routed):
+                // only recompute coefficients when the cutoff drifts
+                // more than ~50 cents from the last computed value
+                // (cheap perceptual gate). A static filter was handled
+                // once at the top of the block.
+                if self.filter.is_some() && !filter_static {
                     let target = self.initial_filter_fc_cents
                         + self.timbre_cutoff_offset_cents
                         + self.dest_cutoff_offset_cents
                         + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32
                         + self.mod_lfo_filter_cents_at(self.elapsed);
-                    let last = self
-                        .filter
-                        .as_ref()
-                        .map(|f| f.last_cutoff_cents)
-                        .unwrap_or(i32::MIN);
-                    // Saturating subtraction so the i32::MIN sentinel
-                    // (used to force a first-call computation) doesn't
-                    // wrap around when subtracted from a positive target.
-                    if target.saturating_sub(last).saturating_abs() > 50 {
-                        self.update_filter_coeffs(target, self.output_rate);
-                    }
+                    self.maybe_update_filter(target);
                 }
 
                 // If we've walked off the end of the (non-looping) sample
@@ -2937,6 +3019,16 @@ impl Voice for Sf2Voice {
             return 0;
         }
         let lfo = self.lfo_active();
+        let mod_env_needed = self.mod_env_to_pitch_cents != 0 || self.mod_env_to_filter_cents != 0;
+        let filter_static = self.filter.is_some()
+            && self.mod_env_to_filter_cents == 0
+            && self.mod_lfo_to_filter_cents == 0;
+        if filter_static {
+            let target = self.initial_filter_fc_cents
+                + self.timbre_cutoff_offset_cents
+                + self.dest_cutoff_offset_cents;
+            self.maybe_update_filter(target);
+        }
         for i in 0..out_l.len() {
             let env = self.envelope_at(self.elapsed);
             if self.release_pos.is_some() && env <= 0.0 {
@@ -2948,7 +3040,7 @@ impl Voice for Sf2Voice {
             }
 
             // Mod-env routings same as the mono path.
-            let mod_lvl = if self.mod_env_to_pitch_cents != 0 || self.filter.is_some() {
+            let mod_lvl = if mod_env_needed {
                 self.mod_env_at(self.elapsed)
             } else {
                 0.0
@@ -2965,23 +3057,13 @@ impl Voice for Sf2Voice {
                 let bend_ratio = (2.0f64).powf(pitch_cents / 1200.0);
                 self.phase_inc = self.base_phase_inc * bend_ratio;
             }
-            if self.filter.is_some() {
+            if self.filter.is_some() && !filter_static {
                 let target = self.initial_filter_fc_cents
                     + self.timbre_cutoff_offset_cents
                     + self.dest_cutoff_offset_cents
                     + (mod_lvl * self.mod_env_to_filter_cents as f32) as i32
                     + self.mod_lfo_filter_cents_at(self.elapsed);
-                let last = self
-                    .filter
-                    .as_ref()
-                    .map(|f| f.last_cutoff_cents)
-                    .unwrap_or(i32::MIN);
-                // Saturating subtraction so the i32::MIN sentinel
-                // (used to force a first-call computation) doesn't
-                // wrap around when subtracted from a positive target.
-                if target.saturating_sub(last).saturating_abs() > 50 {
-                    self.update_filter_coeffs(target, self.output_rate);
-                }
+                self.maybe_update_filter(target);
             }
 
             // Wrap / end-of-sample handling for the *primary* (left)

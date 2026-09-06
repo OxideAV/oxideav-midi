@@ -195,6 +195,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them so every parsed file round-trips. Regression seeds are checked
   in under `fuzz/corpus/`. A `Fuzz` workflow builds every target on
   nightly and smoke-runs each for 30 s.
+- **SF2 render fast paths (byte-identical)**: the modulation envelope is
+  evaluated only when a routing depth consumes it, a filter whose
+  cutoff nothing modulates runs its coefficient drift check once per
+  256-frame block instead of per sample, and a dedicated static-filter
+  path keeps the biquad coefficients and delay line in locals (same
+  expression order). The §8.4.2 default modulator had put most notes
+  on the filtered path, so the dense-score SMF→PCM bench goes 122.5 →
+  89.8 ms (−27 %) here with every `--corpus` PCM hash unchanged.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-midi/compare/v0.0.4...v0.0.5) - 2026-08-31
 
