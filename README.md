@@ -277,13 +277,88 @@ framing: `SMF2CLIP` File Header, leading Set Profile On SysEx (no
 Delta Clockstamp), `DCS(0)` + DCTPQ, Clip Configuration Header, Start
 / End of Clip markers, per-message Delta Clockstamps with the §3.2.2
 `DCS + NOOP` restart for gaps beyond the 20-bit field, and the §7.3
-nothing-after-End rule. `ClipFile::to_smf()` renders a clip through
-the Appendix-D Default Translation into the existing scheduler +
-mixer pipeline (MIDI 2.0 Channel Voice via the compound expansions,
-Flex tempo / meter / key / text to SMF metas, SysEx7 reassembly to
-`F0` events); `ClipFile::from_smf()` covers the Appendix-A
-concordance direction. The registered decoder accepts both `MThd` and
-`SMF2CLIP` payloads.
+nothing-after-End rule. The writer is a fixed point of the reader over
+every UMP Message Type (`tests/writer_fixed_point.rs`).
+`Scheduler::from_clip()` plays a clip **natively** (see *Native MIDI
+2.0 synthesis* below) — the registered decoder does this for
+`SMF2CLIP` payloads and applies the Configuration Header's Set
+Profile On messages first. `ClipFile::to_smf()` remains the Appendix-D
+Default Translation into an SMF (MIDI 2.0 Channel Voice via the
+compound expansions, Flex tempo / meter / key / text to SMF metas,
+SysEx7 reassembly to `F0` events) and `ClipFile::from_smf()` the
+Appendix-A concordance direction; the two are lossy exactly once,
+then stable.
+
+## Native MIDI 2.0 synthesis
+
+The mixer consumes MIDI 2.0 Channel Voice messages (M2-104 §7.4) at
+full resolution instead of downgrading them to 7 / 14 bits:
+
+- **Resolution anchor.** Every refinement is anchored on the spec's
+  own 7 ↔ 16 / 32-bit equivalence, the §D.1.3 Min-Center-Max upscale
+  grid: a value on the grid (every MIDI 1.0 value's upscale) renders
+  **bit-identically** to its MIDI 1.0 counterpart in both translation
+  directions, the positions between two grid points are distinct and
+  monotone, `0xFFFF` / `0xFFFF_FFFF` are exactly position 127. The
+  MIDI 1.0 paths are untouched (bench `--corpus` hashes unchanged for
+  MIDI 1.0 content); `tests/midi2_native.rs` and `tests/clip_native.rs`
+  pin identity and difference on rendered PCM.
+- **Pitch** — `Voice::set_pitch_bend_fine_cents` carries fractional
+  cents; `Mixer::set_pitch_bend_32` (§7.4.11) keeps the 32-bit bend, a
+  sweep inside one 14-bit step is strictly monotone. Per-Note Pitch
+  Bend (§7.4.12) scales by the RPN #00/07 Sensitivity of Per-Note
+  Pitch Bend (Q7.25, §7.4.13; default 2.0 HCU) and sums with the
+  channel bend. **Pitch 7.9** (Note On Attribute Type 3, §7.4.15.3) and
+  **Pitch 7.25** (Registered Per-Note Controller #3, §7.4.15.2, live
+  through the note's life) set absolute pitches — the sample is picked
+  at the integer part (`Mixer::midi2_note_sample_key`) and the
+  fraction is an exact offset overriding MTS; channel / master tuning,
+  bends and glides still apply relatively; 7.9 out-ranks 7.25 for that
+  one note.
+- **Velocity** — `Mixer::note_on_midi2` refines the 7-bit-built voice
+  by the ratio of the voice's own velocity curve (`Voice::velocity_gain`,
+  square law by default) at the 16-bit value's continuous position
+  (`midi2_velocity_position`), continuous across steps; velocity 0 is
+  a Note On at the lowest velocity (§7.4.2), never a Note Off; CC 88
+  is ignored in the 2.0 Protocol (§7.4.6).
+- **32-bit controllers** — `set_control_change_32` keeps CC 1 / 7 /
+  10 / 11 / 91 / 93 at full resolution through the same response
+  curves (GM2 square law, RP-036 pan with `0x8000_0000` the true
+  centre, fractional modulation depth via
+  `Voice::set_mod_depth_fine_cents`); switch / table controllers take
+  the §D.1.4 downscale; the §7.4.6.1 special formats (CC 84 source
+  note, CC 126 channel count in the top 7 bits) and the §7.4.6 ignore
+  list (CC 0 / 32 / 6 / 38 / 98–101 / 88) are honoured.
+  `set_channel_pressure_32` / `set_poly_pressure_32` likewise.
+- **Registered / Assignable Controllers** (§7.4.7 / §7.4.8) —
+  `set_registered_controller` implements the unified RPN form for Bank
+  0 #00–#02 / #05 / #06 with the Figure 57–61 field layouts and #00/07;
+  `registered_controller` reads the 32-bit layout back;
+  `set_relative_registered_controller` applies the two's-complement
+  relative form (saturating). Assignable Controllers are recorded per
+  channel with the relative form applied.
+- **Per-Note Controllers** (§7.4.4, Appendix A) — per-`(channel, note)`
+  state (`PerNoteState`, shared and persistent per Appendix C.1, left
+  alone by Reset All Controllers per Appendix B.2): #1 Modulation
+  (summed with CC 1), #3 Pitch 7.25, #7 / #11 per-note square-law
+  gains, #10 per-note pan, #71–#78 Sound Controllers captured at
+  note-on with #74 Brightness live, #91 / #93 per-note sends; other
+  defined numbers are recorded, Reserved numbers ignored; Assignable
+  Per-Note Controllers are recorded. **Per-Note Management** (§7.4.5)
+  implements D (detach: sounding voices keep their values) and S
+  (reset), D-then-S.
+- **Program Change with Bank Valid** (§7.4.9) latches the GM2 bank pair
+  then the program. Groups fold onto the single 16-channel Function
+  Block; JR Timestamps are accepted and rendered at their Delta
+  Clockstamp position.
+- **MIDI-CI Profiles** (M2-101 §7.8 / §7.9, M2-102 §2.3 / §2.6) —
+  `Mixer::set_profile_on` / `set_profile_off` implement the Device-ID
+  addressing (a Channel as the Manager of a Multi-Channel Profile with
+  the version-2 channel span, the Group `0x7E`, the Function Block
+  `0x7F`); the scheduler routes Set Profile On / Off SysEx into it and
+  `profile_enabled` / `enabled_profiles` expose the result. No Standard
+  Defined Profile specification is staged, so enabling changes no
+  sound parameter by itself.
 
 ## MIDI-CI (`ci`)
 
@@ -303,12 +378,29 @@ only — no session state machine.
 ## Instruments
 
 - `instruments::sf2` — full SoundFont 2 RIFF reader + voice generator.
-  Resolves preset → instrument → zone → sample; honours key/vel
-  ranges, the sample / tune / root-key generators, volume + modulation
-  DAHDSR envelopes, modEnv→pitch / modEnv→filter routing, the initial
-  low-pass biquad, and exclusive-class drum cuts. 24-bit `sm24`
-  samples and native stereo zones supported. Bounds-checked with spec
-  ceilings on sample / record counts.
+  Resolves preset → instrument → zone → sample with the §7.3 / §7.7
+  **global zones** supplying defaults under the §9.4 precedence;
+  honours key/vel ranges, the sample / tune / root-key generators,
+  `scaleTuning`, volume + modulation DAHDSR envelopes with the
+  `keynumTo…Hold/Decay` key tracking, modEnv→pitch / modEnv→filter
+  routing, the **Vibrato and Modulation LFOs** (§9.1.6: delay + triangle,
+  routed to pitch / filter / volume), the initial low-pass biquad,
+  `pan` and the reverb / chorus **effects sends** (gens 15–17, summed
+  with the channel CC 91 / 93 sends), and exclusive-class drum cuts.
+  `pmod` / `imod` **modulators** are parsed and evaluated at note-on for
+  the sources known then (No Controller, velocity, key number; §8.2
+  direction / polarity, linear + switch types, amount source, §8.3
+  absolute-value transform) with the §9.5.1 supersede / add precedence;
+  the §8.4.2 velocity→cutoff default modulator is implicit and
+  supersedable, and the §8.4.3 / §8.4.4 defaults put Channel Pressure
+  and CC 1 on the Vibrato LFO (the GM2 Sound Controllers CC 76–78 scale
+  its rate / depth / delay). Not evaluated: modulators sourced from
+  live channel state (MIDI CC palette, pressure, pitch wheel), linked
+  chains, and the concave / convex source types (the staged §8.2.4
+  formula is not usable as printed; the §8.4.1 velocity→attenuation
+  default keeps a square-law approximation). 24-bit `sm24` samples and
+  native stereo zones supported. Bounds-checked with spec ceilings on
+  sample / record counts.
 - `instruments::sfz` — text patch reader + voice generator. Tokenises
   the SFZ syntax, flattens `<global>`/`<master>`/`<group>`/`<region>`
   inheritance, reads referenced WAV samples (8/16/24/32-bit PCM +
@@ -469,8 +561,9 @@ only — no session state machine.
   `Error::Unsupported`.
 
 The decoder factory registers under codec id `"midi"`: `send_packet`
-parses the SMF — or a `.midi2` MIDI Clip File, translated through
-Appendix D — and primes the scheduler; `receive_frame` returns
+parses the SMF — or a `.midi2` MIDI Clip File, scheduled natively at
+full MIDI 2.0 resolution with its Configuration Header profiles
+applied — and primes the scheduler; `receive_frame` returns
 interleaved S16 stereo PCM (1024 samples/channel at 44.1 kHz) until
 the event stream and voice pool run dry. Without an on-disk bank the
 registry-built decoder uses the pure-tone fallback; for SoundFont 2
@@ -481,16 +574,23 @@ playback build a `MidiDecoder` directly with an `Sf2Instrument`.
 A `cargo-fuzz` harness covers every attacker-facing parser:
 
 ```
-cargo +nightly fuzz run smf    # smf::parse + iterators
-cargo +nightly fuzz run clip   # clip::parse + to_smf + write round trip
+cargo +nightly fuzz run smf    # smf::parse + iterators + both writers as fixed points
+cargo +nightly fuzz run clip   # clip::parse + writer fixed point + to_smf + native render
+cargo +nightly fuzz run ump    # UMP word stream: decode → encode → decode fixed point
 cargo +nightly fuzz run sf2    # instruments::sf2::Sf2Bank::parse
 cargo +nightly fuzz run dls    # instruments::dls::DlsBank::parse
 cargo +nightly fuzz run sfz    # instruments::sfz::parse_str
 ```
 
 Each target asserts arbitrary bytes return a `Result` with no panic /
-OOM / overflow / OOB. Curated seed corpora live under
-`fuzz/corpus/<target>/`.
+OOM / overflow / OOB; `smf` and `clip` additionally require the writers
+to be fixed points of the parsers (the SMF writer may refuse only the
+documented reader-tolerated shapes: a header `ntrks` disagreeing with
+the `MTrk` chunks present, a missing / misplaced End of Track, an
+`Unknown { 0x2F }` meta), and `clip` renders a bounded slice through
+the native MIDI 2.0 path. Curated seed corpora (including the
+fuzz-found regressions) live under `fuzz/corpus/<target>/`; the `Fuzz`
+workflow builds every target on nightly and smoke-runs each for 30 s.
 
 ## Profiling
 
@@ -518,6 +618,15 @@ drops the per-sample mod-env evaluation, the filter-coefficient drift
 check, and the biquad `filter_step`. On the dry SF2 dense score this
 takes the wall clock to ~55 ms (≈37 % under the round-378 baseline),
 again with every `--corpus` PCM hash unchanged.
+
+The SF2 §8.4.2 default modulator (velocity → filter cutoff) puts most
+notes on the filtered path, so the same dense score now renders in
+~122 ms with the biquad engaged. Three byte-identical hoists bring it to
+~90 ms (−27 %): the modulation envelope is evaluated only when a routing
+depth consumes it, a filter whose cutoff nothing modulates runs its
+coefficient drift check once per 256-frame block, and a static-filter
+inner loop keeps the biquad coefficients and delay line in locals (same
+expression order) — every `--corpus` PCM hash unchanged.
 
 ## License
 
