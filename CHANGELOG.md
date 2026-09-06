@@ -139,6 +139,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   {Hold,Decay}` (gens 31/32/39/40) and `scaleTuning` (gen 56) are
   honoured at plan time. Banks that set none of these render
   bit-identically (bench `--corpus` hashes unchanged).
+- **SoundFont 2 zone semantics + modulators** (sf2-spec-2.04 §7.3/§7.4/
+  §7.7/§7.8/§8.2/§8.3/§8.4.2/§9.4/§9.5.1): **global zones** — a first
+  preset / instrument zone without `instrument` / `sampleID` — used to
+  abort the whole preset lookup (`None` for banks that use them); they
+  now supply generators and modulators to every local zone with the
+  §9.4 precedence (local identical generator supersedes, global ranges
+  gate unless overridden). `pmod` / `imod` records are parsed
+  (`Modulator`) and evaluated at note-on for the sources known then —
+  No Controller, Note-On Velocity, Note-On Key Number, with the §8.2
+  direction / polarity / linear + switch types, Table 2 mappings, the
+  secondary amount source and the §8.3 absolute-value transform —
+  into every value generator the plan holds; §9.5.1 precedence: local
+  instrument modulators supersede global / default ones, preset-level
+  identical modulators add, others join the destination sum. The
+  **§8.4.2 default modulator** (Note-On Velocity → Initial Filter
+  Cutoff, −2400 cents, linear negative unipolar) is implicit and
+  supersedable — softer notes now open the low-pass less, as the
+  format intends, so the SF2 bench `--corpus` hashes changed
+  (dense `9aef0b4f1fa68115` → `3d347570b87e9336`, sparse
+  `02fd4d81f502791d` → `a7efae75622ee5c5`, note_on_off
+  `9c05f325ccac47d5` → `c54c32dd884d0705`); the pure-tone rows are
+  unchanged. Not evaluated: modulators sourced from live channel state
+  (MIDI CC palette, pressure, pitch wheel), linked chains, and the
+  concave / convex source types (the staged §8.2.4 formula is not
+  usable as printed — the §8.4.1 velocity→attenuation default keeps
+  the documented square-law approximation).
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-midi/compare/v0.0.4...v0.0.5) - 2026-08-31
 

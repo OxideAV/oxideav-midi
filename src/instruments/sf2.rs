@@ -248,6 +248,67 @@ pub const GEN_KEYNUM_TO_VOL_ENV_DECAY: u16 = 40;
 /// (the tempered semitone scale), 0 = key has no effect on pitch.
 pub const GEN_SCALE_TUNING: u16 = 56;
 
+/// One SoundFont modulator (`sfModList`, §7.4 / §7.8): source,
+/// destination generator, amount, amount source, transform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)] // internal: SF2 bank/voice plumbing exposed for tests
+pub struct Modulator {
+    /// `sfModSrcOper` — the §8.2 source enumeration (type / P / D / CC /
+    /// index bit fields).
+    pub src: u16,
+    /// `sfModDestOper` — a generator number, or a link (top bit set).
+    pub dest: u16,
+    /// `modAmount` — signed, in the destination's units.
+    pub amount: i16,
+    /// `sfModAmtSrcOper` — the secondary (amount) source enumeration.
+    pub amt_src: u16,
+    /// `sfModTransOper` — 0 linear, 2 absolute value (§8.3).
+    pub transform: u16,
+}
+
+impl Modulator {
+    /// §7.4: "A modulator is defined by its sfModSrcOper, its
+    /// sfModDestOper, and its sfModSrcAmtOper" — the identity used for
+    /// the §9.5.1 supersede / add rules.
+    fn identical(&self, other: &Self) -> bool {
+        self.src == other.src && self.dest == other.dest && self.amt_src == other.amt_src
+    }
+}
+
+/// Modulator source enumeration bit fields (§8.2).
+mod mod_src {
+    /// Index (bits 0..6): the controller number.
+    pub const INDEX_MASK: u16 = 0x007F;
+    /// CC flag (bit 7): MIDI Controller palette when set.
+    pub const CC: u16 = 0x0080;
+    /// Direction (bit 8): max → min when set.
+    pub const D: u16 = 0x0100;
+    /// Polarity (bit 9): bipolar when set.
+    pub const P: u16 = 0x0200;
+    /// Type (bits 10..15): 0 linear, 1 concave, 2 convex, 3 switch.
+    pub const TYPE_SHIFT: u16 = 10;
+    /// General Controller palette index: no controller (output 1).
+    pub const GC_NONE: u16 = 0;
+    /// General Controller palette index: note-on velocity.
+    pub const GC_VELOCITY: u16 = 2;
+    /// General Controller palette index: note-on key number.
+    pub const GC_KEY: u16 = 3;
+    /// General Controller palette index: link (not a value source).
+    pub const GC_LINK: u16 = 127;
+}
+
+/// The §8.4.2 default modulator: MIDI Note-On Velocity to Filter
+/// Cutoff — source `0x0102` (linear, negative unipolar, velocity),
+/// destination `initialFilterFc`, amount −2400 cents, no amount
+/// source, linear transform. Implicit at the instrument level.
+pub const DEFAULT_MOD_VELOCITY_TO_FILTER_FC: Modulator = Modulator {
+    src: 0x0102,
+    dest: GEN_INITIAL_FILTER_FC,
+    amount: -2400,
+    amt_src: 0,
+    transform: 0,
+};
+
 /// Absolute-cents → hertz (SF2 §8.1.3 "Abs Zero" 8.176 Hz):
 /// `8.176 × 2^(cents/1200)`.
 #[must_use]
@@ -291,6 +352,11 @@ pub struct Sf2Bank {
     pub ibags: Vec<Bag>,
     /// Instrument generators.
     pub igens: Vec<Generator>,
+    /// Preset zone modulators (`pmod`, §7.4) — sliced per zone by the
+    /// bags' `mod_start`.
+    pub pmods: Vec<Modulator>,
+    /// Instrument zone modulators (`imod`, §7.8).
+    pub imods: Vec<Modulator>,
     /// Concatenated PCM, as signed 24-bit values stored in `i32`s with
     /// the sample value occupying the lower 24 bits (sign-extended). For
     /// banks without an `sm24` chunk every value is the original 16-bit
@@ -743,6 +809,8 @@ impl Sf2Bank {
             pgens: pdta.pgen,
             ibags: pdta.ibag,
             igens: pdta.igen,
+            pmods: pdta.pmod,
+            imods: pdta.imod,
             sample_data: Arc::from(sample_data.into_boxed_slice()),
         })
     }
@@ -839,88 +907,318 @@ impl Sf2Bank {
             return None;
         }
 
-        // Walk every preset zone of this preset.
+        // §7.3: the first preset zone is a *global* zone when its last
+        // generator is not `instrument`; its generators and modulators
+        // apply to every local zone of the preset (§9.4 / §9.5.1:
+        // a local generator identical to a global one supersedes it —
+        // the concatenation below keeps the local copy last, and every
+        // lookup takes the last match). A later zone without an
+        // `instrument` generator is ignored.
+        let mut pglobal_gens: &[Generator] = &[];
+        let mut pglobal_mods: &[Modulator] = &[];
         for zone_idx in pbag_lo..pbag_hi {
             let bag = self.pbags[zone_idx];
             let next = self.pbags[zone_idx + 1];
             let gens = self
                 .pgens
                 .get(bag.gen_start as usize..next.gen_start as usize)?;
-            // Key/vel range filter.
-            let (klo, khi) = key_range(gens).unwrap_or((0, 127));
-            let (vlo, vhi) = vel_range(gens).unwrap_or((0, 127));
+            let mods = self
+                .pmods
+                .get(bag.mod_start as usize..next.mod_start as usize)
+                .unwrap_or(&[]);
+            let is_local = gens.last().is_some_and(|g| g.oper == GEN_INSTRUMENT);
+            if !is_local {
+                if zone_idx == pbag_lo && !(gens.is_empty() && mods.is_empty()) {
+                    pglobal_gens = gens;
+                    pglobal_mods = mods;
+                }
+                continue;
+            }
+            let eff_pgens: Vec<Generator> = pglobal_gens.iter().chain(gens).copied().collect();
+            // Key/vel range filter (a global range applies unless the
+            // local zone sets its own).
+            let (klo, khi) = key_range(&eff_pgens).unwrap_or((0, 127));
+            let (vlo, vhi) = vel_range(&eff_pgens).unwrap_or((0, 127));
             if key < klo || key > khi || velocity < vlo || velocity > vhi {
                 continue;
             }
-            // Find instrument index. Per spec, the `instrument` gen
-            // must be the **last** generator in the preset zone.
-            let inst_idx = gens
-                .iter()
-                .rev()
-                .find(|g| g.oper == GEN_INSTRUMENT)
-                .map(|g| g.amount as usize)?;
+            // The `instrument` generator is the last generator of a
+            // local preset zone (checked above).
+            let inst_idx = gens.last().map(|g| g.amount as usize)?;
             if inst_idx >= self.instruments.len() {
                 continue;
             }
-            // Walk the instrument's zones.
-            let inst = &self.instruments[inst_idx];
-            let next_ibag_end = self
-                .instruments
-                .get(inst_idx + 1)
-                .map(|i| i.ibag_start as usize)
-                .unwrap_or_else(|| self.ibags.len().saturating_sub(1));
-            let ilo = inst.ibag_start as usize;
-            let ihi = next_ibag_end;
-            if ihi > self.ibags.len().saturating_sub(1) || ilo > ihi {
-                continue;
-            }
-            for izone_idx in ilo..ihi {
-                let ibag = self.ibags[izone_idx];
-                let inext = self.ibags[izone_idx + 1];
-                let igens = self
-                    .igens
-                    .get(ibag.gen_start as usize..inext.gen_start as usize)?;
-                let (klo, khi) = key_range(igens).unwrap_or((0, 127));
-                let (vlo, vhi) = vel_range(igens).unwrap_or((0, 127));
-                if key < klo || key > khi || velocity < vlo || velocity > vhi {
-                    continue;
-                }
-                let sample_idx = igens
-                    .iter()
-                    .rev()
-                    .find(|g| g.oper == GEN_SAMPLE_ID)
-                    .map(|g| g.amount as usize)?;
-                if sample_idx >= self.samples.len() {
-                    continue;
-                }
-                let sample = &self.samples[sample_idx];
-                let mut plan = SamplePlan::from_zones(sample, igens, gens, key);
-                // If this sample is half of a stereo pair, link the
-                // partner so the voice can pull both channels in lock-
-                // step. We require the partner to live within `samples`
-                // (already bounds-checked at parse time) and to point
-                // back at us — the SF2 spec promises bidirectional
-                // links for genuine pairs.
-                if (sample.sample_type & (sample_type_bits::LEFT | sample_type_bits::RIGHT)) != 0 {
-                    let partner = sample.sample_link as usize;
-                    if partner != sample_idx
-                        && partner < self.samples.len()
-                        && self.samples[partner].sample_link as usize == sample_idx
-                    {
-                        let p = &self.samples[partner];
-                        plan.stereo_pair = Some(StereoPair {
-                            start: p.start,
-                            end: p.end,
-                            start_loop: p.start_loop,
-                            end_loop: p.end_loop,
-                            sample_rate: p.sample_rate.max(1),
-                        });
-                    }
-                }
+            let preset_mods = merge_modulators(pglobal_mods, mods, MergeRule::Supersede);
+            if let Some(plan) =
+                self.resolve_instrument(inst_idx, &eff_pgens, &preset_mods, key, velocity)
+            {
                 return Some(plan);
             }
         }
         None
+    }
+
+    /// Walk one instrument's zones for `(key, velocity)` with the
+    /// effective preset generators / modulators already resolved.
+    fn resolve_instrument(
+        &self,
+        inst_idx: usize,
+        pgens: &[Generator],
+        preset_mods: &[Modulator],
+        key: u8,
+        velocity: u8,
+    ) -> Option<SamplePlan> {
+        let inst = &self.instruments[inst_idx];
+        let next_ibag_end = self
+            .instruments
+            .get(inst_idx + 1)
+            .map(|i| i.ibag_start as usize)
+            .unwrap_or_else(|| self.ibags.len().saturating_sub(1));
+        let ilo = inst.ibag_start as usize;
+        let ihi = next_ibag_end;
+        if ihi > self.ibags.len().saturating_sub(1) || ilo > ihi {
+            return None;
+        }
+        // §7.7: the first instrument zone is global when its last
+        // generator is not `sampleID`.
+        let mut iglobal_gens: &[Generator] = &[];
+        let mut iglobal_mods: &[Modulator] = &[];
+        for izone_idx in ilo..ihi {
+            let ibag = self.ibags[izone_idx];
+            let inext = self.ibags[izone_idx + 1];
+            let igens = self
+                .igens
+                .get(ibag.gen_start as usize..inext.gen_start as usize)?;
+            let imods = self
+                .imods
+                .get(ibag.mod_start as usize..inext.mod_start as usize)
+                .unwrap_or(&[]);
+            let is_local = igens.last().is_some_and(|g| g.oper == GEN_SAMPLE_ID);
+            if !is_local {
+                if izone_idx == ilo && !(igens.is_empty() && imods.is_empty()) {
+                    iglobal_gens = igens;
+                    iglobal_mods = imods;
+                }
+                continue;
+            }
+            let eff_igens: Vec<Generator> = iglobal_gens.iter().chain(igens).copied().collect();
+            let (klo, khi) = key_range(&eff_igens).unwrap_or((0, 127));
+            let (vlo, vhi) = vel_range(&eff_igens).unwrap_or((0, 127));
+            if key < klo || key > khi || velocity < vlo || velocity > vhi {
+                continue;
+            }
+            let sample_idx = igens.last().map(|g| g.amount as usize)?;
+            if sample_idx >= self.samples.len() {
+                continue;
+            }
+            let sample = &self.samples[sample_idx];
+            let mut plan = SamplePlan::from_zones(sample, &eff_igens, pgens, key);
+            // Modulators (§9.5.1 precedence): the default set, superseded
+            // by identical instrument modulators (global, then local),
+            // with preset-level modulators adding to identical ones or
+            // joining the destination sum.
+            let inst_mods = merge_modulators(iglobal_mods, imods, MergeRule::Supersede);
+            let with_defaults = merge_modulators(
+                &[DEFAULT_MOD_VELOCITY_TO_FILTER_FC],
+                &inst_mods,
+                MergeRule::Supersede,
+            );
+            let all = merge_modulators(&with_defaults, preset_mods, MergeRule::Add);
+            apply_modulators(&mut plan, &all, key, velocity);
+            // If this sample is half of a stereo pair, link the
+            // partner so the voice can pull both channels in lock-
+            // step. We require the partner to live within `samples`
+            // (already bounds-checked at parse time) and to point
+            // back at us — the SF2 spec promises bidirectional
+            // links for genuine pairs.
+            if (sample.sample_type & (sample_type_bits::LEFT | sample_type_bits::RIGHT)) != 0 {
+                let partner = sample.sample_link as usize;
+                if partner != sample_idx
+                    && partner < self.samples.len()
+                    && self.samples[partner].sample_link as usize == sample_idx
+                {
+                    let p = &self.samples[partner];
+                    plan.stereo_pair = Some(StereoPair {
+                        start: p.start,
+                        end: p.end,
+                        start_loop: p.start_loop,
+                        end_loop: p.end_loop,
+                        sample_rate: p.sample_rate.max(1),
+                    });
+                }
+            }
+            return Some(plan);
+        }
+        None
+    }
+}
+
+/// How a later modulator list combines with an earlier one (§9.5.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MergeRule {
+    /// A later modulator identical to an earlier one replaces it
+    /// (local instrument zone over global / default).
+    Supersede,
+    /// A later modulator identical to an earlier one adds its amount
+    /// (preset level over instrument level); others join the list.
+    Add,
+}
+
+/// Combine `over` into `base` under `rule`. Within a single list a
+/// repeated identity keeps the later entry (§7.4: "the first modulator
+/// will be ignored"). Modulators whose destination is a link (top bit
+/// set) or whose source is the `link` controller are dropped — this
+/// synth evaluates no linked chains.
+fn merge_modulators(base: &[Modulator], over: &[Modulator], rule: MergeRule) -> Vec<Modulator> {
+    let usable = |m: &Modulator| {
+        m.dest & 0x8000 == 0
+            && (m.src & mod_src::CC != 0 || m.src & mod_src::INDEX_MASK != mod_src::GC_LINK)
+            && (m.amt_src & mod_src::CC != 0 || m.amt_src & mod_src::INDEX_MASK != mod_src::GC_LINK)
+    };
+    let mut out: Vec<Modulator> = Vec::new();
+    for m in base.iter().filter(|m| usable(m)) {
+        if let Some(slot) = out.iter_mut().find(|e| e.identical(m)) {
+            *slot = *m;
+        } else {
+            out.push(*m);
+        }
+    }
+    for m in over.iter().filter(|m| usable(m)) {
+        match out.iter_mut().find(|e| e.identical(m)) {
+            Some(slot) => match rule {
+                MergeRule::Supersede => *slot = *m,
+                MergeRule::Add => slot.amount = slot.amount.saturating_add(m.amount),
+            },
+            None => out.push(*m),
+        }
+    }
+    out
+}
+
+/// Map a modulator source to the `−1..=1` controller domain (§8.2,
+/// §9.5.3 Table 2) for the sources known at note-on: the General
+/// Controller palette's *No Controller* (output 1), *Note-On
+/// Velocity* and *Note-On Key Number*. Sources that need live channel
+/// state (pressure, pitch wheel, the MIDI Controller palette) are not
+/// available when a voice is built and yield `None` — the modulator
+/// is skipped. Types 1 / 2 (concave / convex) are also skipped: the
+/// staged spec's §8.2.4 curve formula is not usable as printed.
+fn map_source(src: u16, key: u8, velocity: u8) -> Option<f32> {
+    if src & mod_src::CC != 0 {
+        return None;
+    }
+    let native: f32 = match src & mod_src::INDEX_MASK {
+        mod_src::GC_NONE => return Some(1.0),
+        mod_src::GC_VELOCITY => f32::from(velocity.min(127)),
+        mod_src::GC_KEY => f32::from(key.min(127)),
+        _ => return None,
+    };
+    let kind = src >> mod_src::TYPE_SHIFT;
+    // Direction: D = 1 runs max → min (§8.2.2), mirroring the native
+    // position on the 0..=127 scale.
+    let pos = if src & mod_src::D != 0 {
+        127.0 - native
+    } else {
+        native
+    };
+    // Table 2: unipolar 0 → 0, 127 → 127/128; bipolar 0 → −1.
+    let unipolar = pos / 128.0;
+    let shaped = match kind {
+        0 => unipolar,
+        // §8.2.4 Switch: minimum until half of the maximum, then maximum.
+        3 => {
+            if pos < 64.0 {
+                0.0
+            } else {
+                127.0 / 128.0
+            }
+        }
+        _ => return None,
+    };
+    Some(if src & mod_src::P != 0 {
+        2.0 * shaped - 1.0
+    } else {
+        shaped
+    })
+}
+
+/// Evaluate the note-on-time modulators (§9.5.1: `destination +=
+/// Transform(Amount × Map(primary) × Map(secondary))`) into the plan's
+/// generator fields.
+fn apply_modulators(plan: &mut SamplePlan, mods: &[Modulator], key: u8, velocity: u8) {
+    let mut tune_cents = 0.0f32;
+    for m in mods {
+        let (Some(p), Some(a)) = (
+            map_source(m.src, key, velocity),
+            map_source(m.amt_src, key, velocity),
+        ) else {
+            continue;
+        };
+        let mut v = f32::from(m.amount) * p * a;
+        match m.transform {
+            0 => {}
+            // §8.3 Absolute Value.
+            2 => v = v.abs(),
+            _ => continue,
+        }
+        let vi = v.round() as i32;
+        match m.dest {
+            GEN_INITIAL_ATTENUATION => plan.initial_attenuation_cb += vi,
+            GEN_INITIAL_FILTER_FC => plan.initial_filter_fc_cents += vi,
+            GEN_INITIAL_FILTER_Q => plan.initial_filter_q_cb += vi,
+            GEN_PAN => plan.pan_per_mille = (plan.pan_per_mille + vi).clamp(-500, 500),
+            GEN_CHORUS_EFFECTS_SEND => {
+                plan.chorus_send_per_mille = (plan.chorus_send_per_mille + vi).clamp(0, 1000);
+            }
+            GEN_REVERB_EFFECTS_SEND => {
+                plan.reverb_send_per_mille = (plan.reverb_send_per_mille + vi).clamp(0, 1000);
+            }
+            GEN_MOD_LFO_TO_PITCH => plan.mod_lfo_to_pitch_cents += vi,
+            GEN_VIB_LFO_TO_PITCH => plan.vib_lfo_to_pitch_cents += vi,
+            GEN_MOD_ENV_TO_PITCH => plan.mod_env_to_pitch_cents += vi,
+            GEN_MOD_LFO_TO_FILTER_FC => plan.mod_lfo_to_filter_cents += vi,
+            GEN_MOD_ENV_TO_FILTER_FC => plan.mod_env_to_filter_cents += vi,
+            GEN_MOD_LFO_TO_VOLUME => plan.mod_lfo_to_volume_cb += vi,
+            GEN_DELAY_MOD_LFO => plan.mod_lfo_delay_tc = add_tc(plan.mod_lfo_delay_tc, vi),
+            GEN_FREQ_MOD_LFO => plan.mod_lfo_freq_cents += vi,
+            GEN_DELAY_VIB_LFO => plan.vib_lfo_delay_tc = add_tc(plan.vib_lfo_delay_tc, vi),
+            GEN_FREQ_VIB_LFO => plan.vib_lfo_freq_cents += vi,
+            GEN_DELAY_MOD_ENV => plan.mod_env.delay_tc = add_tc(plan.mod_env.delay_tc, vi),
+            GEN_ATTACK_MOD_ENV => plan.mod_env.attack_tc = add_tc(plan.mod_env.attack_tc, vi),
+            GEN_HOLD_MOD_ENV => plan.mod_env.hold_tc = add_tc(plan.mod_env.hold_tc, vi),
+            GEN_DECAY_MOD_ENV => plan.mod_env.decay_tc = add_tc(plan.mod_env.decay_tc, vi),
+            GEN_SUSTAIN_MOD_ENV => {
+                plan.mod_env.sustain_per_mille =
+                    (plan.mod_env.sustain_per_mille + vi).clamp(0, 1000);
+            }
+            GEN_RELEASE_MOD_ENV => plan.mod_env.release_tc = add_tc(plan.mod_env.release_tc, vi),
+            GEN_DELAY_VOL_ENV => plan.env.delay_tc = add_tc(plan.env.delay_tc, vi),
+            GEN_ATTACK_VOL_ENV => plan.env.attack_tc = add_tc(plan.env.attack_tc, vi),
+            GEN_HOLD_VOL_ENV => plan.env.hold_tc = add_tc(plan.env.hold_tc, vi),
+            GEN_DECAY_VOL_ENV => plan.env.decay_tc = add_tc(plan.env.decay_tc, vi),
+            GEN_SUSTAIN_VOL_ENV => plan.env.sustain_cb = (plan.env.sustain_cb + vi).max(0),
+            GEN_RELEASE_VOL_ENV => plan.env.release_tc = add_tc(plan.env.release_tc, vi),
+            GEN_COARSE_TUNE => tune_cents += v * 100.0,
+            GEN_FINE_TUNE => tune_cents += v,
+            _ => {}
+        }
+    }
+    if tune_cents != 0.0 {
+        plan.fine_cents += tune_cents.round() as i32;
+        plan.pitch_ratio *= (2f64).powf(f64::from(tune_cents) / 1200.0);
+    }
+}
+
+/// Add a modulator amount (timecents) to an envelope / LFO time that
+/// may still be the "unset" sentinel: the sum starts from the §8.1.3
+/// default (−12000 tc).
+fn add_tc(tc: i32, delta: i32) -> i32 {
+    if delta == 0 {
+        tc
+    } else if tc == i32::MIN {
+        -12_000 + delta
+    } else {
+        tc + delta
     }
 }
 
@@ -1342,18 +1640,24 @@ impl SamplePlan {
 }
 
 fn key_range(gens: &[Generator]) -> Option<(u8, u8)> {
-    gens.iter().find(|g| g.oper == GEN_KEY_RANGE).map(|g| {
-        let (lo, hi) = g.amount_lo_hi();
-        // Spec quirk: low byte = lo, high byte = hi.
-        (lo.min(127), hi.min(127).max(lo))
-    })
+    gens.iter()
+        .rev()
+        .find(|g| g.oper == GEN_KEY_RANGE)
+        .map(|g| {
+            let (lo, hi) = g.amount_lo_hi();
+            // Spec quirk: low byte = lo, high byte = hi.
+            (lo.min(127), hi.min(127).max(lo))
+        })
 }
 
 fn vel_range(gens: &[Generator]) -> Option<(u8, u8)> {
-    gens.iter().find(|g| g.oper == GEN_VEL_RANGE).map(|g| {
-        let (lo, hi) = g.amount_lo_hi();
-        (lo.min(127), hi.min(127).max(lo))
-    })
+    gens.iter()
+        .rev()
+        .find(|g| g.oper == GEN_VEL_RANGE)
+        .map(|g| {
+            let (lo, hi) = g.amount_lo_hi();
+            (lo.min(127), hi.min(127).max(lo))
+        })
 }
 
 fn generator_amount(gens: &[Generator], oper: u16) -> Option<u16> {
@@ -1432,9 +1736,11 @@ fn parse_sdta(body: &[u8]) -> Result<(&[u8], &[u8])> {
 struct Pdta {
     phdr: Vec<PresetHeader>,
     pbag: Vec<Bag>,
+    pmod: Vec<Modulator>,
     pgen: Vec<Generator>,
     inst: Vec<InstrumentHeader>,
     ibag: Vec<Bag>,
+    imod: Vec<Modulator>,
     igen: Vec<Generator>,
     shdr: Vec<SampleHeader>,
 }
@@ -1467,16 +1773,18 @@ impl Pdta {
         let mut ibag_raw: &[u8] = &[];
         let mut igen_raw: &[u8] = &[];
         let mut shdr_raw: &[u8] = &[];
+        let mut pmod_raw: &[u8] = &[];
+        let mut imod_raw: &[u8] = &[];
         while !c.at_end() {
             let (tag, payload) = read_chunk(&mut c)?;
             match &tag {
                 b"phdr" => phdr_raw = payload,
                 b"pbag" => pbag_raw = payload,
-                b"pmod" => check_record(payload, PMOD_RECORD, "pmod")?,
+                b"pmod" => pmod_raw = payload,
                 b"pgen" => pgen_raw = payload,
                 b"inst" => inst_raw = payload,
                 b"ibag" => ibag_raw = payload,
-                b"imod" => check_record(payload, IMOD_RECORD, "imod")?,
+                b"imod" => imod_raw = payload,
                 b"igen" => igen_raw = payload,
                 b"shdr" => shdr_raw = payload,
                 _ => { /* unknown pdta sub-chunk; ignore */ }
@@ -1485,9 +1793,11 @@ impl Pdta {
 
         let phdr = parse_phdr(phdr_raw)?;
         let pbag = parse_bag(pbag_raw, "pbag")?;
+        let pmod = parse_mod(pmod_raw, "pmod", PMOD_RECORD)?;
         let pgen = parse_gen(pgen_raw, "pgen")?;
         let inst = parse_inst(inst_raw)?;
         let ibag = parse_bag(ibag_raw, "ibag")?;
+        let imod = parse_mod(imod_raw, "imod", IMOD_RECORD)?;
         let igen = parse_gen(igen_raw, "igen")?;
         let shdr = parse_shdr(shdr_raw)?;
 
@@ -1536,13 +1846,34 @@ impl Pdta {
         Ok(Self {
             phdr,
             pbag,
+            pmod,
             pgen,
             inst,
             ibag,
+            imod,
             igen,
             shdr,
         })
     }
+}
+
+/// Parse a `pmod` / `imod` sub-chunk (§7.4 / §7.8: ten-byte
+/// `sfModList` records, terminal record included).
+fn parse_mod(body: &[u8], what: &str, record: usize) -> Result<Vec<Modulator>> {
+    check_record(body, record, what)?;
+    let n = body.len() / record;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let r = &body[i * record..(i + 1) * record];
+        out.push(Modulator {
+            src: u16::from_le_bytes([r[0], r[1]]),
+            dest: u16::from_le_bytes([r[2], r[3]]),
+            amount: i16::from_le_bytes([r[4], r[5]]),
+            amt_src: u16::from_le_bytes([r[6], r[7]]),
+            transform: u16::from_le_bytes([r[8], r[9]]),
+        });
+    }
+    Ok(out)
 }
 
 fn check_record(body: &[u8], record_size: usize, what: &str) -> Result<()> {
@@ -3072,6 +3403,48 @@ mod tests {
     /// The looping fixture with extra instrument-zone generators
     /// (placed before `sampleModes` / `sampleID`, which must stay last).
     fn build_looping_sf2_with_igens(extra: &[(u16, u16)]) -> Vec<u8> {
+        build_sf2(&FixtureSpec {
+            ilocal: extra.to_vec(),
+            ..FixtureSpec::default()
+        })
+    }
+
+    /// Zone layout for [`build_sf2`]: optional global preset /
+    /// instrument zones (§7.3 / §7.7) with their own generators and
+    /// modulators, plus the local zones' extras.
+    #[derive(Default)]
+    struct FixtureSpec {
+        /// Global preset zone generators (a global zone is emitted only
+        /// when this or `pglobal_mods` is non-empty).
+        pglobal: Vec<(u16, u16)>,
+        pglobal_mods: Vec<Modulator>,
+        /// Local preset zone generators (before `instrument`).
+        plocal: Vec<(u16, u16)>,
+        /// Local preset zone modulators.
+        pmods: Vec<Modulator>,
+        /// Global instrument zone generators / modulators.
+        iglobal: Vec<(u16, u16)>,
+        iglobal_mods: Vec<Modulator>,
+        /// Local instrument zone generators (before `sampleModes` /
+        /// `sampleID`).
+        ilocal: Vec<(u16, u16)>,
+        /// Local instrument zone modulators.
+        imods: Vec<Modulator>,
+    }
+
+    fn mod_record(m: &Modulator) -> [u8; PMOD_RECORD] {
+        let mut r = [0u8; PMOD_RECORD];
+        r[0..2].copy_from_slice(&m.src.to_le_bytes());
+        r[2..4].copy_from_slice(&m.dest.to_le_bytes());
+        r[4..6].copy_from_slice(&m.amount.to_le_bytes());
+        r[6..8].copy_from_slice(&m.amt_src.to_le_bytes());
+        r[8..10].copy_from_slice(&m.transform.to_le_bytes());
+        r
+    }
+
+    /// One preset → one instrument → the 20-frame looping ramp, with
+    /// the zone layout of `spec`.
+    fn build_sf2(spec: &FixtureSpec) -> Vec<u8> {
         // 20-frame ramp.
         let mut samples: Vec<i16> = Vec::with_capacity(20);
         for i in 0i32..20 {
@@ -3103,31 +3476,79 @@ mod tests {
 
         // ---- pdta with loop mode set ----
         let mut phdr = Vec::new();
+        let pglobal_present = !spec.pglobal.is_empty() || !spec.pglobal_mods.is_empty();
+        let iglobal_present = !spec.iglobal.is_empty() || !spec.iglobal_mods.is_empty();
+        let n_pzones = 1 + usize::from(pglobal_present);
+        let n_izones = 1 + usize::from(iglobal_present);
         phdr.extend_from_slice(&phdr_record("Test Preset", 0, 0, 0));
-        phdr.extend_from_slice(&phdr_record("EOP", 0, 0, 1));
+        phdr.extend_from_slice(&phdr_record("EOP", 0, 0, n_pzones as u16));
+        // Preset zones: [global?] then the local zone ending in
+        // `instrument`.
         let mut pbag = Vec::new();
-        pbag.extend_from_slice(&bag_record(0, 0));
-        pbag.extend_from_slice(&bag_record(1, 0));
-        let pmod = vec![0u8; PMOD_RECORD];
         let mut pgen = Vec::new();
+        let mut pmod = Vec::new();
+        if pglobal_present {
+            pbag.extend_from_slice(&bag_record(0, 0));
+            for &(oper, amount) in &spec.pglobal {
+                pgen.extend_from_slice(&gen_record(oper, amount));
+            }
+            for m in &spec.pglobal_mods {
+                pmod.extend_from_slice(&mod_record(m));
+            }
+        }
+        pbag.extend_from_slice(&bag_record(
+            (pgen.len() / PGEN_RECORD) as u16,
+            (pmod.len() / PMOD_RECORD) as u16,
+        ));
+        for &(oper, amount) in &spec.plocal {
+            pgen.extend_from_slice(&gen_record(oper, amount));
+        }
         pgen.extend_from_slice(&gen_record(GEN_INSTRUMENT, 0));
+        for m in &spec.pmods {
+            pmod.extend_from_slice(&mod_record(m));
+        }
+        // Terminal bag + records.
+        pbag.extend_from_slice(&bag_record(
+            (pgen.len() / PGEN_RECORD) as u16,
+            (pmod.len() / PMOD_RECORD) as u16,
+        ));
         pgen.extend_from_slice(&gen_record(0, 0));
+        pmod.extend_from_slice(&[0u8; PMOD_RECORD]);
         let mut inst_chunk = Vec::new();
         inst_chunk.extend_from_slice(&inst_record("Test Inst", 0));
-        inst_chunk.extend_from_slice(&inst_record("EOI", 2));
+        inst_chunk.extend_from_slice(&inst_record("EOI", n_izones as u16));
+        // Instrument zones: [global?] then the local zone ending in
+        // `sampleModes`, `sampleID`.
         let mut ibag = Vec::new();
-        ibag.extend_from_slice(&bag_record(0, 0));
-        ibag.extend_from_slice(&bag_record((2 + extra.len()) as u16, 0));
-        let imod = vec![0u8; IMOD_RECORD];
-        // igen: extras, sampleModes=1 *then* sampleID=0 (sampleID must
-        // be last).
         let mut igen = Vec::new();
-        for &(oper, amount) in extra {
+        let mut imod = Vec::new();
+        if iglobal_present {
+            ibag.extend_from_slice(&bag_record(0, 0));
+            for &(oper, amount) in &spec.iglobal {
+                igen.extend_from_slice(&gen_record(oper, amount));
+            }
+            for m in &spec.iglobal_mods {
+                imod.extend_from_slice(&mod_record(m));
+            }
+        }
+        ibag.extend_from_slice(&bag_record(
+            (igen.len() / IGEN_RECORD) as u16,
+            (imod.len() / IMOD_RECORD) as u16,
+        ));
+        for &(oper, amount) in &spec.ilocal {
             igen.extend_from_slice(&gen_record(oper, amount));
         }
         igen.extend_from_slice(&gen_record(GEN_SAMPLE_MODES, 1));
         igen.extend_from_slice(&gen_record(GEN_SAMPLE_ID, 0));
+        for m in &spec.imods {
+            imod.extend_from_slice(&mod_record(m));
+        }
+        ibag.extend_from_slice(&bag_record(
+            (igen.len() / IGEN_RECORD) as u16,
+            (imod.len() / IMOD_RECORD) as u16,
+        ));
         igen.extend_from_slice(&gen_record(0, 0));
+        imod.extend_from_slice(&[0u8; IMOD_RECORD]);
         let mut shdr = Vec::new();
         shdr.extend_from_slice(&shdr_record("RampLoop", 0, 20, 5, 15, 22050, 60, 0, 0, 1));
         shdr.extend_from_slice(&shdr_record("EOS", 0, 0, 0, 0, 0, 0, 0, 0, 0));
@@ -3338,13 +3759,13 @@ mod tests {
         b.set_pressure(1.0);
         let buf_a = render_frames(&mut a, 4096);
         let buf_b = render_frames(&mut b, 4096);
-        let peak = |v: &[f32]| v[200..].iter().map(|s| s.abs()).fold(0.0, f32::max);
-        let (pa, pb) = (peak(&buf_a), peak(&buf_b));
-        assert!(
-            (pa - pb).abs() < pa * 0.05,
-            "no gain change: a={pa}, b={pb}"
-        );
         assert_ne!(buf_a, buf_b, "pressure must sway the pitch");
+        // The exact contract: no gain response, a 50-cent vibrato depth.
+        let plan = inst.bank.resolve(0, 60, 100).unwrap();
+        let mut probe = Sf2Voice::from_plan(inst.bank.sample_data.clone(), &plan, 100, 22_050);
+        probe.set_pressure(1.0);
+        assert_eq!(probe.pressure_gain, 1.0);
+        assert_eq!(probe.pressure_vib_cents, 50.0 * 127.0 / 128.0);
         // CC 1 through the mixer's mod-depth hook does the same
         // (§8.4.4), and zero depth is exactly the dry voice.
         let mut c = inst.make_voice(0, 60, 100, 22_050).unwrap();
@@ -3509,6 +3930,218 @@ mod tests {
         assert!((v.vib_lfo_period - period / 2.0).abs() < 1e-3);
         assert_eq!(v.vib_lfo_to_pitch_cents, depth * 2.0);
         assert_eq!(v.vib_lfo_delay, delay / 2);
+    }
+
+    fn bank_of(spec: &FixtureSpec) -> Sf2Bank {
+        Sf2Bank::parse(&build_sf2(spec)).unwrap()
+    }
+
+    #[test]
+    fn global_zones_no_longer_break_resolution_and_supply_defaults() {
+        // §7.3 / §7.7: a first zone without `instrument` / `sampleID`
+        // is global; its generators apply to every local zone.
+        let spec = FixtureSpec {
+            pglobal: vec![(GEN_INITIAL_ATTENUATION, 100)],
+            iglobal: vec![(GEN_INITIAL_FILTER_FC, 5000), (GEN_PAN, 300)],
+            ..FixtureSpec::default()
+        };
+        let bank = bank_of(&spec);
+        assert_eq!(bank.pbags.len(), 3, "global + local + sentinel");
+        let plan = bank.resolve(0, 60, 127).expect("global zones must resolve");
+        assert_eq!(plan.initial_attenuation_cb, 100);
+        assert_eq!(plan.initial_filter_fc_cents, 5000);
+        assert_eq!(plan.pan_per_mille, 300);
+        // A local generator identical to a global one supersedes it
+        // (§9.4); the other global generators stay in force.
+        let spec = FixtureSpec {
+            iglobal: vec![(GEN_INITIAL_FILTER_FC, 5000), (GEN_PAN, 300)],
+            ilocal: vec![(GEN_INITIAL_FILTER_FC, 7000)],
+            ..FixtureSpec::default()
+        };
+        let plan = bank_of(&spec).resolve(0, 60, 127).unwrap();
+        assert_eq!(plan.initial_filter_fc_cents, 7000);
+        assert_eq!(plan.pan_per_mille, 300);
+        // A global key range gates the local zones unless overridden.
+        let spec = FixtureSpec {
+            iglobal: vec![(GEN_KEY_RANGE, 60 | (72 << 8))],
+            ..FixtureSpec::default()
+        };
+        let bank = bank_of(&spec);
+        assert!(bank.resolve(0, 66, 100).is_some());
+        assert!(bank.resolve(0, 50, 100).is_none());
+        let spec = FixtureSpec {
+            iglobal: vec![(GEN_KEY_RANGE, 60 | (72 << 8))],
+            ilocal: vec![(GEN_KEY_RANGE, 127 << 8)],
+            ..FixtureSpec::default()
+        };
+        assert!(bank_of(&spec).resolve(0, 50, 100).is_some());
+    }
+
+    #[test]
+    fn explicit_modulators_evaluate_note_on_sources() {
+        // Velocity (positive unipolar linear, 0x0002) → pan, 500: at
+        // velocity 64 the pan moves 500 × 64/128 = 250 (Table 2).
+        let vel_to_pan = Modulator {
+            src: 0x0002,
+            dest: GEN_PAN,
+            amount: 500,
+            amt_src: 0,
+            transform: 0,
+        };
+        let spec = FixtureSpec {
+            imods: vec![vel_to_pan],
+            ..FixtureSpec::default()
+        };
+        let bank = bank_of(&spec);
+        assert_eq!(bank.resolve(0, 60, 64).unwrap().pan_per_mille, 250);
+        assert_eq!(bank.resolve(0, 60, 0).unwrap().pan_per_mille, 0);
+        assert_eq!(bank.resolve(0, 60, 127).unwrap().pan_per_mille, 496);
+        // Key number, negative direction (0x0103): key 127 → 0, key 0 →
+        // 127/128 of the amount; bipolar velocity (0x0202) centred.
+        let key_to_att = Modulator {
+            src: 0x0103,
+            dest: GEN_INITIAL_ATTENUATION,
+            amount: 128,
+            amt_src: 0,
+            transform: 0,
+        };
+        let vel_bipolar = Modulator {
+            src: 0x0202,
+            dest: GEN_FINE_TUNE,
+            amount: 64,
+            amt_src: 0,
+            transform: 0,
+        };
+        let spec = FixtureSpec {
+            imods: vec![key_to_att, vel_bipolar],
+            ..FixtureSpec::default()
+        };
+        let bank = bank_of(&spec);
+        assert_eq!(bank.resolve(0, 127, 64).unwrap().initial_attenuation_cb, 0);
+        assert_eq!(bank.resolve(0, 0, 64).unwrap().initial_attenuation_cb, 127);
+        // Bipolar velocity 64 → 0, velocity 0 → −1 × 64 = −64 cents.
+        assert_eq!(bank.resolve(0, 60, 64).unwrap().fine_cents, 0);
+        assert_eq!(bank.resolve(0, 60, 0).unwrap().fine_cents, -64);
+        // Amount source (secondary) multiplies; absolute-value
+        // transform (§8.3); a MIDI-CC-palette source (live state) and a
+        // concave source are skipped at note-on.
+        let two_sources = Modulator {
+            src: 0x0002,
+            dest: GEN_PAN,
+            amount: -1000,
+            amt_src: 0x0003, // × key/128
+            transform: 2,    // |x|
+        };
+        let cc_sourced = Modulator {
+            src: 0x0081, // CC 1
+            dest: GEN_PAN,
+            amount: 500,
+            amt_src: 0,
+            transform: 0,
+        };
+        let concave = Modulator {
+            src: 0x0402,
+            dest: GEN_PAN,
+            amount: 500,
+            amt_src: 0,
+            transform: 0,
+        };
+        let spec = FixtureSpec {
+            imods: vec![two_sources, cc_sourced, concave],
+            ..FixtureSpec::default()
+        };
+        // velocity 64 → 0.5, key 64 → 0.5: |−1000 × 0.25| = 250.
+        assert_eq!(
+            bank_of(&spec).resolve(0, 64, 64).unwrap().pan_per_mille,
+            250
+        );
+        // Switch type (3): below half → 0, at/above → 127/128.
+        let switch = Modulator {
+            src: 0x0C02,
+            dest: GEN_PAN,
+            amount: 128,
+            amt_src: 0,
+            transform: 0,
+        };
+        let spec = FixtureSpec {
+            imods: vec![switch],
+            ..FixtureSpec::default()
+        };
+        let bank = bank_of(&spec);
+        assert_eq!(bank.resolve(0, 60, 63).unwrap().pan_per_mille, 0);
+        assert_eq!(bank.resolve(0, 60, 64).unwrap().pan_per_mille, 127);
+    }
+
+    #[test]
+    fn modulator_precedence_local_supersedes_global_and_preset_adds() {
+        let vel_to_pan = |amount: i16| Modulator {
+            src: 0x0002,
+            dest: GEN_PAN,
+            amount,
+            amt_src: 0,
+            transform: 0,
+        };
+        // Global 500 superseded by local 100 → 50 at velocity 64.
+        let spec = FixtureSpec {
+            iglobal_mods: vec![vel_to_pan(500)],
+            imods: vec![vel_to_pan(100)],
+            ..FixtureSpec::default()
+        };
+        assert_eq!(bank_of(&spec).resolve(0, 60, 64).unwrap().pan_per_mille, 50);
+        // A preset-level identical modulator adds: (100 + 100) × 0.5.
+        let spec = FixtureSpec {
+            iglobal_mods: vec![vel_to_pan(500)],
+            imods: vec![vel_to_pan(100)],
+            pmods: vec![vel_to_pan(100)],
+            ..FixtureSpec::default()
+        };
+        assert_eq!(
+            bank_of(&spec).resolve(0, 60, 64).unwrap().pan_per_mille,
+            100
+        );
+        // A local preset modulator supersedes a global preset one, then
+        // adds to the instrument level: (100 + 300) × 0.5.
+        let spec = FixtureSpec {
+            imods: vec![vel_to_pan(100)],
+            pglobal_mods: vec![vel_to_pan(900)],
+            pmods: vec![vel_to_pan(300)],
+            ..FixtureSpec::default()
+        };
+        assert_eq!(
+            bank_of(&spec).resolve(0, 60, 64).unwrap().pan_per_mille,
+            200
+        );
+        // Non-identical modulators (different source) both apply.
+        let key_to_pan = Modulator {
+            src: 0x0003,
+            dest: GEN_PAN,
+            amount: 128,
+            amt_src: 0,
+            transform: 0,
+        };
+        let spec = FixtureSpec {
+            imods: vec![vel_to_pan(100), key_to_pan],
+            ..FixtureSpec::default()
+        };
+        // 100 × 0.5 + 128 × 64/128 = 50 + 64.
+        assert_eq!(
+            bank_of(&spec).resolve(0, 64, 64).unwrap().pan_per_mille,
+            114
+        );
+        // Linked destinations are ignored; the records still parse.
+        let linked = Modulator {
+            src: 0x0002,
+            dest: 0x8000 | 1,
+            amount: 500,
+            amt_src: 0,
+            transform: 0,
+        };
+        let spec = FixtureSpec {
+            imods: vec![linked],
+            ..FixtureSpec::default()
+        };
+        assert_eq!(bank_of(&spec).resolve(0, 60, 64).unwrap().pan_per_mille, 0);
+        assert_eq!(bank_of(&spec).imods.len(), 2, "record + terminal parsed");
     }
 
     #[test]
@@ -4167,7 +4800,9 @@ mod tests {
         // filtered version applies the LPF.
         let blob_filt = build_filter_sf2();
         let bank_filt = Sf2Bank::parse(&blob_filt).unwrap();
-        let plan = bank_filt.resolve(0, 60, 100).unwrap();
+        // Velocity 127: the §8.4.2 default velocity→cutoff modulator
+        // contributes exactly 0, so the plan carries the bare generator.
+        let plan = bank_filt.resolve(0, 60, 127).unwrap();
         assert_eq!(plan.initial_filter_fc_cents, 6500);
         let inst = Sf2Instrument {
             name: "filt".into(),
@@ -4199,8 +4834,55 @@ mod tests {
         // state allocated → output matches the unfiltered path.
         let blob = build_minimal_looping_sf2();
         let bank = Sf2Bank::parse(&blob).unwrap();
-        let plan = bank.resolve(0, 60, 100).unwrap();
+        let plan = bank.resolve(0, 60, 127).unwrap();
         assert_eq!(plan.initial_filter_fc_cents, 13_500);
+    }
+
+    #[test]
+    fn default_velocity_to_filter_cutoff_modulator_is_implicit_and_supersedable() {
+        // §8.4.2: source 0x0102 (linear, negative unipolar, velocity) →
+        // initialFilterFc, −2400 cents. Table 2 / Figure 7 map velocity
+        // v to (127 − v)/128, so velocity 100 lowers the cutoff by
+        // 2400 × 27/128 = 506.25 → −506 cents, velocity 127 by 0.
+        let bank = Sf2Bank::parse(&build_minimal_looping_sf2()).unwrap();
+        assert_eq!(
+            bank.resolve(0, 60, 127).unwrap().initial_filter_fc_cents,
+            13_500
+        );
+        assert_eq!(
+            bank.resolve(0, 60, 100).unwrap().initial_filter_fc_cents,
+            13_500 - 506
+        );
+        // −2400 × 126/128 = −2362.5 rounds away from zero.
+        assert_eq!(
+            bank.resolve(0, 60, 1).unwrap().initial_filter_fc_cents,
+            13_500 - 2363
+        );
+        // An identical instrument modulator (same source, destination
+        // and amount source) supersedes the default (§9.5.1).
+        let spec = FixtureSpec {
+            imods: vec![Modulator {
+                amount: 0,
+                ..DEFAULT_MOD_VELOCITY_TO_FILTER_FC
+            }],
+            ..FixtureSpec::default()
+        };
+        let bank = Sf2Bank::parse(&build_sf2(&spec)).unwrap();
+        assert_eq!(
+            bank.resolve(0, 60, 1).unwrap().initial_filter_fc_cents,
+            13_500
+        );
+        // A preset-level identical modulator *adds* to it: −4800 ×
+        // 27/128 = −1012.5, rounded away from zero.
+        let spec = FixtureSpec {
+            pmods: vec![DEFAULT_MOD_VELOCITY_TO_FILTER_FC],
+            ..FixtureSpec::default()
+        };
+        let bank = Sf2Bank::parse(&build_sf2(&spec)).unwrap();
+        assert_eq!(
+            bank.resolve(0, 60, 100).unwrap().initial_filter_fc_cents,
+            13_500 - 1013
+        );
     }
 
     /// Build an SF2 with a strong modulation envelope routed to filter
@@ -4299,7 +4981,7 @@ mod tests {
     fn mod_env_to_filter_routes_correctly() {
         let blob = build_mod_env_sf2();
         let bank = Sf2Bank::parse(&blob).unwrap();
-        let plan = bank.resolve(0, 60, 100).unwrap();
+        let plan = bank.resolve(0, 60, 127).unwrap();
         assert_eq!(plan.initial_filter_fc_cents, 4500);
         assert_eq!(plan.mod_env_to_filter_cents, 6000);
         // Mod-env attack should be ~50 ms (the long ramp).
