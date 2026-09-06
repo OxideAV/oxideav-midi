@@ -81,28 +81,62 @@ pub fn gm2_cc_gain(value: u8) -> f32 {
     norm * norm
 }
 
-/// One 7-bit controller step expressed in the MIDI 2.0 32-bit
-/// controller space: the §D.1.4 downscale is `value >> 25`, so the
-/// low 25 bits are the resolution a 32-bit value adds *below* one
-/// 7-bit step.
+/// One unit of the Q7.25 fixed-point fields (Pitch 7.25, the RPN
+/// #00/07 sensitivity): 2^25.
 const HR_STEP: f64 = 33_554_432.0; // 2^25
+
+/// Locate a MIDI 2.0 `bits`-wide value (16 or 32) on the 7-bit grid
+/// the spec's own translation defines: the §D.1.3 Min-Center-Max
+/// upscale `scale_up(k, 7, bits)` of every 7-bit `k` (a plain shift up
+/// to the centre 64, bit-repeat above it, so 127 lands on the maximum).
+/// Returns `(k, fraction)` with `k` the largest grid index whose
+/// upscale is `<= value` and `fraction` the value's position toward
+/// the next grid point (`0.0` exactly on the grid, `< 1.0`). This is
+/// the anchor of every native-resolution refinement: a value the
+/// §D.3 upscale produces from a MIDI 1.0 controller is *on* the grid
+/// and renders bit-identically to that controller, the §D.1.4
+/// downscale of a grid point returns its `k`, and the positions in
+/// between refine continuously.
+fn grid_position(value: u32, bits: u8) -> (u8, f64) {
+    use crate::ump::scaling::scale_up;
+    let up = |k: u32| -> f64 {
+        if k >= 128 {
+            // One past the top grid point (the top bracket is empty:
+            // `scale_up(127)` is already the field maximum).
+            2f64.powi(i32::from(bits))
+        } else {
+            f64::from(scale_up(k, 7, bits))
+        }
+    };
+    // The truncation index is either the bracket or one above it
+    // (the upscale of `k` is never below `k << shift`).
+    let mut k = value >> (bits - 7);
+    if up(k) > f64::from(value) {
+        k -= 1;
+    }
+    let lo = up(k);
+    let hi = up(k + 1);
+    let fraction = (f64::from(value) - lo) / (hi - lo);
+    (k as u8, fraction)
+}
 
 /// The MIDI 2.0 32-bit controller refinement rule shared by every
 /// hi-res controller path. Returns `None` when `value` sits exactly on
-/// the 7-bit grid (its low 25 bits are zero) — the caller then takes
-/// the MIDI 1.0 path verbatim, so such values render **bit-identically**
-/// to the 7-bit controller they downscale to. Otherwise returns the
-/// value as a fractional 7-bit controller position (`value / 2^25`,
-/// e.g. `100.5`), which the caller feeds through the same response
-/// curve as the 7-bit value: the 2^25 positions between two 7-bit
-/// steps become distinct, monotone responses. (The top position,
-/// `0xFFFF_FFFF`, sits 1/128 of a step above 127.)
+/// the §D.1.3 grid — the caller then takes the MIDI 1.0 path verbatim,
+/// so such values render **bit-identically** to the 7-bit controller
+/// they translate to / from. Otherwise returns the value as a
+/// fractional 7-bit controller position (e.g. `100.5` halfway between
+/// the upscales of 100 and 101), which the caller feeds through the
+/// same response curve as the 7-bit value: the positions between two
+/// grid points become distinct, monotone responses, and the maximum
+/// `0xFFFF_FFFF` is exactly position 127.
 #[must_use]
 fn hr_refine(value: u32) -> Option<f64> {
-    if value & 0x01FF_FFFF == 0 {
+    let (k, fraction) = grid_position(value, 32);
+    if fraction == 0.0 {
         None
     } else {
-        Some(f64::from(value) / HR_STEP)
+        Some(f64::from(k) + fraction)
     }
 }
 
@@ -128,24 +162,26 @@ pub fn per_note_bend_cents(value: u32, range_cents: f64) -> f64 {
 /// position, exactly [`gm2_cc_gain`] on the 7-bit grid.
 #[doc(hidden)] // internal: voice-mixer conversion helper
 pub fn gm2_cc_gain_32(value: u32) -> f32 {
-    match hr_refine(value) {
-        None => gm2_cc_gain((value >> 25) as u8),
-        Some(pos) => {
-            let norm = pos / 127.0;
-            (norm * norm) as f32
-        }
+    let (k, fraction) = grid_position(value, 32);
+    if fraction == 0.0 {
+        gm2_cc_gain(k)
+    } else {
+        let norm = (f64::from(k) + fraction) / 127.0;
+        (norm * norm) as f32
     }
 }
 
 /// A MIDI 2.0 32-bit controller as a `0..=1` fraction of the 7-bit
-/// full scale (127): exactly `v7 / 127` on the grid, continuous in
-/// between. Used for pressure and effect-send depths. Clamped at 1.0
-/// (the top 1/128 step above 127 saturates).
+/// full scale (127): exactly `v7 / 127` on the §D.1.3 grid, continuous
+/// in between, exactly 1.0 at `0xFFFF_FFFF`. Used for pressure and
+/// effect-send depths.
 #[doc(hidden)] // internal: voice-mixer conversion helper
 pub fn unit_32(value: u32) -> f32 {
-    match hr_refine(value) {
-        None => (value >> 25) as f32 / 127.0,
-        Some(pos) => (pos / 127.0).min(1.0) as f32,
+    let (k, fraction) = grid_position(value, 32);
+    if fraction == 0.0 {
+        k as f32 / 127.0
+    } else {
+        ((f64::from(k) + fraction) / 127.0) as f32
     }
 }
 
@@ -202,15 +238,27 @@ struct NoteOnRefinement {
     pitch_hcu: Option<f64>,
 }
 
-/// Downscale a MIDI 2.0 16-bit Note On velocity to the 7-bit value
-/// the voice generators are built from (M2-104 §D.1.4 truncation:
-/// the top 7 bits). A MIDI 2.0 velocity of 0 is a *Note On at the
-/// lowest velocity*, not a Note Off (§7.4.2), so the result is floored
-/// to 1 — the remaining resolution rides in the mixer's per-note gain
-/// (see [`Mixer::note_on_midi2`]).
+/// A MIDI 2.0 16-bit Note On velocity as a continuous position on the
+/// 7-bit velocity scale: `(k, k + fraction)` where `k` is the 7-bit
+/// velocity whose §D.1.3 upscale is the highest grid point at or below
+/// the value (so `scale_7_to_16(v)` maps back to exactly `v`, and
+/// `0xFFFF` is exactly 127.0) and the fraction is the position toward
+/// the next grid point.
+#[must_use]
+pub fn midi2_velocity_position(velocity: u16) -> (u8, f64) {
+    let (k, fraction) = grid_position(u32::from(velocity), 16);
+    (k, f64::from(k) + fraction)
+}
+
+/// The 7-bit velocity the voice generators are built from for a MIDI
+/// 2.0 16-bit velocity: the §D.1.3 grid index below the value (see
+/// [`midi2_velocity_position`]). A MIDI 2.0 velocity of 0 is a *Note
+/// On at the lowest velocity*, not a Note Off (§7.4.2), so the result
+/// is floored to 1 — the remaining resolution rides in the mixer's
+/// per-note gain (see [`Mixer::note_on_midi2`]).
 #[must_use]
 pub fn midi2_velocity_to_7(velocity: u16) -> u8 {
-    ((velocity >> 9) as u8).max(1)
+    midi2_velocity_position(velocity).0.max(1)
 }
 
 /// The key a voice generator should be built from for a MIDI 2.0 Note
@@ -3530,15 +3578,17 @@ impl Mixer {
     /// built by the instrument from [`midi2_velocity_to_7`]`(velocity)`
     /// at key [`midi2_sample_key`]`(note, attribute_type, attribute)`.
     ///
-    /// * **16-bit velocity** — the voice carries the 7-bit velocity
-    ///   curve; the low 9 bits refine the note's static gain by the
-    ///   ratio `velocity / (velocity7 << 9)` (the same construction as
-    ///   the CA-031 14-bit prefix), so a velocity whose low 9 bits are
-    ///   zero renders **bit-identically** to the MIDI 1.0 note with the
-    ///   same 7-bit velocity, every one of the 512 values between two
-    ///   7-bit steps is a distinct gain, and velocity 0 — a Note On at
-    ///   the lowest velocity, *not* a Note Off (§7.4.2) — allocates a
-    ///   silent-gain voice rather than releasing anything.
+    /// * **16-bit velocity** — the voice carries its own velocity curve
+    ///   evaluated at the 7-bit grid velocity; the mixer refines the
+    ///   note's static gain by the ratio of that curve
+    ///   ([`Voice::velocity_gain`]) at the value's continuous position
+    ///   ([`midi2_velocity_position`]) over the grid velocity. A
+    ///   velocity on the §D.1.3 grid (every MIDI 1.0 velocity's
+    ///   upscale) renders **bit-identically** to the MIDI 1.0 note,
+    ///   every value between two grid points is a distinct gain on the
+    ///   voice's own curve (continuous across steps), and velocity 0 —
+    ///   a Note On at the lowest velocity, *not* a Note Off (§7.4.2) —
+    ///   allocates a silent-gain voice rather than releasing anything.
     /// * **Attribute Type 0x03 Pitch 7.9** (§7.4.15.3) — the Attribute
     ///   is the note's absolute pitch in Q7.9 HCUs and `note` is only an
     ///   index: the fractional part becomes an exact pitch offset from
@@ -3560,8 +3610,15 @@ impl Mixer {
     ) {
         let ch = channel as usize % NUM_CHANNELS;
         self.channels[ch].high_res_velocity_prefix = None;
-        let v7 = midi2_velocity_to_7(velocity);
-        let gain = f32::from(velocity) / f32::from(u16::from(v7) << 9);
+        let (k, pos) = midi2_velocity_position(velocity);
+        let v7 = k.max(1);
+        // Exactly 1.0 on the grid (the same expression divided by
+        // itself) so a translated MIDI 1.0 velocity stays bit-exact.
+        let gain = if pos == f64::from(v7) {
+            1.0
+        } else {
+            voice.velocity_gain(pos as f32) / voice.velocity_gain(f32::from(v7))
+        };
         let sample_key = self.midi2_note_sample_key(channel, note, attribute_type, attribute);
         let pitch =
             (attribute_type == ATTRIBUTE_TYPE_PITCH_7_9).then(|| f64::from(attribute) / 512.0);
@@ -4557,6 +4614,22 @@ mod tests {
     }
 
     type FineBendCell = std::sync::Arc<std::sync::Mutex<f64>>;
+
+    /// The §D.1.3 upscale of a 7-bit value — the 32-bit grid point a
+    /// MIDI 1.0 controller translates to.
+    fn g32(k: u8) -> u32 {
+        crate::ump::scaling::scale_7_to_32(k)
+    }
+
+    /// Halfway between the grid points of `k` and `k + 1`.
+    fn mid32(k: u8) -> u32 {
+        g32(k) + (g32(k + 1) - g32(k)) / 2
+    }
+
+    /// The §D.1.3 upscale of a 7-bit velocity to 16 bits.
+    fn g16(k: u8) -> u16 {
+        crate::ump::scaling::scale_7_to_16(k)
+    }
 
     /// [`ConstVoice`] plus the handle to its fractional-cents cell —
     /// what the MIDI 2.0 32-bit / per-note pitch paths deliver.
@@ -6086,7 +6159,7 @@ mod tests {
         assert_eq!(m.midi2_note_sample_key(0, 62, ATTRIBUTE_TYPE_NONE, 0), 62);
         assert_eq!(m.per_note_state(0, 60).unwrap().pitch_hcu(), Some(61.5));
         let (a, fine_a, _) = fine_bend_voice(64);
-        m.note_on_midi2(0, 60, 100 << 9, ATTRIBUTE_TYPE_NONE, 0, a);
+        m.note_on_midi2(0, 60, g16(100), ATTRIBUTE_TYPE_NONE, 0, a);
         assert_eq!(
             *fine_a.lock().unwrap(),
             50.0,
@@ -6104,7 +6177,7 @@ mod tests {
         m.note_on_midi2(
             0,
             60,
-            100 << 9,
+            g16(100),
             ATTRIBUTE_TYPE_PITCH_7_9,
             (60 << 9) | 128,
             b,
@@ -6179,7 +6252,7 @@ mod tests {
         m.set_mod_wheel(0, 0);
         assert_eq!(*depth.lock().unwrap(), 25);
         // Brightness #74 routes live like CC 74 …
-        m.set_registered_per_note_controller(0, 60, rpnc::BRIGHTNESS, 100 << 25);
+        m.set_registered_per_note_controller(0, 60, rpnc::BRIGHTNESS, g32(100));
         assert_eq!(*timbre.lock().unwrap(), 100);
         // … and reaches a later note on that number at strike time.
         let (v2, _b2, _p2, depth2, timbre2) = instrumented_voice_full(0.5, 64);
@@ -6227,23 +6300,23 @@ mod tests {
     #[test]
     fn cc_32_volume_is_bit_identical_on_the_7bit_grid_and_finer_between() {
         for v7 in [0u8, 1, 64, 100, 127] {
-            assert_eq!(gm2_cc_gain_32(u32::from(v7) << 25), gm2_cc_gain(v7), "{v7}");
+            assert_eq!(gm2_cc_gain_32(g32(v7)), gm2_cc_gain(v7), "{v7}");
         }
         // Off grid: strictly between the neighbouring 7-bit gains,
         // and 256 samples across one step are distinct + monotone.
         let mut last = gm2_cc_gain(100);
         let mut distinct = std::collections::BTreeSet::new();
+        let step = (g32(101) - g32(100)) / 256;
         for i in 1..256u32 {
-            let g = gm2_cc_gain_32((100 << 25) + i * (1 << 17));
+            let g = gm2_cc_gain_32(g32(100) + i * step);
             assert!(g > last && g < gm2_cc_gain(101), "step {i}: {g}");
             last = g;
             distinct.insert(g.to_bits());
         }
         assert_eq!(distinct.len(), 255);
-        // The top of the range is 1/128 of a step above 127: barely
-        // over the 7-bit maximum, never a gross jump.
-        let top = gm2_cc_gain_32(0xFFFF_FFFF);
-        assert!(top > 1.0 && top < 1.02, "{top}");
+        // The top of the range is exactly the 7-bit maximum.
+        assert_eq!(gm2_cc_gain_32(0xFFFF_FFFF), gm2_cc_gain(127));
+        assert_eq!(g32(127), 0xFFFF_FFFF);
     }
 
     #[test]
@@ -6253,15 +6326,23 @@ mod tests {
         m.note_on(0, 60, 100, voice(1.0, 64));
         m.set_volume(0, 100);
         let (l7, _) = one_sample_lr(&mut m);
-        m.set_control_change_32(0, 7, 100 << 25);
-        assert_eq!(m.channel_state(0).hr.volume, Some(100 << 25));
+        m.set_control_change_32(0, 7, g32(100));
+        assert_eq!(m.channel_state(0).hr.volume, Some(g32(100)));
         assert_eq!(m.channel_state(0).volume, 100, "7-bit shadow");
         let (l32, _) = one_sample_lr(&mut m);
         assert_eq!(l7, l32, "on-grid 32-bit CC 7 renders as CC 7 = 100");
-        m.set_control_change_32(0, 7, (100 << 25) | (1 << 24));
+        m.set_control_change_32(0, 7, mid32(100));
         let (lhalf, _) = one_sample_lr(&mut m);
         assert!(lhalf > l32, "half a step louder: {lhalf} vs {l32}");
-        assert_eq!(m.channel_state(0).volume, 100, "shadow still floors to 100");
+        m.set_volume(0, 101);
+        let (l101, _) = one_sample_lr(&mut m);
+        assert!(lhalf < l101, "but under CC 7 = 101: {lhalf} vs {l101}");
+        m.set_control_change_32(0, 7, mid32(100));
+        assert_eq!(
+            m.channel_state(0).volume,
+            crate::ump::scaling::scale_32_to_7(mid32(100)),
+            "shadow is the §D.1.4 downscale"
+        );
         // Expression composes the same way.
         m.set_control_change_32(0, 11, 64 << 25);
         let (lexp, _) = one_sample_lr(&mut m);
@@ -6317,8 +6398,9 @@ mod tests {
         );
         m.set_reverb_send(0, 0);
         assert_eq!(m.channel_state(0).hr.reverb_send, None);
-        assert_eq!(unit_32(100 << 25), 100.0 / 127.0);
-        assert!(unit_32((100 << 25) | (1 << 24)) > 100.0 / 127.0);
+        assert_eq!(unit_32(g32(100)), 100.0 / 127.0);
+        assert!(unit_32(mid32(100)) > 100.0 / 127.0);
+        assert!(unit_32(mid32(100)) < 101.0 / 127.0);
         assert_eq!(unit_32(0xFFFF_FFFF), 1.0, "saturates at full scale");
     }
 
@@ -6329,22 +6411,24 @@ mod tests {
         m.note_on(0, 60, 100, v);
         m.set_channel_pressure(0, 100);
         assert_eq!(*press.lock().unwrap(), 100.0 / 127.0);
-        m.set_channel_pressure_32(0, 100 << 25);
+        m.set_channel_pressure_32(0, g32(100));
         assert_eq!(*press.lock().unwrap(), 100.0 / 127.0, "on-grid identity");
         assert_eq!(m.channel_state(0).channel_pressure, 100, "7-bit shadow");
-        m.set_channel_pressure_32(0, (100 << 25) | (1 << 24));
-        assert_eq!(*press.lock().unwrap(), (100.5 / 127.0) as f32);
+        m.set_channel_pressure_32(0, mid32(100));
+        let half = *press.lock().unwrap();
+        assert!(half > 100.4 / 127.0 && half < 100.6 / 127.0, "{half}");
         // A fresh note picks the 32-bit pressure up at strike time.
         let (v2, _, press2) = instrumented_voice(0.5, 64);
         m.note_on(0, 62, 100, v2);
-        assert_eq!(*press2.lock().unwrap(), (100.5 / 127.0) as f32);
+        assert_eq!(*press2.lock().unwrap(), half);
         // MIDI 1.0 pressure supersedes.
         m.set_channel_pressure(0, 0);
         assert_eq!(m.channel_state(0).hr.channel_pressure, None);
         assert_eq!(*press.lock().unwrap(), 0.0);
-        // Poly pressure, per key.
-        m.set_poly_pressure_32(0, 60, (64 << 25) | (1 << 24));
-        assert_eq!(*press.lock().unwrap(), (64.5 / 127.0) as f32);
+        // Poly pressure, per key (below the centre the grid is a plain
+        // shift, so 60.5 is exact).
+        m.set_poly_pressure_32(0, 60, (60 << 25) | (1 << 24));
+        assert_eq!(*press.lock().unwrap(), (60.5 / 127.0) as f32);
         assert_eq!(*press2.lock().unwrap(), 0.0, "other key untouched");
     }
 
@@ -6354,12 +6438,12 @@ mod tests {
         let (v, _b, _p, depth, _t) = instrumented_voice_full(0.5, 64);
         m.note_on(0, 60, 100, v);
         // On grid: the MIDI 1.0 integer computation (100·50/127 = 39).
-        m.set_control_change_32(0, 1, 100 << 25);
+        m.set_control_change_32(0, 1, g32(100));
         assert_eq!(*depth.lock().unwrap(), 39);
         assert_eq!(m.channel_state(0).mod_wheel, 100);
-        // Off grid (100.5): 39.57 cents — the ConstVoice only records
+        // Off grid (≈100.5): 39.57 cents — the ConstVoice only records
         // the trait-default rounding, which now lands on 40.
-        m.set_control_change_32(0, 1, (100 << 25) | (1 << 24));
+        m.set_control_change_32(0, 1, mid32(100));
         assert_eq!(*depth.lock().unwrap(), 40);
         // A MIDI 1.0 CC 1 returns to the integer path.
         m.set_mod_wheel(0, 100);
@@ -6538,8 +6622,13 @@ mod tests {
     #[test]
     fn midi2_velocity_helpers_follow_appendix_d_and_floor_to_one() {
         assert_eq!(midi2_velocity_to_7(0xFFFF), 127);
-        assert_eq!(midi2_velocity_to_7(100 << 9), 100);
-        assert_eq!(midi2_velocity_to_7((100 << 9) | 0x1FF), 100);
+        assert_eq!(midi2_velocity_position(0xFFFF), (127, 127.0));
+        assert_eq!(midi2_velocity_to_7(g16(100)), 100);
+        assert_eq!(midi2_velocity_position(g16(100)), (100, 100.0));
+        assert_eq!(midi2_velocity_to_7(g16(101) - 1), 100);
+        // Below the centre the grid is a plain shift.
+        assert_eq!(g16(60), 60 << 9);
+        assert_eq!(midi2_velocity_position((60 << 9) + 256), (60, 60.5));
         // §7.4.2: velocity 0 is a Note On (lowest velocity), never a
         // Note Off — the voice is built at 1 (the §D.2.1 floor too).
         assert_eq!(midi2_velocity_to_7(0), 1);
@@ -6555,28 +6644,30 @@ mod tests {
     fn midi2_velocity_on_7bit_grid_matches_midi1_gain_exactly() {
         for v7 in [1u8, 37, 64, 100, 127] {
             let g1 = note_gain_for_midi1(v7);
-            let g2 = note_gain_for_midi2(u16::from(v7) << 9, ATTRIBUTE_TYPE_NONE, 0);
+            let g2 = note_gain_for_midi2(g16(v7), ATTRIBUTE_TYPE_NONE, 0);
             assert_eq!(g1, g2, "velocity {v7}");
         }
     }
 
     #[test]
-    fn midi2_velocity_between_7bit_steps_is_512_distinct_monotone_gains() {
-        let base = 100u16 << 9;
+    fn midi2_velocity_between_7bit_steps_is_distinct_monotone_on_the_voice_curve() {
+        let (lo, hi) = (g16(100), g16(101));
         let g_lo = note_gain_for_midi1(100);
         let mut last = f32::NEG_INFINITY;
         let mut distinct = std::collections::BTreeSet::new();
-        for lsb in 0..512u16 {
-            let g = note_gain_for_midi2(base | lsb, ATTRIBUTE_TYPE_NONE, 0);
-            assert!(g > last, "lsb {lsb}: {g} !> {last}");
-            // The refinement is exactly the 16-bit / 7-bit velocity
-            // ratio over the (voice-defined) 7-bit gain.
-            let want = g_lo * f32::from(base | lsb) / f32::from(base);
-            assert!((g - want).abs() <= 1e-6, "lsb {lsb}: {g} vs {want}");
+        for v in lo..hi {
+            let g = note_gain_for_midi2(v, ATTRIBUTE_TYPE_NONE, 0);
+            assert!(g > last, "{v:#06x}: {g} !> {last}");
+            // The refinement follows the voice's own curve (square law
+            // by default) so it is continuous across the 7-bit step.
+            let (_, pos) = midi2_velocity_position(v);
+            let want = g_lo * ((pos / 100.0) * (pos / 100.0)) as f32;
+            assert!((g - want).abs() <= 1e-6, "{v:#06x}: {g} vs {want}");
             last = g;
             distinct.insert(g.to_bits());
         }
-        assert_eq!(distinct.len(), 512);
+        assert_eq!(distinct.len(), usize::from(hi - lo));
+        assert!(hi - lo >= 512);
     }
 
     #[test]
@@ -6600,7 +6691,7 @@ mod tests {
         let mut m = Mixer::new();
         m.channel_state_mut(0).volume = 127;
         m.set_high_res_velocity_prefix(0, 0x7F);
-        m.note_on_midi2(0, 60, 100 << 9, ATTRIBUTE_TYPE_NONE, 0, voice(1.0, 8));
+        m.note_on_midi2(0, 60, g16(100), ATTRIBUTE_TYPE_NONE, 0, voice(1.0, 8));
         assert_eq!(m.channel_state(0).high_res_velocity_prefix, None);
         let (mut l, mut r) = (vec![0.0f32; 1], vec![0.0f32; 1]);
         m.mix_stereo(&mut l, &mut r);
@@ -6645,10 +6736,10 @@ mod tests {
         ] {
             let mut m = Mixer::new();
             let (v, fine, _) = fine_bend_voice(8);
-            m.note_on_midi2(0, 60, 100 << 9, at, 0xABCD, v);
+            m.note_on_midi2(0, 60, g16(100), at, 0xABCD, v);
             assert_eq!(*fine.lock().unwrap(), 0.0, "attribute type {at:#04x}");
             assert_eq!(
-                note_gain_for_midi2(100 << 9, at, 0xABCD),
+                note_gain_for_midi2(g16(100), at, 0xABCD),
                 note_gain_for_midi1(100)
             );
         }

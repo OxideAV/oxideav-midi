@@ -105,8 +105,15 @@ fn pitch_bend_32_resolution_is_monotone_across_a_14_bit_step() {
 // ── 16-bit velocity + Pitch 7.9 attribute (M2-104 §7.4.2 / §7.4.15.3) ──
 
 use oxideav_midi::mixer::{
-    midi2_sample_key, midi2_velocity_to_7, ATTRIBUTE_TYPE_NONE, ATTRIBUTE_TYPE_PITCH_7_9,
+    midi2_sample_key, midi2_velocity_position, midi2_velocity_to_7, ATTRIBUTE_TYPE_NONE,
+    ATTRIBUTE_TYPE_PITCH_7_9,
 };
+use oxideav_midi::ump::scaling::{scale_7_to_16, scale_7_to_32};
+
+/// Halfway between the §D.1.3 grid points of `k` and `k + 1`.
+fn mid32(k: u8) -> u32 {
+    scale_7_to_32(k) + (scale_7_to_32(k + 1) - scale_7_to_32(k)) / 2
+}
 
 /// Render a single MIDI 2.0 note (16-bit velocity + attribute) through
 /// a fresh mixer.
@@ -135,7 +142,7 @@ fn velocity_16_on_the_7_bit_grid_renders_bit_identically_to_midi1() {
         let mut l1b = vec![0.0f32; FRAMES];
         let mut r = vec![0.0f32; FRAMES];
         m.mix_stereo(&mut l1b, &mut r);
-        let l2 = render_midi2(u16::from(v7) << 9, ATTRIBUTE_TYPE_NONE, 0);
+        let l2 = render_midi2(scale_7_to_16(v7), ATTRIBUTE_TYPE_NONE, 0);
         assert_eq!(l1b, l2, "velocity {v7}");
         if v7 == 100 {
             assert_eq!(l1, l2);
@@ -145,15 +152,18 @@ fn velocity_16_on_the_7_bit_grid_renders_bit_identically_to_midi1() {
 
 #[test]
 fn velocity_16_low_bits_scale_the_render_where_translation_cannot() {
-    let v_grid = 100u16 << 9;
-    let v_half = v_grid | 256;
+    let v_grid = scale_7_to_16(100);
+    let v_half = v_grid + (scale_7_to_16(101) - v_grid) / 2;
     // Appendix D folds both onto velocity 100 …
     assert_eq!(midi2_velocity_to_7(v_grid), midi2_velocity_to_7(v_half));
     let grid = render_midi2(v_grid, ATTRIBUTE_TYPE_NONE, 0);
     let half = render_midi2(v_half, ATTRIBUTE_TYPE_NONE, 0);
-    // … natively the half-step note is exactly (v_half / v_grid) louder,
-    // sample for sample (a static gain: same waveform, same envelope).
-    let ratio = f32::from(v_half) / f32::from(v_grid);
+    // … natively the half-step note is louder by the tone voice's own
+    // square-law ratio at its continuous velocity position, sample for
+    // sample (a static gain: same waveform, same envelope).
+    let (_, pos) = midi2_velocity_position(v_half);
+    let ratio = ((pos / 100.0) * (pos / 100.0)) as f32;
+    assert!(ratio > 1.005 && ratio < 1.015, "{ratio}");
     for (i, (g, h)) in grid.iter().zip(&half).enumerate() {
         let want = g * ratio;
         assert!(
@@ -170,12 +180,12 @@ fn pitch_7_9_half_semitone_equals_an_exact_50_cent_bend() {
     // of 0xA000_0000 at the ±200 c default is exactly +50 c too. Both
     // feed the same fractional-cents voice hook → identical PCM.
     let attr = (69u16 << 9) | 256;
-    let via_attr = render_midi2(100 << 9, ATTRIBUTE_TYPE_PITCH_7_9, attr);
+    let via_attr = render_midi2(scale_7_to_16(100), ATTRIBUTE_TYPE_PITCH_7_9, attr);
     let (via_bend, _) = render(|m| m.set_pitch_bend_32(0, 0xA000_0000));
     assert_eq!(via_attr, via_bend);
     // And a Pitch 7.9 with a zero fraction is the plain note.
-    let plain = render_midi2(100 << 9, ATTRIBUTE_TYPE_NONE, 0);
-    let whole = render_midi2(100 << 9, ATTRIBUTE_TYPE_PITCH_7_9, 69 << 9);
+    let plain = render_midi2(scale_7_to_16(100), ATTRIBUTE_TYPE_NONE, 0);
+    let whole = render_midi2(scale_7_to_16(100), ATTRIBUTE_TYPE_PITCH_7_9, 69 << 9);
     assert_eq!(plain, whole);
     // Note number is only an index for a Pitch 7.9 note: index 5 with
     // pitch 69.0 renders exactly like the plain A4.
@@ -186,7 +196,7 @@ fn pitch_7_9_half_semitone_equals_an_exact_50_cent_bend() {
     m.note_on_midi2(
         0,
         5,
-        100 << 9,
+        scale_7_to_16(100),
         ATTRIBUTE_TYPE_PITCH_7_9,
         69 << 9,
         inst.make_voice(0, key, 100, RATE).unwrap(),
@@ -202,9 +212,9 @@ fn pitch_7_9_half_semitone_equals_an_exact_50_cent_bend() {
 #[test]
 fn cc7_32_on_grid_renders_bit_identically_and_off_grid_scales() {
     let (v7, _) = render(|m| m.set_volume(0, 100));
-    let (grid, _) = render(|m| m.set_control_change_32(0, 7, 100 << 25));
+    let (grid, _) = render(|m| m.set_control_change_32(0, 7, scale_7_to_32(100)));
     assert_eq!(v7, grid);
-    let (half, _) = render(|m| m.set_control_change_32(0, 7, (100 << 25) | (1 << 24)));
+    let (half, _) = render(|m| m.set_control_change_32(0, 7, mid32(100)));
     // Same waveform, a static gain in between the CC 7 = 100 and 101
     // renders.
     let (v101, _) = render(|m| m.set_volume(0, 101));

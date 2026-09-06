@@ -27,10 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Mixer::note_on_midi2` takes the 16-bit velocity and the Attribute
   Type/Data. The voice is built from the §D.1.4 7-bit downscale
   (`midi2_velocity_to_7`, floored to 1 — a 2.0 velocity 0 is a Note On
-  at the lowest velocity, never a Note Off) and the low 9 bits refine
-  the note's static gain by the exact `v16 / (v7 << 9)` ratio, so
-  on-grid velocities render bit-identically to MIDI 1.0 and the 512
-  values between two 7-bit steps are 512 distinct monotone gains.
+  at the lowest velocity, never a Note Off) and the mixer refines the
+  note's static gain by the ratio of the voice's own velocity curve
+  (new `Voice::velocity_gain`, square law by default) at the value's
+  continuous position (`midi2_velocity_position`) over the grid
+  velocity. The grid is the spec's own 7↔16-bit equivalence — the
+  §D.1.3 Min-Center-Max upscale of every 7-bit velocity — so a MIDI
+  1.0 velocity translated up (§D.3.1) renders bit-identically, a
+  native velocity translated down (§D.2.1) likewise, and the values
+  between two grid points are distinct monotone gains continuous
+  across the 7-bit step.
   **Attribute Type 0x03 Pitch 7.9** (§7.4.15.3) sets the note's absolute
   pitch: the sample is selected at the integer part (`midi2_sample_key`)
   and the 1/512-HCU fraction becomes an exact fractional-cents offset
@@ -46,9 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   controller) through the same response curves — GM2 square law for
   Volume/Expression (`gm2_cc_gain_32`), RP-036 pan with `0x8000_0000`
   the true centre, fractional-cents modulation depth via the new
-  `Voice::set_mod_depth_fine_cents` hook; a value on the 7-bit grid
-  renders bit-identically to its 7-bit controller, the 2^25 positions
-  between two steps are distinct and monotone. Switch / table
+  `Voice::set_mod_depth_fine_cents` hook. Every refinement is anchored
+  on the §D.1.3 Min-Center-Max grid (`scale_7_to_32(k)`): a value on
+  it renders bit-identically to its 7-bit controller in both
+  translation directions, the positions between two grid points are
+  distinct and monotone, and `0xFFFF_FFFF` is exactly position 127.
+  Switch / table
   controllers take the downscale; the §7.4.6.1 special formats (CC 84
   source note, CC 126 channel count in the top 7 bits) and the §7.4.6
   ignore list (CC 0/32/6/38/98–101/88) are honoured.

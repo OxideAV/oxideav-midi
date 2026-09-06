@@ -256,6 +256,19 @@ pub trait Voice: Send {
         n
     }
 
+    /// The voice's velocity → amplitude curve, evaluated at a
+    /// (possibly fractional) MIDI velocity `0.0..=127.0`. The mixer
+    /// uses the *ratio* of two evaluations to refine a voice that was
+    /// built at a 7-bit velocity to the finer MIDI 2.0 16-bit velocity
+    /// (M2-104 §7.4.2): `gain(v16 position) / gain(v7)`. The default
+    /// is the square law every in-tree voice applies at construction
+    /// (`(v / 127)²`); a voice with a different curve overrides this so
+    /// the refinement stays continuous across 7-bit steps.
+    fn velocity_gain(&self, velocity: f32) -> f32 {
+        let n = (velocity / 127.0).clamp(0.0, 1.0);
+        n * n
+    }
+
     /// Non-zero exclusive-class id (SF2 generator 57). When a new
     /// voice with the same `exclusive_class` is started on the same
     /// channel, the mixer hard-stops every prior voice in that class —
