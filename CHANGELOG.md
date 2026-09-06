@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-midi/compare/v0.0.5...v0.0.6) - 2026-09-06
+
+### Other
+
+- README — native MIDI 2.0 synthesis, MIDI-CI profiles, SF2 LFOs/modulators/global zones, fuzz targets + workflow, profiling numbers
+- byte-identical render fast paths — block-rate mod-env/filter gating and a static-filter inner loop (−27% dense-score wall clock)
+- ump target, writer fixed-point assertions in smf/clip targets, native-render leg, Fuzz workflow; fix Set Tempo overflow and three writer refusals of reader-kept bytes
+- writer fixed points — every UMP message type through the .midi2 writer, every SMF construct through both writers, concordance stability
+- global zones resolve and supply defaults; pmod/imod modulators evaluated at note-on with §9.5.1 precedence; §8.4.2 velocity→cutoff default modulator
+- Vibrato + Modulation LFOs, pan / effects-send generators, keynum envelope tracking, scaleTuning; pressure and CC 1 drive the Vibrato LFO per §8.4.3/§8.4.4
+- MIDI-CI Profile Configuration state in the mixer — Set Profile On/Off addressing, SysEx routing, clip-header application
+- native MIDI Clip File playback — UMPs dispatched at full resolution, decoder switched, native-vs-translated PCM pins
+- anchor every MIDI 2.0 refinement on the §D.1.3 Min-Center-Max grid; voices declare their velocity curve
+- native MIDI 2.0 Per-Note messages — per-note pitch bend, Registered/Assignable Per-Note Controllers, Pitch 7.25, Per-Note Management
+- native MIDI 2.0 32-bit controllers — CC/pressure at full resolution, Registered/Assignable + relative controllers, per-note bend sensitivity
+- native MIDI 2.0 Note On — 16-bit velocity refinement + Pitch 7.9 attribute, velocity-0 is a Note On
+- native MIDI 2.0 32-bit Pitch Bend — fractional-cents voice path, bit-identical MIDI 1.0
+
 ### Added
 
 - **Native MIDI 2.0 32-bit Pitch Bend in the mixer** (M2-104 §7.4.11):
