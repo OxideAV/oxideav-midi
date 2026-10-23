@@ -20,7 +20,7 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_midi::instruments::tone::ToneInstrument;
 use oxideav_midi::mixer::Mixer;
-use oxideav_midi::scheduler::{dispatch_universal_sysex, Scheduler};
+use oxideav_midi::scheduler::{Scheduler, dispatch_universal_sysex};
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(clip) = oxideav_midi::clip::parse(data) {

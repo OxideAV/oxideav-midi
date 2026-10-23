@@ -752,7 +752,7 @@ impl Sf2Bank {
         // frame. When the `sm24` length doesn't match the frame count
         // we silently fall back to 16-bit-only (per spec, the sm24
         // chunk is optional and parsers must tolerate its absence).
-        if sdta_smpl.len() % 2 != 0 {
+        if !sdta_smpl.len().is_multiple_of(2) {
             return Err(Error::invalid(format!(
                 "SF2: sdta-smpl length {} is not a multiple of 2",
                 sdta_smpl.len(),
@@ -770,7 +770,7 @@ impl Sf2Bank {
         // than reject the whole bank.
         let use_sm24 = !sdta_sm24.is_empty() && sdta_sm24.len() == frame_count;
         let mut sample_data = Vec::with_capacity(frame_count);
-        for (i, chunk) in sdta_smpl.chunks_exact(2).enumerate() {
+        for (i, chunk) in sdta_smpl.as_chunks::<2>().0.iter().enumerate() {
             let hi = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
             // Combine: 16-bit MSBs in bits 8..23, 8-bit LSB in bits 0..7.
             // (hi << 8) preserves sign because `hi` is i32 (sign-extended).
@@ -1877,7 +1877,7 @@ fn parse_mod(body: &[u8], what: &str, record: usize) -> Result<Vec<Modulator>> {
 }
 
 fn check_record(body: &[u8], record_size: usize, what: &str) -> Result<()> {
-    if body.len() % record_size != 0 {
+    if !body.len().is_multiple_of(record_size) {
         return Err(Error::invalid(format!(
             "SF2: '{what}' length {} is not a multiple of {record_size}",
             body.len(),
@@ -3035,7 +3035,7 @@ impl Voice for Sf2Voice {
                 self.done = true;
                 return i;
             }
-            if lfo && self.elapsed % ENV_RUN as u32 == 0 {
+            if lfo && self.elapsed.is_multiple_of(ENV_RUN as u32) {
                 self.refresh_mod_lfo_gain(self.elapsed);
             }
 

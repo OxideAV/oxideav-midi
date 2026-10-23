@@ -1795,7 +1795,7 @@ mod tests {
         // pass with less loss than a sine an octave below.
         let sr = 44_100;
         let cutoff_cents = 8_338; // ≈ 1 kHz
-                                  // Sine at the cutoff.
+        // Sine at the cutoff.
         let mut cfg_on = cfg_with(sine_buf(1_000.0, sr, 16_384), sr);
         cfg_on.filter = FilterParams {
             cutoff_cents,
@@ -1829,7 +1829,7 @@ mod tests {
         // heavily attenuated; an out-of-band sine should pass.
         let sr = 44_100;
         let cutoff_cents = 8_338; // ≈ 1 kHz
-                                  // Sine at the cutoff (in the notch).
+        // Sine at the cutoff (in the notch).
         let mut cfg_in = cfg_with(sine_buf(1_000.0, sr, 16_384), sr);
         cfg_in.filter = FilterParams {
             cutoff_cents,

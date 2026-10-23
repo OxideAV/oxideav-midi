@@ -43,7 +43,7 @@ fn render_and_measure_rms(dec: &mut MidiDecoder, smf: Vec<u8>) -> f64 {
     for _ in 0..2048 {
         match dec.receive_frame() {
             Ok(Frame::Audio(af)) => {
-                for chunk in af.data[0].chunks_exact(2) {
+                for chunk in af.data[0].as_chunks::<2>().0 {
                     let s = i16::from_le_bytes([chunk[0], chunk[1]]) as f64;
                     sum_sq += s * s;
                     samples += 1;

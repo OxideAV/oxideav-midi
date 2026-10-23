@@ -158,15 +158,18 @@ mod tests {
         // Safety: unsafe in 2024 edition; in 2021 it's still safe to call,
         // but we'd rather be explicit. Tests are single-threaded enough
         // for this not to matter in practice.
-        env::set_var(ENV_VAR, &custom);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { env::set_var(ENV_VAR, &custom) };
         let paths = soundfont_search_paths();
         assert!(paths.len() >= 2);
         assert_eq!(paths[0], PathBuf::from("/tmp/oxideav-test-banks"));
         assert_eq!(paths[1], PathBuf::from("/var/empty/oxideav-test"));
         // Restore.
         match prev {
-            Some(v) => env::set_var(ENV_VAR, v),
-            None => env::remove_var(ENV_VAR),
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            Some(v) => unsafe { env::set_var(ENV_VAR, v) },
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { env::remove_var(ENV_VAR) },
         }
     }
 

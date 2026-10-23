@@ -158,11 +158,7 @@ pub struct ChordName {
 /// Decode a 4-bit two's-complement field to a signed value (−8..=7).
 fn nib_i8(v: u8) -> i8 {
     let v = (v & 0x0F) as i8;
-    if v >= 8 {
-        v - 16
-    } else {
-        v
-    }
+    if v >= 8 { v - 16 } else { v }
 }
 
 /// Encode a signed value (−8..=7) as a 4-bit two's-complement nibble.

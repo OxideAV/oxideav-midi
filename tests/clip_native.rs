@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use oxideav_core::{Decoder, Error, Frame, Packet, TimeBase};
+use oxideav_midi::MidiDecoder;
 use oxideav_midi::clip::{self, ClipEvent, ClipFile};
 use oxideav_midi::instruments::tone::ToneInstrument;
 use oxideav_midi::mixer::Mixer;
@@ -20,7 +21,6 @@ use oxideav_midi::ump::flex::FlexDataMessage;
 use oxideav_midi::ump::message::{Midi1ChannelVoice, Midi2ChannelVoice, UmpMessage};
 use oxideav_midi::ump::scaling::{scale_7_to_16, scale_7_to_32};
 use oxideav_midi::ump::sysex7_packets;
-use oxideav_midi::MidiDecoder;
 
 const RATE: u32 = 44_100;
 const BLOCK: usize = 1024;
@@ -415,7 +415,7 @@ fn decoder_plays_a_clip_natively_and_matches_the_smf_of_a_midi1_clip() {
 
 #[test]
 fn clip_header_set_profile_on_configures_the_decoder_before_playback() {
-    use oxideav_midi::ci::{sub_id2, CiBody, CiMessage, ProfileId, BROADCAST_MUID, CI_VERSION_2};
+    use oxideav_midi::ci::{BROADCAST_MUID, CI_VERSION_2, CiBody, CiMessage, ProfileId, sub_id2};
     let profile = ProfileId::standard(0x00, 0x02, 0x01, 0x01);
     let set_on = CiMessage {
         device_id: 0x7E, // the whole Group

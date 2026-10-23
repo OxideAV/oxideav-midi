@@ -230,7 +230,7 @@ mod tests {
         bytes.extend_from_slice(&(rate * 2).to_le_bytes()); // byte rate
         bytes.extend_from_slice(&2u16.to_le_bytes()); // block align
         bytes.extend_from_slice(&16u16.to_le_bytes()); // bits/sample
-                                                       // data chunk.
+        // data chunk.
         bytes.extend_from_slice(b"data");
         bytes.extend_from_slice(&(data_size as u32).to_le_bytes());
         for s in samples {

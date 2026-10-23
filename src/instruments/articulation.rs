@@ -398,7 +398,7 @@ impl Articulation {
         // Helper closure: record an override iff a region block sets it
         // (or no region block has already set it).
         macro_rules! set {
-            ($field:ident, $mask:ident, $val:expr) => {{
+            ($field:ident, $mask:ident, $val:expr_2021) => {{
                 if is_region || !overridden.$mask {
                     self.$field = $val;
                     if is_region {

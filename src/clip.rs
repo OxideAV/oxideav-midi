@@ -31,11 +31,11 @@ use oxideav_core::{Error, Result};
 use crate::smf::{
     ChannelBody, ChannelMessage, Division, Event, MetaEvent, SmfBuilder, SmfFile, SmfFormat,
 };
-use crate::ump::flex::{self, text_status, FlexAddress, FlexDataMessage, FlexTextAssembler};
+use crate::ump::flex::{self, FlexAddress, FlexDataMessage, FlexTextAssembler, text_status};
 use crate::ump::message::{Midi1ChannelVoice, UmpMessage, UtilityMessage};
 use crate::ump::stream::UmpStreamMessage;
 use crate::ump::translator::midi2_to_midi1_messages;
-use crate::ump::{sysex7_packets, Sysex7Assembler, UmpStream};
+use crate::ump::{Sysex7Assembler, UmpStream, sysex7_packets};
 
 /// The 8-byte File Header (§5, Table 5).
 pub const CLIP_MAGIC: &[u8; 8] = b"SMF2CLIP";
@@ -93,13 +93,15 @@ pub fn parse(data: &[u8]) -> Result<ClipFile> {
         ));
     }
     let body = &data[CLIP_MAGIC.len()..];
-    if body.len() % 4 != 0 {
+    if !body.len().is_multiple_of(4) {
         return Err(Error::invalid(
             "MIDI Clip File: UMP data length is not a multiple of 4 bytes",
         ));
     }
     let words: Vec<u32> = body
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
@@ -533,10 +535,10 @@ impl ClipFile {
                             bytes,
                             ..
                         } => {
-                            if let Some(text) = text_asm.push(*format, bytes) {
-                                if let Some(kind) = flex_text_to_meta_kind(*status_bank, *status) {
-                                    tb.meta(tick, MetaEvent::Text { kind, text });
-                                }
+                            if let Some(text) = text_asm.push(*format, bytes)
+                                && let Some(kind) = flex_text_to_meta_kind(*status_bank, *status)
+                            {
+                                tb.meta(tick, MetaEvent::Text { kind, text });
                             }
                         }
                         // Metronome configuration and chord names have
@@ -640,12 +642,11 @@ impl ClipFile {
                     } else {
                         FlexAddress::Group
                     };
-                    if let Ok(text) = std::str::from_utf8(text) {
-                        if let Ok(packets) = flex::flex_text_packets(0, address, bank, status, text)
-                        {
-                            for p in packets {
-                                push(tick, UmpMessage::decode(&p)?);
-                            }
+                    if let Ok(text) = std::str::from_utf8(text)
+                        && let Ok(packets) = flex::flex_text_packets(0, address, bank, status, text)
+                    {
+                        for p in packets {
+                            push(tick, UmpMessage::decode(&p)?);
                         }
                     }
                 }

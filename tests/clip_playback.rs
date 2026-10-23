@@ -6,11 +6,11 @@
 use std::sync::Arc;
 
 use oxideav_core::{Decoder, Error, Frame, Packet, TimeBase};
+use oxideav_midi::MidiDecoder;
 use oxideav_midi::clip::{self, ClipEvent, ClipFile};
 use oxideav_midi::instruments::tone::ToneInstrument;
 use oxideav_midi::ump::flex::FlexDataMessage;
 use oxideav_midi::ump::message::{Midi2ChannelVoice, UmpMessage};
-use oxideav_midi::MidiDecoder;
 
 /// One-second clip at 120 BPM / 480 TPQ, played entirely with MIDI 2.0
 /// Channel Voice messages (16-bit velocities) so playback exercises
@@ -73,7 +73,7 @@ fn midi2_clip_renders_nonsilent_pcm() {
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
                 total_samples += u64::from(a.samples);
-                for pair in a.data[0].chunks_exact(2) {
+                for pair in a.data[0].as_chunks::<2>().0 {
                     peak = peak.max(i16::from_le_bytes([pair[0], pair[1]]).saturating_abs());
                 }
             }

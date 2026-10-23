@@ -454,8 +454,8 @@ mod tests {
         assert_eq!(s.exc_group(42), s.exc_group(46));
         // A non-EXC key is in no group.
         assert_eq!(s.exc_group(36), None); // Bass Drum 1
-                                           // The §2.8.1 worked example: Note 42 (Closed) mutes Note 46
-                                           // (Open) — same group.
+        // The §2.8.1 worked example: Note 42 (Closed) mutes Note 46
+        // (Open) — same group.
         assert_eq!(s.exc_group(42), s.exc_group(46));
         assert_ne!(s.exc_group(42), s.exc_group(51)); // vs Ride Cymbal 1
     }
@@ -535,7 +535,7 @@ mod tests {
         assert_eq!(o.key(30).unwrap().name, "Ride Cymbal 1");
         assert_eq!(o.exc_group(30), None);
         assert_eq!(o.exc_group(29), Some(1)); // was EXC7 in STANDARD
-                                              // §2.8.1: ORCHESTRA Note 88 honours Note Off (Applause).
+        // §2.8.1: ORCHESTRA Note 88 honours Note Off (Applause).
         assert_eq!(o.key(88).unwrap().name, "Applause");
         assert!(o.honors_note_off(88));
         assert!(!o.honors_note_off(36));

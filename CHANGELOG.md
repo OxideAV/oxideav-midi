@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - **Native MIDI 2.0 32-bit Pitch Bend in the mixer** (M2-104 §7.4.11):
@@ -2932,7 +2936,6 @@ Wall respected: every change in this round used only
 `docs/audio/midi/midi-1.0/Universal-System-Exclusive-Messages.pdf`,
 plus the in-tree crate sources + `oxideav-core`'s public API. No
 external library source consulted, paraphrased, or cross-checked.
-
 
 ## [0.0.1](https://github.com/OxideAV/oxideav-midi/compare/v0.0.0...v0.0.1) - 2026-05-04
 

@@ -33,7 +33,7 @@
 //! held-chord killing every new note in a busy passage. Round-4 may
 //! revisit.
 
-use crate::ci::{ProfileId, DEVICE_ID_FUNCTION_BLOCK, DEVICE_ID_GROUP};
+use crate::ci::{DEVICE_ID_FUNCTION_BLOCK, DEVICE_ID_GROUP, ProfileId};
 use crate::instruments::{SoundControls, Voice};
 
 /// Hard cap on simultaneous voices. Picked to land below the audible
@@ -2099,23 +2099,21 @@ impl Mixer {
                 }
                 _ => slot.channel == channel,
             };
-            if routes {
-                if let Some(voice) = slot.voice.as_mut() {
-                    let combined = Self::compose_pressure(
-                        self.channels[slot_ch].pressure_frac(),
-                        match self.channels[slot_ch].mpe_role {
-                            MpeRole::Member(kind) => {
-                                let mgr = match kind {
-                                    MpeZoneKind::Lower => 0,
-                                    MpeZoneKind::Upper => 15,
-                                };
-                                self.channels[mgr].pressure_frac()
-                            }
-                            _ => 0.0,
-                        },
-                    );
-                    voice.set_pressure(combined);
-                }
+            if routes && let Some(voice) = slot.voice.as_mut() {
+                let combined = Self::compose_pressure(
+                    self.channels[slot_ch].pressure_frac(),
+                    match self.channels[slot_ch].mpe_role {
+                        MpeRole::Member(kind) => {
+                            let mgr = match kind {
+                                MpeZoneKind::Lower => 0,
+                                MpeZoneKind::Upper => 15,
+                            };
+                            self.channels[mgr].pressure_frac()
+                        }
+                        _ => 0.0,
+                    },
+                );
+                voice.set_pressure(combined);
             }
         }
         // CA-022 / GM2 §4.6.1: when a Channel-Pressure Controller
@@ -2151,10 +2149,11 @@ impl Mixer {
             return;
         }
         for slot in self.slots.iter_mut() {
-            if slot.channel == channel && slot.key == key {
-                if let Some(voice) = slot.voice.as_mut() {
-                    voice.set_pressure(p);
-                }
+            if slot.channel == channel
+                && slot.key == key
+                && let Some(voice) = slot.voice.as_mut()
+            {
+                voice.set_pressure(p);
             }
         }
     }
@@ -2220,10 +2219,10 @@ impl Mixer {
         // Clear channel + poly pressure on held voices.
         self.set_channel_pressure(channel, 0);
         for slot in self.slots.iter_mut() {
-            if slot.channel == channel {
-                if let Some(voice) = slot.voice.as_mut() {
-                    voice.set_pressure(0.0);
-                }
+            if slot.channel == channel
+                && let Some(voice) = slot.voice.as_mut()
+            {
+                voice.set_pressure(0.0);
             }
         }
     }
@@ -2291,8 +2290,8 @@ impl Mixer {
                     (cur / 100) * 100 + (value as u16 % 100)
                 };
                 self.channels[ch].pitch_bend_range_cents = new.max(1); // never zero
-                                                                       // Re-apply the live bend with the new range so still-held voices
-                                                                       // pick up the change immediately.
+                // Re-apply the live bend with the new range so still-held voices
+                // pick up the change immediately.
                 let bend = self.channels[ch].pitch_bend;
                 self.set_pitch_bend(channel, bend);
             }
@@ -2514,10 +2513,9 @@ impl Mixer {
                 slot.channel,
                 channel,
                 &role,
-            ) {
-                if let Some(v) = slot.voice.as_mut() {
-                    v.set_timbre(value & 0x7F);
-                }
+            ) && let Some(v) = slot.voice.as_mut()
+            {
+                v.set_timbre(value & 0x7F);
             }
         }
     }
@@ -3675,12 +3673,13 @@ impl Mixer {
         // new attack; the pool handles that naturally).
         if self.channels[channel as usize % NUM_CHANNELS].mono {
             for slot in self.slots.iter_mut() {
-                if slot.channel == channel && !slot.released {
-                    if let Some(v) = slot.voice.as_mut() {
-                        v.release();
-                        slot.released = true;
-                        slot.sustained = false;
-                    }
+                if slot.channel == channel
+                    && !slot.released
+                    && let Some(v) = slot.voice.as_mut()
+                {
+                    v.release();
+                    slot.released = true;
+                    slot.sustained = false;
                 }
             }
         }
@@ -3690,14 +3689,13 @@ impl Mixer {
         let new_class = voice.exclusive_class();
         if new_class != 0 {
             for slot in self.slots.iter_mut() {
-                if slot.channel == channel {
-                    if let Some(v) = slot.voice.as_ref() {
-                        if v.exclusive_class() == new_class {
-                            slot.voice = None;
-                            slot.sustained = false;
-                            slot.glide_remaining_samples = 0;
-                        }
-                    }
+                if slot.channel == channel
+                    && let Some(v) = slot.voice.as_ref()
+                    && v.exclusive_class() == new_class
+                {
+                    slot.voice = None;
+                    slot.sustained = false;
+                    slot.glide_remaining_samples = 0;
                 }
             }
         }
@@ -3901,20 +3899,19 @@ impl Mixer {
         // voice's very first sample so a note triggered while the bend
         // wheel is held doesn't pop.
         let initial_cents = self.pitch_cents_for_slot(idx);
-        if initial_cents != 0.0 {
-            if let Some(v) = self.slots[idx].voice.as_mut() {
-                v.set_pitch_bend_fine_cents(initial_cents);
-            }
+        if initial_cents != 0.0
+            && let Some(v) = self.slots[idx].voice.as_mut()
+        {
+            v.set_pitch_bend_fine_cents(initial_cents);
         }
         // Per-Note Brightness (#74) is also a live parameter on the
         // voice (like CC 74); the snapshot above only sized the filter
         // for strike time.
-        if let Some(b) = pn_reg(rpnc::BRIGHTNESS) {
-            if !is_drum {
-                if let Some(v) = self.slots[idx].voice.as_mut() {
-                    v.set_timbre(crate::ump::scaling::scale_32_to_7(b));
-                }
-            }
+        if let Some(b) = pn_reg(rpnc::BRIGHTNESS)
+            && !is_drum
+            && let Some(v) = self.slots[idx].voice.as_mut()
+        {
+            v.set_timbre(crate::ump::scaling::scale_32_to_7(b));
         }
     }
 
@@ -4143,10 +4140,8 @@ impl Mixer {
                 rpnc::PAN => self.slots[idx].pn_pan = Some(value),
                 rpnc::EXPRESSION => self.slots[idx].pn_expression = Some(value),
                 rpnc::BRIGHTNESS => {
-                    if !is_drum {
-                        if let Some(v) = self.slots[idx].voice.as_mut() {
-                            v.set_timbre(scale_32_to_7(value));
-                        }
+                    if !is_drum && let Some(v) = self.slots[idx].voice.as_mut() {
+                        v.set_timbre(scale_32_to_7(value));
                     }
                 }
                 rpnc::REVERB_SEND => self.slots[idx].pn_reverb_send = Some(value),
@@ -4285,14 +4280,15 @@ impl Mixer {
         }
         let sustain = self.channels[ch].sustain;
         for slot in self.slots.iter_mut() {
-            if slot.channel == channel && slot.key == key {
-                if let Some(v) = slot.voice.as_mut() {
-                    if sustain || slot.sostenuto_captured {
-                        slot.sustained = true;
-                    } else {
-                        v.release();
-                        slot.released = true;
-                    }
+            if slot.channel == channel
+                && slot.key == key
+                && let Some(v) = slot.voice.as_mut()
+            {
+                if sustain || slot.sostenuto_captured {
+                    slot.sustained = true;
+                } else {
+                    v.release();
+                    slot.released = true;
                 }
             }
         }
@@ -4612,12 +4608,11 @@ impl Mixer {
             // exhausted itself mid-chunk; mark it done so the next mix
             // pass frees the slot. The voice's own `done()` flag is
             // already set in this case (see Voice::render contract).
-            if n < mono.len() {
-                if let Some(v) = slot.voice.as_ref() {
-                    if v.done() {
-                        slot.voice = None;
-                    }
-                }
+            if n < mono.len()
+                && let Some(v) = slot.voice.as_ref()
+                && v.done()
+            {
+                slot.voice = None;
             }
 
             // Per-voice diagnostics (peak / silent-sample counter)
@@ -5529,7 +5524,7 @@ mod tests {
         m.channel_state_mut(0).pitch_bend = 0x3000;
         m.channel_state_mut(0).rpn = 0; // a selected RPN
         m.set_sustain(0, 127); // pedal down
-                               // Things RP-015 must preserve:
+        // Things RP-015 must preserve:
         m.channel_state_mut(0).volume = 50;
         m.channel_state_mut(0).pan = 20;
         m.channel_state_mut(0).program = 12;
@@ -6084,7 +6079,7 @@ mod tests {
         m.note_on(0, 60, 100, voice(0.5, 100_000)); // source = #60
         let (v, bend, _p) = instrumented_voice(0.5, 100_000);
         m.note_on(0, 64, 100, v); // target #64, 4 semitones up
-                                  // Voice starts 4 semitones BELOW target = −400 cents.
+        // Voice starts 4 semitones BELOW target = −400 cents.
         assert_eq!(
             *bend.lock().unwrap(),
             -400,
@@ -6128,7 +6123,7 @@ mod tests {
         m.set_portamento_time(0, 127);
         m.set_portamento_control(0, 60);
         m.note_on(0, 72, 100, voice(0.5, 100_000)); // consumes CC 84
-                                                    // A second note with no CC 84 and CC 65 off must NOT glide.
+        // A second note with no CC 84 and CC 65 off must NOT glide.
         let (v, bend, _p) = instrumented_voice(0.5, 100_000);
         m.note_on(0, 67, 100, v);
         assert_eq!(
@@ -6375,8 +6370,8 @@ mod tests {
     fn pitch_7_25_per_note_controller_is_persistent_absolute_pitch_with_live_repitch() {
         let mut m = Mixer::new();
         m.set_scale_octave_tuning(0, [30.0; 12], false); // MTS, to be overridden
-                                                         // Note #60 sounds at 61.5 HCU: the sample is picked at 61 and
-                                                         // the voice sits +50 cents above it.
+        // Note #60 sounds at 61.5 HCU: the sample is picked at 61 and
+        // the voice sits +50 cents above it.
         m.set_registered_per_note_controller(0, 60, rpnc::PITCH_7_25, (61 << 25) | (1 << 24));
         assert_eq!(m.midi2_note_sample_key(0, 60, ATTRIBUTE_TYPE_NONE, 0), 61);
         assert_eq!(m.midi2_note_sample_key(0, 62, ATTRIBUTE_TYPE_NONE, 0), 62);
@@ -7179,7 +7174,7 @@ mod tests {
     fn rpn_1_channel_fine_tune_data_entry_sets_cents() {
         let mut m = Mixer::new();
         select_rpn(&mut m, 0, 0, 1); // RPN 1 = Channel Fine Tuning
-                                     // Centre (MSB=0x40 LSB=0x00) → 0 cents.
+        // Centre (MSB=0x40 LSB=0x00) → 0 cents.
         m.set_data_entry(0, 0x40, true);
         m.set_data_entry(0, 0x00, false);
         assert_eq!(m.channel_state(0).channel_fine_tune_cents, 0);
@@ -7229,7 +7224,7 @@ mod tests {
     fn data_increment_rpn0_steps_cents_then_wraps_into_semitone() {
         let mut m = Mixer::new();
         select_rpn(&mut m, 0, 0, 0); // RPN 0 = Pitch Bend Sensitivity
-                                     // Start from the GM default (200 = 2 semitones, 0 cents).
+        // Start from the GM default (200 = 2 semitones, 0 cents).
         assert_eq!(m.channel_state(0).pitch_bend_range_cents, 200);
         // RP-018 worked example: increment pitch-bend sensitivity by 2
         // cents = two Data Increment messages (value byte ignored).
@@ -7279,7 +7274,7 @@ mod tests {
     fn data_inc_dec_rpn1_steps_fine_tune_lsb() {
         let mut m = Mixer::new();
         select_rpn(&mut m, 0, 0, 1); // RPN 1 = Channel Fine Tuning
-                                     // Default raw is centre 0x2000 (= 0 cents).
+        // Default raw is centre 0x2000 (= 0 cents).
         assert_eq!(m.channel_state(0).channel_fine_tune_raw_14, 0x2000);
         m.data_inc_dec(0, 1);
         assert_eq!(m.channel_state(0).channel_fine_tune_raw_14, 0x2001);
@@ -7319,7 +7314,7 @@ mod tests {
     fn data_inc_dec_rpn5_steps_mod_depth_cents() {
         let mut m = Mixer::new();
         select_rpn(&mut m, 0, 0, 5); // RPN 5 = Modulation Depth Range
-                                     // GM2 default is 50 cents.
+        // GM2 default is 50 cents.
         assert_eq!(m.channel_state(0).mod_depth_range_cents, 50);
         m.data_inc_dec(0, 1);
         assert_eq!(m.channel_state(0).mod_depth_range_cents, 51);
@@ -7806,7 +7801,7 @@ mod tests {
     fn mpe_upper_zone_assigns_roles_top_down() {
         let mut m = Mixer::new();
         m.set_mpe_zone(MpeZoneKind::Upper, 3); // 3 member channels
-                                               // Manager = ch 15, Members = 12..=14.
+        // Manager = ch 15, Members = 12..=14.
         assert!(matches!(
             m.channel_state(15).mpe_role,
             MpeRole::Manager(MpeZoneKind::Upper)
@@ -7827,11 +7822,11 @@ mod tests {
         m.set_mpe_zone(MpeZoneKind::Lower, 4);
         let (v, bend_cell, _) = instrumented_voice(0.5, 1024);
         m.note_on(1, 60, 100, v); // member channel
-                                  // Manager bend = +1 semi (range = 200 cents).
+        // Manager bend = +1 semi (range = 200 cents).
         m.set_pitch_bend(0, 0x3FFF); // full positive at 200 cents = +200 cents
-                                     // Member bend = half-positive at 4800-cent range = +1200 cents.
+        // Member bend = half-positive at 4800-cent range = +1200 cents.
         m.set_pitch_bend(1, 0x3000); // 0x3000 - 0x2000 = +4096
-                                     //   = 4096 * 4800 / 8192 = 2400 cents
+        //   = 4096 * 4800 / 8192 = 2400 cents
         let total = *bend_cell.lock().unwrap();
         // Manager (200) + Member (2400) = 2600.
         assert!(
@@ -8167,7 +8162,7 @@ mod tests {
             let mut l = vec![0.0; 512];
             let mut r = vec![0.0; 512];
             m.mix_stereo(&mut l, &mut r); // dry + start of tail
-                                          // Run a few more chunks to let the decay separate.
+            // Run a few more chunks to let the decay separate.
             for _ in 0..8 {
                 m.mix_stereo(&mut l, &mut r);
             }

@@ -21,8 +21,8 @@
 use std::sync::Arc;
 
 use oxideav_core::{Decoder, Error, Frame, Packet, TimeBase};
-use oxideav_midi::instruments::dls::DlsInstrument;
 use oxideav_midi::instruments::Instrument;
+use oxideav_midi::instruments::dls::DlsInstrument;
 use oxideav_midi::{MidiDecoder, OUTPUT_SAMPLE_RATE};
 
 /// Build a tiny SMF: one channel-0 key-60 note on at tick 0, note off
@@ -52,7 +52,7 @@ fn render_to_pcm(dec: &mut MidiDecoder, smf: Vec<u8>) -> Vec<i16> {
     for _ in 0..2048 {
         match dec.receive_frame() {
             Ok(Frame::Audio(af)) => {
-                for chunk in af.data[0].chunks_exact(2) {
+                for chunk in af.data[0].as_chunks::<2>().0 {
                     all.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
             }
@@ -313,7 +313,7 @@ fn build_dls_with_articulation(art1_blocks: &[ArtBlock]) -> Vec<u8> {
     wsmp.extend_from_slice(&0i32.to_le_bytes()); // gain (centibels)
     wsmp.extend_from_slice(&0u32.to_le_bytes()); // options
     wsmp.extend_from_slice(&1u32.to_le_bytes()); // 1 loop
-                                                 // loop record: cbSize=16, type=0 (forward), start=0, length=n.
+    // loop record: cbSize=16, type=0 (forward), start=0, length=n.
     wsmp.extend_from_slice(&16u32.to_le_bytes());
     wsmp.extend_from_slice(&0u32.to_le_bytes());
     wsmp.extend_from_slice(&0u32.to_le_bytes());

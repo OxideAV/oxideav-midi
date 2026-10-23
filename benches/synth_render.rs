@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use oxideav_core::{Decoder, Error, Frame, Packet, TimeBase};
-use oxideav_midi::instruments::{sf2::Sf2Instrument, tone::ToneInstrument, Instrument};
+use oxideav_midi::instruments::{Instrument, sf2::Sf2Instrument, tone::ToneInstrument};
 use oxideav_midi::{MidiDecoder, OUTPUT_SAMPLE_RATE};
 
 // =========================================================================

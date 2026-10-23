@@ -41,14 +41,14 @@ pub mod stream;
 pub mod translator;
 
 pub use data::{
-    sysex7_packets, sysex8_packets, Data128Message, DataFormat, Sysex7, Sysex7Assembler,
-    Sysex8Assembler,
+    Data128Message, DataFormat, Sysex7, Sysex7Assembler, Sysex8Assembler, sysex7_packets,
+    sysex8_packets,
 };
-pub use flex::{flex_text_packets, FlexAddress, FlexDataMessage, FlexTextAssembler};
+pub use flex::{FlexAddress, FlexDataMessage, FlexTextAssembler, flex_text_packets};
 pub use message::{
     Midi1ChannelVoice, Midi2ChannelVoice, SystemMessage, UmpMessage, UtilityMessage,
 };
 pub use packet::{MessageType, Ump, UmpStream};
 pub use scaling::{scale_down, scale_up};
 pub use stream::{StreamFormat, StreamTextAssembler, UmpStreamMessage};
-pub use translator::{midi2_to_midi1_messages, Midi1ToMidi2Translator};
+pub use translator::{Midi1ToMidi2Translator, midi2_to_midi1_messages};

@@ -10,8 +10,8 @@
 //! steps — which the Appendix-D downscale folds onto the same 14-bit
 //! step, and therefore onto the same PCM — renders differently.
 
-use oxideav_midi::instruments::tone::ToneInstrument;
 use oxideav_midi::instruments::Instrument;
+use oxideav_midi::instruments::tone::ToneInstrument;
 use oxideav_midi::mixer::Mixer;
 use oxideav_midi::ump::scaling::scale_32_to_14;
 
@@ -105,8 +105,8 @@ fn pitch_bend_32_resolution_is_monotone_across_a_14_bit_step() {
 // ── 16-bit velocity + Pitch 7.9 attribute (M2-104 §7.4.2 / §7.4.15.3) ──
 
 use oxideav_midi::mixer::{
-    midi2_sample_key, midi2_velocity_position, midi2_velocity_to_7, ATTRIBUTE_TYPE_NONE,
-    ATTRIBUTE_TYPE_PITCH_7_9,
+    ATTRIBUTE_TYPE_NONE, ATTRIBUTE_TYPE_PITCH_7_9, midi2_sample_key, midi2_velocity_position,
+    midi2_velocity_to_7,
 };
 use oxideav_midi::ump::scaling::{scale_7_to_16, scale_7_to_32};
 

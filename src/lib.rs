@@ -107,11 +107,11 @@ use oxideav_core::{
     Error, Frame, Packet, Result,
 };
 
+use crate::instruments::Instrument;
 use crate::instruments::dls::DlsInstrument;
 use crate::instruments::sf2::Sf2Instrument;
 use crate::instruments::sfz::SfzInstrument;
 use crate::instruments::tone::ToneInstrument;
-use crate::instruments::Instrument;
 use crate::mixer::Mixer;
 use crate::scheduler::Scheduler;
 
@@ -591,7 +591,7 @@ mod tests {
                     assert_eq!(af.data.len(), 1, "interleaved S16 = single plane");
                     let bytes = &af.data[0];
                     assert_eq!(bytes.len(), FRAME_SAMPLES * 4, "stereo S16 = 4 bytes/frame");
-                    for chunk in bytes.chunks_exact(2) {
+                    for chunk in bytes.as_chunks::<2>().0 {
                         all_samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
                     frame_count += 1;
@@ -670,7 +670,7 @@ mod tests {
         for _ in 0..1024 {
             match dec.receive_frame() {
                 Ok(Frame::Audio(af)) => {
-                    for chunk in af.data[0].chunks_exact(2) {
+                    for chunk in af.data[0].as_chunks::<2>().0 {
                         all_samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
                 }
@@ -921,7 +921,7 @@ mod tests {
         for _ in 0..64 {
             match dec.receive_frame() {
                 Ok(Frame::Audio(af)) => {
-                    for chunk in af.data[0].chunks_exact(2) {
+                    for chunk in af.data[0].as_chunks::<2>().0 {
                         samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
                 }

@@ -25,8 +25,7 @@ fuzz_target!(|data: &[u8]| {
             continue;
         };
         let encoded: Ump = message.encode();
-        let again = UmpMessage::decode(&encoded)
-            .expect("re-encoded packet must decode");
+        let again = UmpMessage::decode(&encoded).expect("re-encoded packet must decode");
         assert_eq!(again, message, "encode/decode must be a fixed point");
         assert_eq!(
             encoded.words().len(),

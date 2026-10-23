@@ -48,9 +48,9 @@ use crate::clip::ClipFile;
 use crate::instruments::Instrument;
 use crate::mixer::{Mixer, NUM_CHANNELS};
 use crate::smf::{ChannelBody, ChannelMessage, Division, Event, MetaEvent, SmfFile};
+use crate::ump::Sysex7Assembler;
 use crate::ump::flex::{self, FlexDataMessage};
 use crate::ump::message::{Midi2ChannelVoice, UmpMessage};
-use crate::ump::Sysex7Assembler;
 
 /// Default tempo when no `FF 51 03` is seen yet — 120 BPM = 500 000 µs
 /// per quarter note. The SMF spec mandates this default.
@@ -748,12 +748,11 @@ fn dispatch_universal_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer)
         // <dev> 0B 01 {cc vv}… F7. The shared parser enforces the
         // §3.1.3 validity rules; an invalid message is discarded and
         // the previous MIP table stays in force.
-        if payload.get(3) == Some(&0x01) {
-            if let Some(mip) =
+        if payload.get(3) == Some(&0x01)
+            && let Some(mip) =
                 crate::smf::ScalablePolyphonyMip::parse_pairs(payload.get(4..).unwrap_or(&[]))
-            {
-                mixer.apply_mip_message(mip);
-            }
+        {
+            mixer.apply_mip_message(mip);
         }
         return;
     }
@@ -766,7 +765,9 @@ fn dispatch_universal_real_time(payload: &[u8], mixer: &mut crate::mixer::Mixer)
             let channel = payload[4] & 0x0F;
             let key = payload[5] & 0x7F;
             let pairs: Vec<(u8, u8)> = payload[6..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| (c[0] & 0x7F, c[1] & 0x7F))
                 .collect();
             mixer.set_key_based_controls(channel, key, &pairs);
@@ -850,7 +851,9 @@ fn dispatch_controller_destination(payload: &[u8], mixer: &mut crate::mixer::Mix
         _ => return,
     };
     let pairs: Vec<(u8, u8)> = pair_bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| (c[0] & 0x7F, c[1] & 0x7F))
         .collect();
     match sub2 {
@@ -894,8 +897,8 @@ fn dispatch_global_parameter_control(payload: &[u8], mixer: &mut crate::mixer::M
     let sw = payload[4] as usize; // slot-path entry count
     let pw = payload[5] as usize; // parameter-id byte width
     let vw = payload[6] as usize; // value byte width
-                                  // A zero parameter or value width can't address anything; a GM2 edit
-                                  // always carries at least one byte of each.
+    // A zero parameter or value width can't address anything; a GM2 edit
+    // always carries at least one byte of each.
     if pw == 0 || vw == 0 {
         return;
     }
@@ -1235,7 +1238,7 @@ mod tests {
         let mut ev = Vec::new();
         // Note on, then pitch bend, then EOT.
         ev.extend_from_slice(&[0x00, 0x90, 0x3C, 0x64]); // note on
-                                                         // Pitch bend max-up: status E0, lsb 0x7F, msb 0x7F.
+        // Pitch bend max-up: status E0, lsb 0x7F, msb 0x7F.
         ev.extend_from_slice(&[0x10, 0xE0, 0x7F, 0x7F]);
         ev.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
         let smf = parse(&smf_with_events(96, &ev)).unwrap();
@@ -1452,7 +1455,7 @@ mod tests {
 
     #[test]
     fn midi_ci_set_profile_on_off_sysex_routes_to_the_mixer() {
-        use crate::ci::{sub_id2, CiBody, CiMessage, ProfileId, CI_VERSION_2};
+        use crate::ci::{CI_VERSION_2, CiBody, CiMessage, ProfileId, sub_id2};
         let profile = ProfileId::standard(0x00, 0x05, 0x01, 0x01);
         let ci = |sub: u8, body: CiBody| {
             CiMessage {

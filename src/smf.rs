@@ -3473,7 +3473,7 @@ impl UniversalSysExEvent {
         let ln = *self.data.get(4)? as usize;
         // The minimum legal body is the 4-byte simple meter; compound
         // meters add 2 bytes per extra pair, so ln must be 4, 6, 8, ...
-        if ln < 4 || (ln - 4) % 2 != 0 {
+        if ln < 4 || !(ln - 4).is_multiple_of(2) {
             return None;
         }
         // The leading quartet is nn dd cc bb at indices 5..9.
@@ -4294,7 +4294,7 @@ impl UniversalSysExEvent {
         Some(MidiVisualControl {
             address,
             data,
-            checksum_valid: total % 128 == 0,
+            checksum_valid: total.is_multiple_of(128),
         })
     }
 }
@@ -9140,10 +9140,10 @@ impl SmfFile {
                 if abs > tick {
                     break;
                 }
-                if let Event::Channel(ChannelMessage { channel: ch, body }) = &ev.kind {
-                    if *ch == channel {
-                        events.push((abs, track_idx, in_track_idx, *body));
-                    }
+                if let Event::Channel(ChannelMessage { channel: ch, body }) = &ev.kind
+                    && *ch == channel
+                {
+                    events.push((abs, track_idx, in_track_idx, *body));
                 }
             }
         }
@@ -18825,8 +18825,8 @@ mod tests {
         let msgs = smf.reassembled_sysex_messages();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].tick, 0); // opener tick
-                                     // body = opener payload (0x43 0x12 0x00) + continuation (0x01 0x02),
-                                     // trailing F7 stripped.
+        // body = opener payload (0x43 0x12 0x00) + continuation (0x01 0x02),
+        // trailing F7 stripped.
         assert_eq!(msgs[0].body, vec![0x43, 0x12, 0x00, 0x01, 0x02]);
         assert!(msgs[0].complete);
         assert_eq!(msgs[0].packet_count, 2);
@@ -19575,7 +19575,7 @@ mod tests {
             mip.masked_channels(poly)
                 .iter()
                 .enumerate()
-                .filter(|(_, &m)| !m)
+                .filter(|&(_, &m)| !m)
                 .map(|(i, _)| i as u8 + 1) // one-based, as the spec text
                 .collect()
         };

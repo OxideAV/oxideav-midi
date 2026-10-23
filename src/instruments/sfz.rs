@@ -434,10 +434,10 @@ fn build_envelope_from_opcodes(opcodes: &BTreeMap<String, String>) -> EnvelopePa
 fn build_vibrato_from_opcodes(opcodes: &BTreeMap<String, String>) -> VibratoParams {
     fn pf(map: &BTreeMap<String, String>, keys: &[&str], default: f32) -> f32 {
         for k in keys {
-            if let Some(s) = map.get(*k) {
-                if let Ok(v) = s.trim().parse::<f32>() {
-                    return v;
-                }
+            if let Some(s) = map.get(*k)
+                && let Ok(v) = s.trim().parse::<f32>()
+            {
+                return v;
             }
         }
         default
@@ -548,20 +548,20 @@ fn build_mod_env_from_opcodes(
 ) -> ModEnvParams {
     fn pf(map: &BTreeMap<String, String>, keys: &[&str], default: f32) -> f32 {
         for k in keys {
-            if let Some(s) = map.get(*k) {
-                if let Ok(v) = s.trim().parse::<f32>() {
-                    return v;
-                }
+            if let Some(s) = map.get(*k)
+                && let Ok(v) = s.trim().parse::<f32>()
+            {
+                return v;
             }
         }
         default
     }
     fn pi(map: &BTreeMap<String, String>, keys: &[&str], default: i32) -> i32 {
         for k in keys {
-            if let Some(s) = map.get(*k) {
-                if let Ok(v) = s.trim().parse::<i32>() {
-                    return v;
-                }
+            if let Some(s) = map.get(*k)
+                && let Ok(v) = s.trim().parse::<i32>()
+            {
+                return v;
             }
         }
         default

@@ -1685,7 +1685,7 @@ mod tests {
         payload.extend_from_slice(&(-1000i32).to_le_bytes()); // gain
         payload.extend_from_slice(&0u32.to_le_bytes()); // options
         payload.extend_from_slice(&1u32.to_le_bytes()); // 1 loop
-                                                        // loop record:
+        // loop record:
         payload.extend_from_slice(&16u32.to_le_bytes()); // cbSize
         payload.extend_from_slice(&0u32.to_le_bytes()); // type=forward
         payload.extend_from_slice(&128u32.to_le_bytes()); // start

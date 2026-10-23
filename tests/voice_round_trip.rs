@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use oxideav_core::{Decoder, Error, Frame, Packet, TimeBase};
-use oxideav_midi::{instruments::Instrument, InstrumentSource, MidiDecoder, OUTPUT_SAMPLE_RATE};
+use oxideav_midi::{InstrumentSource, MidiDecoder, OUTPUT_SAMPLE_RATE, instruments::Instrument};
 
 /// Build a minimal one-track SMF: a single 60-key note at chan 0 vel
 /// 100 lasting ~0.5 s plus an EOT.
@@ -46,7 +46,7 @@ fn render_to_pcm(dec: &mut MidiDecoder, smf: Vec<u8>) -> Vec<i16> {
     for _ in 0..2048 {
         match dec.receive_frame() {
             Ok(Frame::Audio(af)) => {
-                for chunk in af.data[0].chunks_exact(2) {
+                for chunk in af.data[0].as_chunks::<2>().0 {
                     all.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
             }

@@ -20,16 +20,16 @@ use oxideav_midi::smf::{
     self, ChannelBody, ChannelMessage, Division, Event, MetaEvent, SmfFile, SmfFormat, SmfHeader,
     Track, TrackEvent,
 };
-use oxideav_midi::ump::data::{sysex8_packets, Data128Message, DataFormat};
+use oxideav_midi::ump::data::{Data128Message, DataFormat, sysex8_packets};
 use oxideav_midi::ump::flex::{
-    flex_text_packets, ChordAlteration, ChordName, FlexAddress, FlexDataMessage,
+    ChordAlteration, ChordName, FlexAddress, FlexDataMessage, flex_text_packets,
 };
 use oxideav_midi::ump::message::{Midi1ChannelVoice, Midi2ChannelVoice, UmpMessage};
 use oxideav_midi::ump::stream::{
-    endpoint_name_packets, function_block_name_packets, product_instance_id_packets,
-    UmpStreamMessage,
+    UmpStreamMessage, endpoint_name_packets, function_block_name_packets,
+    product_instance_id_packets,
 };
-use oxideav_midi::ump::{sysex7_packets, Ump};
+use oxideav_midi::ump::{Ump, sysex7_packets};
 
 fn from_words(words: &[u32]) -> UmpMessage {
     UmpMessage::decode(&Ump::from_words(words).expect("packet")).expect("decodes")
@@ -49,7 +49,7 @@ fn every_message_type() -> Vec<UmpMessage> {
     // the JR messages ride in the sequence.
     v.push(from_words(&[0x0010_1234])); // JR Clock
     v.push(from_words(&[0x0020_5678])); // JR Timestamp
-                                        // MT 0x1 System Common / Real Time.
+    // MT 0x1 System Common / Real Time.
     for w in [
         0x11F1_2300u32, // MTC Quarter Frame
         0x11F2_0F7F,    // Song Position Pointer
@@ -338,7 +338,9 @@ fn clip_writer_is_a_fixed_point_over_every_message_type() {
     // The §3.2.2 restart is really in the stream: a DCS of 0xFFFFF
     // followed by a NOOP.
     let words: Vec<u32> = bytes[8..]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let restarts = words
