@@ -184,6 +184,7 @@ pub struct PePayload {
 
 /// The body of a MIDI-CI message, discriminated by Sub-ID#2.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CiBody {
     /// 0x70 Discovery (§5.5) — broadcast by an Initiator.
     Discovery {
@@ -381,6 +382,7 @@ pub enum CiBody {
 
 /// A complete MIDI-CI message: the §5.2.1 envelope plus a typed body.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CiMessage {
     /// Device ID: 0x00..=0x0F channels, 0x7E Group, 0x7F Function
     /// Block.
@@ -395,6 +397,27 @@ pub struct CiMessage {
     pub destination_muid: u32,
     /// The typed body.
     pub body: CiBody,
+}
+
+impl CiMessage {
+    /// Build a [`CiMessage`] from its fields.
+    pub fn new(
+        device_id: u8,
+        sub_id2: u8,
+        version: u8,
+        source_muid: u32,
+        destination_muid: u32,
+        body: CiBody,
+    ) -> Self {
+        Self {
+            device_id,
+            sub_id2,
+            version,
+            source_muid,
+            destination_muid,
+            body,
+        }
+    }
 }
 
 /// Cursor-style reader over 7-bit SysEx payload bytes.

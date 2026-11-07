@@ -9,6 +9,7 @@
 /// carries the 32-bit data payload (or the structured per-field layout
 /// for Note On/Off, Program Change, and RPN/NRPN messages).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Midi2ChannelVoice {
     /// Registered Per-Note Controller (opcode 0x0) — §7.4.4.
     RegisteredPerNoteController {

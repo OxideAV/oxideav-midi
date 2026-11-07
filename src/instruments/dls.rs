@@ -123,6 +123,7 @@ pub const MAX_RECORDS: usize = 1 << 20;
 /// One DLS bank in memory. Parsed eagerly and self-contained — no
 /// references back into the source bytes.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct DlsBank {
     /// Bank metadata (INAM / ICOP / etc.) from the top-level
     /// `INFO-list`, if present.
@@ -152,6 +153,7 @@ pub struct DlsBank {
 /// `INFO-list` text fields. All optional. ZSTR (null-terminated ASCII)
 /// per RIFF convention; we strip the trailing NUL.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct DlsInfo {
     /// `INAM` — bank name.
     pub name: Option<String>,
@@ -168,6 +170,7 @@ pub struct DlsInfo {
 /// One sample from the wave pool. Carries the raw on-disk PCM bytes
 /// plus the parsed `fmt ` + optional `wsmp` headers.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct DlsSample {
     /// Byte offset of this `wave` LIST from the start of the parent
     /// `wvpl` LIST's payload (i.e. the value `ptbl` cues point at).
@@ -204,6 +207,7 @@ pub struct DlsSample {
 /// voice generator decides how to interpret it from the surrounding
 /// `vers` chunk if it cares about the distinction.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct DlsWaveSample {
     /// `usUnityNote` — MIDI note this sample sounds at when played at
     /// its native rate. Default 60 (middle C) per spec when wsmp is
@@ -237,6 +241,7 @@ pub struct DlsLoop {
 /// One instrument from `lins-list`. Carries the bank/program selector
 /// from `insh-ck` plus a flat list of regions.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct DlsInstrumentEntry {
     /// `MIDILOCALE.ulBank`. Bits 0-6 = MIDI CC32 (LSB), bits 8-14 =
     /// MIDI CC0 (MSB), bit 31 = `F_INSTRUMENT_DRUMS`.
@@ -285,6 +290,7 @@ impl DlsInstrumentEntry {
 
 /// One region inside a [`DlsInstrumentEntry`].
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct DlsRegion {
     /// Inclusive low MIDI key.
     pub key_lo: u16,

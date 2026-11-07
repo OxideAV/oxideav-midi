@@ -9,10 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- API hygiene: `#[non_exhaustive]` on the growable enums `CiBody`,
+  `MetaEvent`, `RegisteredParameter`, `DeviceControl`, `MmcCommandType`,
+  `MmcInformationField`, `ShowControlFormat`, `ShowControlCommand`,
+  `SampleDumpExtension`, `MvcParameter`, `GeneralMidiSystem`,
+  `ControlledParameter`, `UniversalSubId1`, `UniversalSubId2`,
+  `InstrumentSource`, `UtilityMessage`, `UmpMessage`,
+  `Midi2ChannelVoice`, `UmpStreamMessage`, `Data128Message`,
+  `FlexDataMessage` and `Waveform`; and on the records `CiMessage`,
+  `Track`, `SmfFile`, `ClipFile`, `MpeZone`, `ReassembledSysEx`,
+  `SmfChannelSnapshot`, `Note`, every per-event view returned by the
+  `SmfFile` accessors (`TempoChange`, `TimeSignatureChange`,
+  `KeySignatureChange`, the text / marker / lyric / cue events,
+  `SmpteOffsetEvent`, the channel-message event views, `SysExEvent`,
+  `UniversalSysExEvent` and the universal-SysEx event wrappers), and
+  the DLS bank records `DlsBank`, `DlsInfo`, `DlsSample`,
+  `DlsWaveSample`, `DlsInstrumentEntry` and `DlsRegion`. Enums and
+  payload records whose layout the MIDI / SMF / UMP / SDS / MMC
+  specifications fix (status nibbles, 2-bit format fields, frame rates,
+  channel-mode / effect-depth / sound-controller ranges, fixed SysEx
+  payloads) stay exhaustive. No behaviour change.
 - edition 2024, MSRV 1.95
 
 ### Added
 
+- `SmfFile::new(header, tracks)`, `Track::new(events)`,
+  `CiMessage::new(..)`, and `ClipFile` gains `Default`,
+  `ClipFile::new(ticks_per_quarter_note)` and `with_profiles` /
+  `with_config` / `with_start_tick` / `with_sequence` / `with_end_tick`.
 - **Native MIDI 2.0 32-bit Pitch Bend in the mixer** (M2-104 §7.4.11):
   `Mixer::set_pitch_bend_32` keeps the full 32-bit resolution
   (`ChannelState::pitch_bend_hr`, `pitch_bend_32_to_cents`) and delivers

@@ -1020,6 +1020,7 @@ pub enum MpeZoneKind {
 /// what their Pitch Bend Sensitivities are. Built by the mixer in
 /// response to the MPE Configuration Message (MCM, RPN 6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MpeZone {
     /// `Lower` or `Upper`.
     pub kind: MpeZoneKind,

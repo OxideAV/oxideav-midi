@@ -259,6 +259,7 @@ impl MidiDecoder {
 /// "I have an SF2 file at this path" doesn't have to type the full
 /// `Arc::new(Sf2Instrument::open(...))` chain.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum InstrumentSource {
     /// SoundFont 2 bank — loaded via [`Sf2Instrument::open`].
     Sf2(PathBuf),

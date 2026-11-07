@@ -39,25 +39,23 @@ fn one_second_midi2_clip() -> Vec<u8> {
             },
         },
     };
-    let clip = ClipFile {
-        ticks_per_quarter_note: 480,
-        profiles: vec![],
-        config: vec![ClipEvent {
+    let clip = ClipFile::new(480)
+        .with_profiles(vec![])
+        .with_config(vec![ClipEvent {
             tick: 0,
             message: UmpMessage::Flex(FlexDataMessage::SetTempo {
                 group: 0,
                 ten_ns_per_quarter_note: 50_000_000, // 120 BPM
             }),
-        }],
-        start_tick: 0,
-        sequence: vec![
+        }])
+        .with_start_tick(0)
+        .with_sequence(vec![
             note(0, true, 60),
             note(480, false, 60),
             note(480, true, 64),
             note(960, false, 64),
-        ],
-        end_tick: 960,
-    };
+        ])
+        .with_end_tick(960);
     clip::write(&clip).expect("clip serialises")
 }
 
@@ -95,14 +93,12 @@ fn midi2_clip_renders_nonsilent_pcm() {
 
 #[test]
 fn clip_without_notes_drains_to_eof() {
-    let clip = ClipFile {
-        ticks_per_quarter_note: 96,
-        profiles: vec![],
-        config: vec![],
-        start_tick: 0,
-        sequence: vec![],
-        end_tick: 0,
-    };
+    let clip = ClipFile::new(96)
+        .with_profiles(vec![])
+        .with_config(vec![])
+        .with_start_tick(0)
+        .with_sequence(vec![])
+        .with_end_tick(0);
     let mut dec = MidiDecoder::new(Arc::new(ToneInstrument::new()), 44_100);
     let pkt = Packet::new(
         0,

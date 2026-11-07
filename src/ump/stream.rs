@@ -106,6 +106,7 @@ pub const MAX_FUNCTION_BLOCK_NAME_BYTES: usize = 91;
 
 /// A decoded UMP Stream Message (MT 0xF) — §7.1, Table 34.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UmpStreamMessage {
     /// Endpoint Discovery (status 0x00) — §7.1.1. Requests basic
     /// information about the UMP Endpoint; `filter` is the

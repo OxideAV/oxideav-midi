@@ -180,6 +180,7 @@ pub enum ChannelBody {
 
 /// Decoded meta event.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MetaEvent {
     /// `FF 00 02 ssss` — explicit sequence number.
     SequenceNumber(u16),
@@ -224,15 +225,31 @@ pub enum MetaEvent {
 
 /// One track parsed out of an `MTrk` chunk.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Track {
     pub events: Vec<TrackEvent>,
 }
 
+impl Track {
+    /// Build a [`Track`] from its fields.
+    pub fn new(events: Vec<TrackEvent>) -> Self {
+        Self { events }
+    }
+}
+
 /// A fully parsed SMF file.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SmfFile {
     pub header: SmfHeader,
     pub tracks: Vec<Track>,
+}
+
+impl SmfFile {
+    /// Build a [`SmfFile`] from its fields.
+    pub fn new(header: SmfHeader, tracks: Vec<Track>) -> Self {
+        Self { header, tracks }
+    }
 }
 
 /// Incrementally assemble one [`Track`] from events placed at **absolute
@@ -432,6 +449,7 @@ impl SmfBuilder {
 /// Returned by [`SmfFile::time_signatures`] — see that method for the
 /// merge semantics across multiple tracks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TimeSignatureChange {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -478,6 +496,7 @@ impl TimeSignatureChange {
 /// Returned by [`SmfFile::tempo_map`] — see that method for the merge
 /// semantics across multiple tracks.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct TempoChange {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -625,6 +644,7 @@ impl TempoTimeline {
 /// scale (C major / A minor). `mode` is `0` for major and `1` for
 /// minor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeySignatureChange {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -739,6 +759,7 @@ const MINOR_KEY_NAMES: [&str; 15] = [
 /// substitutes) or pick their own decoding strategy from the raw
 /// bytes returned by [`MarkerEvent::text_bytes`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MarkerEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -790,6 +811,7 @@ impl MarkerEvent {
 /// substitutes) or pick their own decoding strategy from the raw bytes
 /// returned by [`LyricEvent::text_bytes`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LyricEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -847,6 +869,7 @@ impl LyricEvent {
 /// substitutes) or pick their own decoding strategy from the raw bytes
 /// returned by [`CueEvent::text_bytes`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CueEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -908,6 +931,7 @@ impl CueEvent {
 /// `U+FFFD` substitutes) or pick their own decoding strategy from the
 /// raw bytes returned by [`TrackNameEvent::text_bytes`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TrackNameEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -968,6 +992,7 @@ impl TrackNameEvent {
 /// `U+FFFD` substitutes) or pick their own decoding strategy from the
 /// raw bytes returned by [`InstrumentNameEvent::text_bytes`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct InstrumentNameEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -1028,6 +1053,7 @@ impl InstrumentNameEvent {
 /// substitutes) or pick their own decoding strategy from the raw bytes
 /// returned by [`TextEvent::text_bytes`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TextEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -1082,6 +1108,7 @@ impl TextEvent {
 /// `U+FFFD` substitutes) or pick their own decoding strategy from the
 /// raw bytes returned by [`CopyrightEvent::text_bytes`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CopyrightEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -1200,6 +1227,7 @@ impl FrameRate {
 /// `seconds`, `frames` are the plain counter values; `subframes`
 /// counts 1/100 of a frame (the conventional MTC encoding).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SmpteOffsetEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -1288,6 +1316,7 @@ impl SmpteOffsetEvent {
 /// load → save cycle) get a clean time-ordered list independent of
 /// the surrounding text / rhythmic / cueing meta events.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SequencerSpecificEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -1337,6 +1366,7 @@ impl SequencerSpecificEvent {
 /// a clean time-ordered list independent of the surrounding text /
 /// rhythmic / cueing / sequencer-private meta events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SequenceNumberEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -1394,6 +1424,7 @@ impl SequenceNumberEvent {
 /// spec leaves the mapping from port index to physical destination up
 /// to the receiving application.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MidiPortEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -1458,6 +1489,7 @@ impl MidiPortEvent {
 /// is unambiguously non-spec and the receiver should likely fall back
 /// to the most recent channel-voice channel rather than mask the byte).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChannelPrefixEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the meta event, in division units. For format-1 SMFs this is
@@ -1534,6 +1566,7 @@ impl ChannelPrefixEvent {
 /// the raw number preserved, so a forward-compatible caller can still
 /// route on the exact value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RegisteredParameter {
     /// `0x0000` — Pitch Bend Sensitivity. Data Entry MSB = ± semitones,
     /// LSB = ± cents.
@@ -1699,6 +1732,7 @@ pub enum DataEntryAction {
 /// or a relative ±1 step). It is the read-side analogue of the runtime
 /// RPN / NRPN state machine a synth maintains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ParameterDataEntry {
     /// Cumulative delta-sum from the start of the track that carried the
     /// Data Entry controller, in division units. For format-1 SMFs this
@@ -1763,6 +1797,7 @@ impl ParameterDataEntry {
 /// "song form" view that highlights the bar each instrument enters)
 /// don't have to re-walk every track event manually.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ProgramChangeEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the channel-voice event, in division units. For format-1 SMFs
@@ -1841,6 +1876,7 @@ impl ProgramChangeEvent {
 /// six the snapshot tracks — don't have to re-walk the channel-voice
 /// stream manually.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ControlChangeEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the channel-voice event, in division units. For format-1 SMFs
@@ -2118,6 +2154,7 @@ impl ControlChangeEvent {
 /// Returned by [`SmfFile::channel_mode_messages`] — the typed
 /// counterpart of the channel-mode subset of [`SmfFile::control_changes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChannelModeEvent {
     /// Cumulative delta-sum from the start of the track that carried the
     /// controller, in division units. For format-1 SMFs this is also the
@@ -2150,6 +2187,7 @@ impl ChannelModeEvent {
 /// Returned by [`SmfFile::effect_depths`] — the typed counterpart of the
 /// effects-depth subset of [`SmfFile::control_changes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EffectDepthEvent {
     /// Cumulative delta-sum from the start of the track that carried the
     /// controller, in division units. For format-1 SMFs this is also the
@@ -2269,6 +2307,7 @@ impl SoundController {
 /// Returned by [`SmfFile::sound_controllers`] — the typed counterpart of
 /// the sound-controller subset of [`SmfFile::control_changes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SoundControllerEvent {
     /// Cumulative delta-sum from the start of the track that carried the
     /// controller, in division units. For format-1 SMFs this is also the
@@ -2326,6 +2365,7 @@ impl SoundControllerEvent {
 /// order so callers building the full bend timeline don't have to
 /// re-walk every track event manually.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PitchBendEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the channel-voice event, in division units. For format-1 SMFs
@@ -2416,6 +2456,7 @@ impl PitchBendEvent {
 /// receiver's concern, so the helper stays routing-agnostic and surfaces
 /// the raw `0..=127` bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PolyAftertouchEvent {
     /// Cumulative delta-sum from the start of the track that carried the
     /// channel-voice event, in division units. For format-1 SMFs this is
@@ -2490,6 +2531,7 @@ impl PolyAftertouchEvent {
 /// by the receiving instrument) is the receiver's concern, so the
 /// helper stays routing-agnostic and surfaces the raw `0..=127` byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChannelPressureEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the channel-voice event, in division units. For format-1 SMFs
@@ -2547,6 +2589,7 @@ impl ChannelPressureEvent {
 /// byte); [`SmfFile::notes`] honours that convention when matching, so a
 /// `9n key 0` releases an open note exactly as an `8n key xx` would.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Note {
     /// Absolute tick (cumulative delta-sum on the global merged
     /// timebase) at which the Note On fires. For format-1 SMFs every
@@ -2687,6 +2730,7 @@ impl Note {
 ///
 /// [`data`]: SysExEvent::data
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SysExEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the SysEx event, in division units. For format-1 SMFs this is
@@ -2810,6 +2854,7 @@ pub struct UniversalSysEx {
 /// same convention used by [`SmfFile::sysex_events`] and every meta-
 /// event iteration helper.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct UniversalSysExEvent {
     /// Cumulative delta-sum from the start of the track that carried
     /// the SysEx packet, in division units. For format-1 SMFs this is
@@ -3185,6 +3230,7 @@ impl NotationTimeSignature {
 ///
 /// [`GlobalParameterControl`]: DeviceControl::GlobalParameterControl
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeviceControl {
     /// `04 01 lsb msb` — Master Volume. A 14-bit unsigned level
     /// (`0..=0x3FFF`); `0x0000` = silence, `0x3FFF` = full scale.
@@ -3271,6 +3317,7 @@ impl DeviceControl {
 /// [`track`]: Self::track
 /// [`control`]: Self::control
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeviceControlEvent {
     /// Absolute tick (cumulative per-track delta sum).
     pub tick: u64,
@@ -3283,6 +3330,7 @@ pub struct DeviceControlEvent {
 /// A decoded **MMC Command** pinned to the absolute tick (and the track)
 /// at which it fires — the element type of [`SmfFile::mmc_commands`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MmcCommandEvent {
     /// Absolute tick (cumulative per-track delta sum).
     pub tick: u64,
@@ -3295,6 +3343,7 @@ pub struct MmcCommandEvent {
 /// A decoded **MMC Response** pinned to the absolute tick (and the track)
 /// at which it fires — the element type of [`SmfFile::mmc_responses`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MmcResponseEvent {
     /// Absolute tick (cumulative per-track delta sum).
     pub tick: u64,
@@ -3308,6 +3357,7 @@ pub struct MmcResponseEvent {
 /// (and the track) at which it fires — the element type of
 /// [`SmfFile::show_control_messages`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ShowControlEvent {
     /// Absolute tick (cumulative per-track delta sum).
     pub tick: u64,
@@ -3321,6 +3371,7 @@ pub struct ShowControlEvent {
 /// track) at which it fires — the element type of
 /// [`SmfFile::identity_replies`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IdentityReplyEvent {
     /// Absolute tick (cumulative per-track delta sum).
     pub tick: u64,
@@ -3334,6 +3385,7 @@ pub struct IdentityReplyEvent {
 /// (and the track) at which it fires — the element type of
 /// [`SmfFile::general_midi_system_messages`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GeneralMidiSystemEvent {
     /// Absolute tick (cumulative per-track delta sum).
     pub tick: u64,
@@ -3347,6 +3399,7 @@ pub struct GeneralMidiSystemEvent {
 /// absolute tick (and the track) at which it fires — the element type of
 /// [`SmfFile::controller_destinations`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ControllerDestinationEvent {
     /// Absolute tick (cumulative per-track delta sum).
     pub tick: u64,
@@ -3360,6 +3413,7 @@ pub struct ControllerDestinationEvent {
 /// absolute tick (and the track) at which it fires — the element type of
 /// [`SmfFile::key_based_instrument_controls`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeyBasedInstrumentControlEvent {
     /// Absolute tick (cumulative per-track delta sum).
     pub tick: u64,
@@ -3373,6 +3427,7 @@ pub struct KeyBasedInstrumentControlEvent {
 /// tick (and the track) at which it fires — the element type of
 /// [`SmfFile::file_references`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FileReferenceEvent {
     /// Absolute tick (cumulative per-track delta sum).
     pub tick: u64,
@@ -3386,6 +3441,7 @@ pub struct FileReferenceEvent {
 /// absolute tick (and the track) at which it fires — the element type
 /// of [`SmfFile::sample_dump_extensions`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SampleDumpExtensionEvent {
     /// Absolute tick (cumulative per-track delta sum).
     pub tick: u64,
@@ -3399,6 +3455,7 @@ pub struct SampleDumpExtensionEvent {
 /// absolute tick (and the track) at which it fires — the element type
 /// of [`SmfFile::midi_visual_controls`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MidiVisualControlEvent {
     /// Absolute tick (cumulative per-track delta sum).
     pub tick: u64,
@@ -4405,6 +4462,7 @@ impl MmcStandardTime {
 /// listing does not assign surfaces through [`MmcCommandType::Other`]
 /// carrying the raw byte so callers can route it to a fallback handler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MmcCommandType {
     /// `0x01` — STOP.
     Stop,
@@ -4574,6 +4632,7 @@ pub struct MmcResponse {
 /// opcode the listing does not assign surfaces through
 /// [`MmcInformationField::Other`] carrying the raw byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MmcInformationField {
     /// `0x01` — SELECTED TIME CODE.
     SelectedTimeCode,
@@ -4650,6 +4709,7 @@ pub struct ShowControlMessage {
 /// table does not assign surface through [`ShowControlFormat::Other`]
 /// carrying the raw byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ShowControlFormat {
     /// `0x00` — reserved for extensions.
     Extensions,
@@ -4699,6 +4759,7 @@ impl ShowControlFormat {
 /// not assign surfaces through [`ShowControlCommand::Other`] carrying the
 /// raw byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ShowControlCommand {
     /// `0x01` — GO.
     Go,
@@ -5038,6 +5099,7 @@ impl SampleName {
 /// convention uniformly. Decoded via
 /// [`UniversalSysExEvent::sample_dump_extension`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SampleDumpExtension {
     /// Sub-command `05` — Extended Dump Header.
     ExtendedDumpHeader(ExtendedDumpHeader),
@@ -5067,6 +5129,7 @@ pub enum SampleDumpExtension {
 ///
 /// [`Reserved`]: MvcParameter::Reserved
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MvcParameter {
     /// `10 00 00` — MIDI Visual Control ON/OFF (`0` = Off, `1` = On).
     MvcOnOff,
@@ -5181,6 +5244,7 @@ impl MidiVisualControl {
 ///
 /// Decoded via [`UniversalSysExEvent::general_midi_system`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GeneralMidiSystem {
     /// `F0 7E <dev> 09 01 F7` — General MIDI 1 System On. The receiver
     /// resets to the GM 1 default state (RP-003).
@@ -5222,6 +5286,7 @@ pub enum ControllerDestinationSource {
 /// for Filter Cutoff, `0x20` = 25 % for LFO Amplitude Depth). The
 /// decoder surfaces `rr` raw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ControlledParameter {
     /// `pp = 00` — Pitch Control.
     PitchControl,
@@ -5722,6 +5787,7 @@ impl FileReference {
 ///
 /// [`Other`]: UniversalSubId1::Other
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UniversalSubId1 {
     /// `0x01` — Sample Dump Header (Non-Real-Time only). Sub-ID #2 is
     /// absent in the Table 4 listing for this category.
@@ -5821,6 +5887,7 @@ pub enum UniversalSubId1 {
 ///
 /// [`Other`]: UniversalSubId2::Other
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UniversalSubId2 {
     // ---- Non-Real-Time, Sub-ID #1 = 0x04 (MIDI Time Code Setup) ----
     /// `0x04 0x00` Non-Real-Time — Special.
@@ -6160,6 +6227,7 @@ impl SysExEvent {
 /// concatenated manufacturer payload via [`body`](Self::body) without
 /// the caller re-implementing the continuation state machine.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReassembledSysEx {
     /// Absolute tick of the **opening** `F0` packet (relative to its
     /// parent track's start; on a format-1 shared timebase this is the
@@ -9213,6 +9281,7 @@ impl SmfFile {
 /// affect voice state, not channel state), so the snapshot can be
 /// produced cheaply for any tick without enumerating sounding notes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SmfChannelSnapshot {
     /// Last MIDI Program Change (`Cn pp`) seen on this channel before
     /// the snapshot tick, or `None` if no Program Change has fired.

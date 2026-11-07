@@ -240,6 +240,7 @@ impl Sysex7Assembler {
 /// A decoded Data-128 packet (MT 0x5) — SysEx8 (§7.8) or Mixed Data
 /// Set (§7.9).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Data128Message {
     /// System Exclusive 8 (statuses 0x0..=0x3) — all 8 bits of every
     /// data byte are significant. `data` excludes the Stream ID.

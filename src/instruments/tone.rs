@@ -76,6 +76,7 @@ impl Instrument for ToneInstrument {
 
 /// Available oscillator shapes for the tone fallback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Waveform {
     Sine,
     Triangle,

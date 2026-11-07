@@ -168,6 +168,7 @@ fn i8_nib(v: i8) -> u8 {
 
 /// A decoded Flex Data message (MT 0xD) — §7.5.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FlexDataMessage {
     /// Set Tempo (bank 0x00, status 0x00) — §7.5.3. Group-addressed.
     SetTempo {

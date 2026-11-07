@@ -288,17 +288,16 @@ fn exhaustive_clip() -> ClipFile {
         sequence.push(ClipEvent { tick, message });
     }
     let end_tick = tick + 0x0020_0000; // two restarts before End of Clip
-    ClipFile {
-        ticks_per_quarter_note: 960,
-        profiles: vec![
+    ClipFile::new(960)
+        .with_profiles(vec![
             vec![
                 0x7E, 0x7F, 0x0D, 0x22, 0x02, 1, 2, 3, 4, 5, 6, 7, 8, 0x7E, 0, 1, 1, 1, 0, 0,
             ],
             vec![
                 0x7E, 0x7E, 0x0D, 0x22, 0x01, 1, 2, 3, 4, 5, 6, 7, 8, 0x7E, 0, 2, 1, 1,
             ],
-        ],
-        config: vec![
+        ])
+        .with_config(vec![
             ClipEvent {
                 tick: 0,
                 message: UmpMessage::Flex(FlexDataMessage::SetTempo {
@@ -319,11 +318,10 @@ fn exhaustive_clip() -> ClipFile {
                     },
                 },
             },
-        ],
-        start_tick: 10,
-        sequence,
-        end_tick,
-    }
+        ])
+        .with_start_tick(10)
+        .with_sequence(sequence)
+        .with_end_tick(end_tick)
 }
 
 #[test]
@@ -498,19 +496,19 @@ fn exhaustive_track() -> Track {
         );
     }
     push(3, Event::Meta(MetaEvent::EndOfTrack));
-    Track { events }
+    Track::new(events)
 }
 
 fn exhaustive_smf(format: SmfFormat, division: Division, ntrks: u16) -> SmfFile {
     let tracks: Vec<Track> = (0..ntrks).map(|_| exhaustive_track()).collect();
-    SmfFile {
-        header: SmfHeader {
+    SmfFile::new(
+        SmfHeader {
             format,
             ntrks,
             division,
         },
         tracks,
-    }
+    )
 }
 
 #[test]
@@ -695,17 +693,15 @@ fn smf_clip_concordance_is_lossy_once_then_stable() {
         note: 60,
         velocity: 100,
     };
-    let clip = ClipFile {
-        ticks_per_quarter_note: 96,
-        profiles: vec![],
-        config: vec![],
-        start_tick: 0,
-        sequence: vec![ClipEvent {
+    let clip = ClipFile::new(96)
+        .with_profiles(vec![])
+        .with_config(vec![])
+        .with_start_tick(0)
+        .with_sequence(vec![ClipEvent {
             tick: 12,
             message: UmpMessage::Midi1 { group: 0, msg: m1 },
-        }],
-        end_tick: 20,
-    };
+        }])
+        .with_end_tick(20);
     let back = ClipFile::from_smf(&clip.to_smf().unwrap()).unwrap();
     assert_eq!(back.sequence, clip.sequence);
     assert_eq!(back.end_tick, clip.end_tick);

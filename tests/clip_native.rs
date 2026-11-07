@@ -63,14 +63,12 @@ fn sysex(tick: u64, payload: &[u8]) -> Vec<ClipEvent> {
 
 fn clip_of(sequence: Vec<ClipEvent>) -> ClipFile {
     let end_tick = sequence.last().map_or(0, |e| e.tick);
-    ClipFile {
-        ticks_per_quarter_note: 480,
-        profiles: vec![],
-        config: vec![tempo(0, 50_000_000)], // 120 BPM
-        start_tick: 0,
-        sequence,
-        end_tick,
-    }
+    ClipFile::new(480)
+        .with_profiles(vec![])
+        .with_config(vec![tempo(0, 50_000_000)])
+        .with_start_tick(0)
+        .with_sequence(sequence)
+        .with_end_tick(end_tick)
 }
 
 fn render(mut sched: Scheduler) -> Vec<f32> {
@@ -417,17 +415,17 @@ fn decoder_plays_a_clip_natively_and_matches_the_smf_of_a_midi1_clip() {
 fn clip_header_set_profile_on_configures_the_decoder_before_playback() {
     use oxideav_midi::ci::{BROADCAST_MUID, CI_VERSION_2, CiBody, CiMessage, ProfileId, sub_id2};
     let profile = ProfileId::standard(0x00, 0x02, 0x01, 0x01);
-    let set_on = CiMessage {
-        device_id: 0x7E, // the whole Group
-        sub_id2: sub_id2::SET_PROFILE_ON,
-        version: CI_VERSION_2,
-        source_muid: 0x0000_0001,
-        destination_muid: BROADCAST_MUID,
-        body: CiBody::SetProfileOn {
+    let set_on = CiMessage::new(
+        0x7E,
+        sub_id2::SET_PROFILE_ON,
+        CI_VERSION_2,
+        0x0000_0001,
+        BROADCAST_MUID,
+        CiBody::SetProfileOn {
             profile,
             num_channels: Some(0),
         },
-    }
+    )
     .emit();
     let mut clip = midi1_clip();
     clip.profiles = vec![set_on];

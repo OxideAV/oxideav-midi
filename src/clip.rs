@@ -59,7 +59,8 @@ pub struct ClipEvent {
 }
 
 /// A parsed MIDI Clip File (M2-116).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub struct ClipFile {
     /// Delta Clockstamp Ticks Per Quarter Note — the tick unit of
     /// every [`ClipEvent::tick`] (§3.2.1).
@@ -77,6 +78,46 @@ pub struct ClipFile {
     pub sequence: Vec<ClipEvent>,
     /// Absolute tick of the End of Clip message (§7.3).
     pub end_tick: u64,
+}
+
+impl ClipFile {
+    /// Build a [`ClipFile`] from its mandatory fields; the rest take their defaults.
+    pub fn new(ticks_per_quarter_note: u16) -> Self {
+        Self {
+            ticks_per_quarter_note,
+            ..Default::default()
+        }
+    }
+
+    /// Set `profiles`.
+    pub fn with_profiles(mut self, v: Vec<Vec<u8>>) -> Self {
+        self.profiles = v;
+        self
+    }
+
+    /// Set `config`.
+    pub fn with_config(mut self, v: Vec<ClipEvent>) -> Self {
+        self.config = v;
+        self
+    }
+
+    /// Set `start_tick`.
+    pub fn with_start_tick(mut self, v: u64) -> Self {
+        self.start_tick = v;
+        self
+    }
+
+    /// Set `sequence`.
+    pub fn with_sequence(mut self, v: Vec<ClipEvent>) -> Self {
+        self.sequence = v;
+        self
+    }
+
+    /// Set `end_tick`.
+    pub fn with_end_tick(mut self, v: u64) -> Self {
+        self.end_tick = v;
+        self
+    }
 }
 
 /// Does this byte buffer begin with the MIDI Clip File header?

@@ -22,6 +22,7 @@ use super::packet::{MessageType, Ump};
 
 /// A Utility Message (MT 0x0, Groupless, 32-bit) — spec §7.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UtilityMessage {
     /// NOOP (status 0x0) — no operation (§7.2.1).
     Noop,
@@ -285,6 +286,7 @@ include!("translate.rs");
 
 /// A decoded UMP message dispatched on Message Type.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UmpMessage {
     /// MT 0x0 Utility.
     Utility(UtilityMessage),
